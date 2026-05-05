@@ -1,0 +1,8 @@
+{
+  "kernel": "ring_attention",
+  "sizes": [768, 1536, 3072, 6144, 12288],
+  "fused_ms": [2.342, 4.319, 11.416, 36.246, 138.047],
+  "world_size": 16,
+  "num_nodes": 2,
+  "_note": "Per-stage launch kernel (RING_ATTN_PER_STAGE_KERNEL=1) — N kernel launches per ring stage, 16 stages. Same variant cx7 figure uses. EFA proxy backend, 2 warmup + 5 iters, max-gpu. M=196608: 138.047 ms = 574 TFLOPS, matches cx7's 138.438 ms / 572 TFLOPS within noise — fabric difference was an artifact of variant mismatch."
+}

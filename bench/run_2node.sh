@@ -1,0 +1,175 @@
+#!/bin/bash
+# release/bench/run_2node.sh — single 2-node launcher for the 5 release kernels.
+#
+# Usage:
+#   bash run_2node.sh <kernel|all> [check|bench] [shapes_csv]
+#
+# Examples:
+#   bash run_2node.sh dispatch_gemm bench
+#   bash run_2node.sh ag_gemm check
+#   bash run_2node.sh all bench
+#
+# Cluster (override via env if it changes):
+#   NODE0_IP   — private IP of this (master) node
+#   NODE1_IP   — private IP of the peer node (used as torchrun MASTER target)
+#   NODE1_SSH  — host this script SSHs into to launch node 1 (public or private)
+set -u
+
+KERNEL=${1:?usage: $0 <kernel|all> [check|bench] [shapes_csv]}
+MODE=${2:-bench}
+SHAPES=${3:-}
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+RELEASE=$(dirname "$HERE")
+
+# === Cluster topology ===
+NODE0_IP=${NODE0_IP:-172.31.1.237}
+NODE1_SSH=${NODE1_SSH:-15.164.130.63}
+NODE1_IP=${NODE1_IP:-172.31.11.6}
+
+# Python venv with torch installed (EFS-shared, both nodes see this path).
+PY=${PY:-/home/ubuntu/efs/yzhou/uccl/.venv/bin/python3}
+TORCHRUN=${TORCHRUN:-/home/ubuntu/efs/yzhou/uccl/.venv/bin/torchrun}
+
+# === Common env propagated to both nodes ===
+COMMON_ENV=(
+    "INTERNODE_BACKEND=efa"
+    "LD_LIBRARY_PATH=/opt/amazon/efa/lib:${LD_LIBRARY_PATH:-}"
+    "NCCL_IB_DISABLE=1"
+    "NCCL_P2P_DISABLE=0"
+    "NCCL_SOCKET_IFNAME=enp71s0"
+    # gemm_ar (and gemm_rs) need verbs notify mode for proxy publication path.
+    "OSGC_EFA_VERBS_NOTIFY_MODE=remote_flag"
+    # gemm_ar release defaults that are still consumed by the host harness.
+    "GEMM_AR_ARRIVAL_QUEUE=1"
+    "GEMM_AR_INTER_SEND_SMS=4"
+    "GEMM_AR_NUM_INTRA_COMM_SMS=14"
+    "GEMM_AR_K_DIV=global_world"
+    # NCCL's NVLS multicast claims the multicast capability for its own
+    # collectives; that conflicts with TKParallelTensor's multicast bind
+    # in the 2-node setup. Disable NCCL multicast so our user-mode bind
+    # has the multicast feature exclusively.
+    "NCCL_NVLS_ENABLE=0"
+    "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7"
+    "TORCH_CUDA_ARCH_LIST=9.0a"
+    "MASTER_ADDR=$NODE0_IP"
+)
+
+KERNELS_ALL="dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention"
+STALE_BENCH_PATTERN='[t]orchrun|[d]ispatch_gemm_bench.py|[g]emm_rs_bench.py|[a]g_gemm_bench.py|[g]emm_ar_bench.py|[r]ing_attention_bench.py|[b]enchmark_gemm_ar_multinode.py'
+
+if [[ "$KERNEL" == "all" ]]; then
+    TARGETS="$KERNELS_ALL"
+else
+    TARGETS="$KERNEL"
+fi
+
+cleanup_stale_benches() {
+    pkill -9 -f "$STALE_BENCH_PATTERN" 2>/dev/null || true
+    ssh -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$NODE1_SSH" \
+        "pkill -9 -f '$STALE_BENCH_PATTERN' 2>/dev/null || true" 2>/dev/null || true
+    sleep "${CLEANUP_SETTLE_SLEEP:-1}"
+}
+
+run_one_2node() {
+    local kernel=$1
+    local script="$HERE/${kernel}_bench.py"
+    if [[ ! -f "$script" ]]; then
+        echo "[run_2node] no bench script for $kernel ($script)"
+        return 1
+    fi
+
+    local extra_args="--mode $MODE"
+    if [[ -n "$SHAPES" ]]; then
+        extra_args="$extra_args --shapes $SHAPES"
+    fi
+    if [[ -n "${WARMUP:-}" ]]; then
+        extra_args="$extra_args --warmup $WARMUP"
+    fi
+    if [[ -n "${ITERS:-}" ]]; then
+        extra_args="$extra_args --iters $ITERS"
+    fi
+    if [[ "$MODE" == "bench" ]]; then
+        local out_json="$HERE/results/${kernel}_efa.json"
+        extra_args="$extra_args --save-json $out_json"
+        # Self-contained regression check against the in-tree source-of-truth JSON.
+        local ref_json="$HERE/source_of_truth/${kernel}.json"
+        if [[ -f "$ref_json" ]]; then
+            extra_args="$extra_args --compare-to $ref_json"
+        fi
+    fi
+
+    local default_master_port=29890
+    local default_tcp_port=19790
+    case "$kernel" in
+        dispatch_gemm)
+            default_master_port=29890
+            default_tcp_port=19790
+            ;;
+        gemm_rs)
+            default_master_port=29850
+            default_tcp_port=19750
+            ;;
+        ag_gemm)
+            default_master_port=29880
+            default_tcp_port=19780
+            ;;
+        gemm_ar)
+            default_master_port=29830
+            default_tcp_port=19730
+            ;;
+        ring_attention)
+            default_master_port=29860
+            default_tcp_port=18560
+            ;;
+    esac
+    local master_port=${MPORT:-$default_master_port}
+    local tcp_port_base=${TCP_PORT:-$default_tcp_port}
+    local bind_retained=${OSGC_BIND_RETAINED_HANDLE:-1}
+    local efa_num_qps_env=" OSGC_EFA_NUM_QPS=${OSGC_EFA_NUM_QPS:-8}"
+    if [[ "$kernel" == "gemm_ar" && -z "${OSGC_EFA_NUM_QPS+x}" ]]; then
+        # Match the gemm_ar source-of-truth experiment harness: leave this unset so
+        # the gemm_ar module's session config uses its in-code default of 4 QPs.
+        efa_num_qps_env=""
+    fi
+    local best_of_env=" OSGC_BENCH_BEST_OF_N=${OSGC_BENCH_BEST_OF_N:-0}"
+    local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port OSGC_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
+    local launch_node0="cd '$RELEASE' && $env_str NODE_IDX=0 \
+        TCP_PORT=$tcp_port_base \
+        '$TORCHRUN' --nproc_per_node=8 --nnodes=2 --node_rank=0 \
+            --master_addr=$NODE0_IP --master_port=$master_port \
+            '$script' $extra_args"
+    local launch_node1="cd '$RELEASE' && $env_str NODE_IDX=1 \
+        TCP_PORT=$tcp_port_base \
+        '$TORCHRUN' --nproc_per_node=8 --nnodes=2 --node_rank=1 \
+            --master_addr=$NODE0_IP --master_port=$master_port \
+            '$script' $extra_args"
+
+    # Hard timeout (default 5 min per kernel sweep — adjust via TIMEOUT env).
+    local TIMEOUT_S=${TIMEOUT:-300}
+    echo "==== $kernel ($MODE) timeout=${TIMEOUT_S}s master_port=${master_port} tcp_port=${tcp_port_base} ===="
+    cleanup_stale_benches
+    timeout "${TIMEOUT_S}" ssh -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$NODE1_SSH" "bash -c \"$launch_node1\"" \
+        > "/tmp/${kernel}_node1.log" 2>&1 &
+    local NODE1_PID=$!
+    sleep "${NODE1_LAUNCH_SLEEP:-2}"
+    timeout "${TIMEOUT_S}" bash -c "$launch_node0" 2>&1 | tee "/tmp/${kernel}_node0.log"
+    local RC0=${PIPESTATUS[0]}
+    wait "$NODE1_PID"
+    local RC1=$?
+    if [[ "$RC0" == "124" || "$RC1" == "124" ]]; then
+        echo "==== $kernel TIMEOUT after ${TIMEOUT_S}s (rc0=$RC0 rc1=$RC1) ===="
+        # Hard kill any stragglers
+        pkill -9 -f "${kernel}_bench.py" 2>/dev/null
+        ssh -o BatchMode=yes "$NODE1_SSH" "pkill -9 -f ${kernel}_bench.py" 2>/dev/null || true
+    fi
+    cleanup_stale_benches
+    echo "==== $kernel done (node0 rc=$RC0  node1 rc=$RC1) ===="
+    return $((RC0 + RC1))
+}
+
+OVERALL=0
+for t in $TARGETS; do
+    run_one_2node "$t" || OVERALL=$?
+done
+exit $OVERALL

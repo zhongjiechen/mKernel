@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""Render per-kernel TFLOPS bar charts matching experiments/multinode/benchmarks/<topic>_efa.png.
+
+Reads release/bench/results/<topic>_{efa,nccl}.json and release/bench/cx7_reference.json,
+emits release/plots/<topic>_efa.png plus a 5-panel overview chart.
+
+Per INSTRUCTION.md §8: 3 series only (NCCL, Ours, cx7-as-line). Drop EFAGDA,
+Triton-distributed, Flux, Mercury, error bars, correctness checkmark row.
+"""
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+# release/plots/ → walk up 1 to release/
+RELEASE = HERE.parent
+RESULTS = RELEASE / "bench" / "results"
+CX7_PATH = RELEASE / "bench" / "cx7_reference.json"
+# External baselines for the ring_attention chart only — Mercury + MagiAttention
+# results live under experiments/, so reference them there directly rather
+# than copying into release/bench/results (release is for our kernels' Ours
+# numbers and the published cx7 reference; external baselines are
+# auxiliary).
+REPO = RELEASE.parent
+EXTERNAL = REPO / "experiments" / "multinode" / "baselines"
+TRITON_DIST_DIR = EXTERNAL / "triton_dist" / "results"
+
+# Map our kernel name → the Q-key used for Triton-dist results JSONs.
+# The published Triton-dist data files in
+#   experiments/multinode/baselines/triton_dist/results/
+# are still named q1/q2/q3/q5_efa.json (q4 = ring_attention has no Triton-dist
+# implementation), even though the rest of the release/ tree has been renamed
+# Q1→ag_gemm etc. Map to the actual file names so we don't silently drop the
+# Triton-dist baseline from best_baseline().
+TRITON_DIST_KEY = {
+    "ag_gemm":        "q1",
+    "gemm_ar":        "q2",  # NCCL-equivalent (no real inter-node TD kernel)
+    "dispatch_gemm":  "q3",
+    "gemm_rs":        "q5",
+    # ring_attention (q4) has no Triton-dist baseline.
+}
+
+WORLD = 16
+
+# === Two-tier roofline model (H200 SXM, world=16, 2 nodes x 8 GPUs) ===
+#
+# Per-GPU machine caps:
+#   P_c  = 989 TFLOPS   (BF16 tensor-core peak)
+#   B_n  = 900 GB/s     (NVLink5 fabric BW per GPU, intra-node)
+#   B_e  =  50 GB/s     (EFA per GPU: 3.2 Tbps/node split across 8 GPUs)
+#
+# For each kernel we count, per GPU:
+#   FLOPs       (compute work)
+#   B_intra     (bytes that traverse NVLink only)
+#   B_inter     (bytes that must cross the EFA boundary)
+# under a hierarchical algorithm (intra-first / inter-first whichever
+# minimises EFA bytes since EFA is ~18x slower than NVLink).
+#
+# Then:    t_compute = FLOPs / P_c
+#          t_nvlink  = B_intra / B_n
+#          t_efa     = B_inter / B_e
+# With overlap:  t = max(t_compute, t_nvlink, t_efa)
+#
+# Per-kernel byte accounting -- counts the *actual* algorithm in each
+# src/<kernel>.cu, NOT the textbook hierarchical version. (W=16, W_n=8.)
+#
+#   ag_gemm ag_gemm     (K=M, N=M/16) -- src/ag_gemm.cu:
+#     FLOPs   = M^3 / 8
+#     B_intra = 15 M^2 / 8   (compute reads 15/16 of full A from local PGL +
+#                             A_recv_gl over NVLink IPC; intra-multicast
+#                             gather pipelines into this read)
+#     B_inter = M^2 / 8      (each GPU RDMA-sends its M/16 rows of A to
+#                             peer-indexed GPU on the other node, once)
+#
+#   gemm_ar gemm_ar     (K=M/16, N=M) -- src/gemm_ar.cu:
+#     FLOPs   = M^3 / 8
+#     B_intra = 7 M^2 / 2    (intra-AR multicast 7M^2/4 + final publish
+#                             multicast 7M^2/4 over NVLink)
+#     B_inter = M^2 / 4      (inter-send pushes "dev_idx's slice" =
+#                             M/8 rows * N = M^2/4 bytes once over EFA;
+#                             concurrent send & recv each = M^2/4)
+#
+#   gemm_rs gemm_rs     (K=M/16, N=M) -- src/gemm_rs.cu:
+#     FLOPs   = M^3 / 8
+#     B_intra = 7 M^2 / 4    (intra-RS via tma::store_add_async over NVLink)
+#     B_inter = M^2 / 4      (RS partition is 1/8 per node, NOT 1/16; each
+#                             GPU has M/8 rows = M^2/4 bytes after intra-RS
+#                             and ships ALL of it to peer-indexed GPU once)
+#
+#   ring_attention ring_attention (B=4, H=16, D=128, S=total_seq) -- src/ring_attention.cu:
+#     FLOPs   = 2048 * S^2
+#     B_intra = 14 * 2048 * S = 28672 * S
+#                              (7 intra-node ring hops in round 1 +
+#                               7 intra-node ring hops in round 2)
+#     B_inter = 1  * 2048 * S =  2048 * S
+#                              (single inter-node KV swap at "stage 7.5")
+#
+#   dispatch_gemm dispatch_gemm (H=7168, I=2048, TOPK=8, E=256, dispatch+GEMM only,
+#                     no combine -- see src/dispatch_gemm.cu):
+#     FLOPs   = 2 * N_tok * TOPK * H * I / W = 1.47e7 * N_tok
+#     B_intra = (N_tok/2) * H * 2 = 7168 * N_tok
+#                  (each GPU owns E/W=16 experts, each gets N_tok*TOPK/E
+#                   = N_tok/32 tokens, so it pulls N_tok/2 tokens via PGL
+#                   over NVLink during dispatch)
+#     B_inter = (N_tok/W) * H * 2 = 896 * N_tok
+#                  (Phase-1 RDMA push of the whole local pre_tokens buffer
+#                   to peer-indexed GPU on the other node; no combine)
+#
+# Crossover (where t_compute = t_efa):
+#   ag_gemm M* ~ 19,800     gemm_ar M* ~ 39,600     gemm_rs M* ~ 19,800
+#   ring_attention S* ~ 296,700    dispatch_gemm ratio is constant in N_tok (~0.83 -> balanced)
+#
+# Per-shape label rule:  r = t_compute / max(t_nvl, t_efa)
+#   r > 1.5  -> compute-bound       r < 0.67 -> comm-bound (tag the slower
+#   tier: EFA = inter-node, NVL = intra-node)        else -> balanced.
+PEAK_FLOPS = 989e12
+NVLINK_BW = 900e9
+EFA_BW    = 50e9
+
+def _times(kernel: str, shape: int):
+    """Return (t_compute, t_nvlink, t_efa) seconds; or None if not modeled."""
+    if kernel == "ag_gemm":
+        M = shape
+        return (M**3 / 8 / PEAK_FLOPS,
+                15 * M**2 / 8 / NVLINK_BW,
+                M**2 / 8 / EFA_BW)
+    if kernel == "gemm_ar":
+        M = shape
+        return (M**3 / 8 / PEAK_FLOPS,
+                7 * M**2 / 2 / NVLINK_BW,
+                M**2 / 4 / EFA_BW)
+    if kernel == "gemm_rs":
+        M = shape
+        return (M**3 / 8 / PEAK_FLOPS,
+                7 * M**2 / 4 / NVLINK_BW,
+                M**2 / 4 / EFA_BW)
+    if kernel == "ring_attention":
+        S = shape
+        return (2048.0 * S**2 / PEAK_FLOPS,
+                28672.0 * S / NVLINK_BW,
+                2048.0  * S / EFA_BW)
+    if kernel == "dispatch_gemm":
+        N = shape
+        return (1.468e7 * N / PEAK_FLOPS,
+                7168.0 * N / NVLINK_BW,
+                896.0 * N / EFA_BW)
+    return None
+
+def _classify(kernel: str, shape: int):
+    """Return (label, color) for the shape's compute/comm balance."""
+    t = _times(kernel, shape)
+    if t is None:
+        return ("n/a", "#888888")
+    tc, tn, te = t
+    tcomm = max(tn, te)
+    if tcomm <= 0:
+        return ("compute-bound", "#F58518")
+    r = tc / tcomm
+    if r > 1.5:
+        return ("compute-bound", "#F58518")
+    if r < 0.67:
+        return ("comm-bound", "#4C72B0")
+    return ("balanced", "#54A24B")
+
+
+# === TFLOPS formulas (verbatim from experiments/multinode/baselines/plot_multi_baseline.py) ===
+
+def ag_gemm_tflops(m, ms):
+    if not ms or not math.isfinite(ms) or ms <= 0:
+        return float("nan")
+    n = m // 16
+    return (2.0 * m * m * n) / (ms * 1e-3) / 1e12
+
+
+def gemm_ar_tflops(m, ms):
+    if not ms or not math.isfinite(ms) or ms <= 0:
+        return float("nan")
+    k_local = m // WORLD
+    return (2.0 * m * k_local * m) / (ms * 1e-3) / 1e12
+
+
+def dispatch_tflops(num_tokens, ms):
+    if not ms or not math.isfinite(ms) or ms <= 0:
+        return float("nan")
+    H, I, TOPK = 7168, 2048, 8
+    per_rank = 2.0 * num_tokens * TOPK * H * I / WORLD
+    return per_rank / (ms * 1e-3) / 1e12
+
+
+def ring_attn_tflops(total_seq, ms):
+    if not ms or not math.isfinite(ms) or ms <= 0:
+        return float("nan")
+    B, H, D = 4, 16, 128
+    return (4.0 * B * H * total_seq * total_seq * D) / (ms * 1e-3) / 1e12 / WORLD
+
+
+def gemm_rs_tflops(m, ms):
+    if not ms or not math.isfinite(ms) or ms <= 0:
+        return float("nan")
+    k_local = m // WORLD
+    return (2.0 * m * k_local * m) / (ms * 1e-3) / 1e12
+
+
+# === Per-Q metadata ===
+
+KERNELS = {
+    "ag_gemm": {
+        "title": "AllGather + GEMM, 2 nodes x 8 H200 EFA (world=16, N=M/16)",
+        "xlabel": "Shape (M x K x N), N = M/16",
+        "label_fn": lambda m: f"{m}x{m}x{m // 16}",
+        "tflops_fn": ag_gemm_tflops,
+        "cx7_key": "AG_GEMM_ag_gemm",
+    },
+    "gemm_ar": {
+        "title": "GEMM + AllReduce, 2 nodes x 8 H200 EFA (world=16, K=M/16)",
+        "xlabel": "Shape (M x K x N), K = M/16",
+        "label_fn": lambda m: f"{m}x{m // 16}x{m}",
+        "tflops_fn": gemm_ar_tflops,
+        "cx7_key": "GEMM_AR_gemm_ar",
+    },
+    "dispatch_gemm": {
+        "title": "MoE Dispatch + GEMM, 2 nodes x 8 H200 EFA (world=16)",
+        "xlabel": "Total tokens across 16 GPUs (H=7168, I=2048, top_k=8, 256 experts)",
+        "label_fn": lambda n: str(n),
+        "tflops_fn": dispatch_tflops,
+        "cx7_key": "DISPATCH_dispatch_gemm",
+    },
+    "ring_attention": {
+        "title": "Ring Attention, 2 nodes x 8 H200 EFA (world=16)",
+        "xlabel": "total_seq",
+        "label_fn": lambda s: str(s),
+        "tflops_fn": ring_attn_tflops,
+        "cx7_key": "RING_ATTN_ring_attention",
+    },
+    "gemm_rs": {
+        "title": "GEMM + ReduceScatter, 2 nodes x 8 H200 EFA (world=16, K=M/16)",
+        "xlabel": "Shape (M x K x N), K = M/16",
+        "label_fn": lambda m: f"{m}x{m // 16}x{m}",
+        "tflops_fn": gemm_rs_tflops,
+        "cx7_key": "GEMM_RS_gemm_rs",
+    },
+}
+
+
+def _parse_shape(s):
+    """Accept 'tokens=131072', 'M=4096', '12288', etc."""
+    if isinstance(s, int):
+        return s
+    s = str(s)
+    if "=" in s:
+        s = s.split("=", 1)[1]
+    return int(s)
+
+
+def load_series(kernel: str):
+    """Returns (shapes, fused_tf, nccl_tf, cx7_tf or None)."""
+    fused = json.load(open(RESULTS / f"{kernel}_efa.json"))
+    nccl = json.load(open(RESULTS / f"{kernel}_nccl.json"))
+    cx7 = json.load(open(CX7_PATH))
+
+    shapes = [_parse_shape(s) for s in fused["sizes"]]
+    # ring_attention release JSON stores per-rank seq_per_dev; align to
+    # total_seq so it matches the NCCL JSON, the cx7 reference, and the
+    # external baselines (Mercury, MagiAttention) which are all keyed by
+    # total_seq.
+    if kernel == "ring_attention":
+        WORLD = 16
+        shapes = [s * WORLD for s in shapes]
+    fused_tf = [KERNELS[kernel]["tflops_fn"](s, ms)
+                for s, ms in zip(shapes, fused["fused_ms"])]
+    # NCCL JSON may have nccl_ms keyed differently
+    nccl_ms = nccl.get("nccl_ms", nccl.get("fused_ms", []))
+    nccl_shapes = [_parse_shape(s) for s in nccl["sizes"]]
+    # Align NCCL shapes to fused shapes
+    nccl_by_shape = {sh: ms for sh, ms in zip(nccl_shapes, nccl_ms)}
+    nccl_tf = [KERNELS[kernel]["tflops_fn"](s, nccl_by_shape.get(s))
+               for s in shapes]
+
+    cx7_entry = cx7.get(KERNELS[kernel]["cx7_key"])
+    cx7_tf = None
+    if cx7_entry is not None and not cx7_entry.get("_skip", False):
+        # cx7 numbers are pre-computed TFLOPS per published chart.
+        cx7_shapes = cx7_entry["shapes"]
+        cx7_tf_full = cx7_entry["tflops"]
+        cx7_by_shape = {sh: tf for sh, tf in zip(cx7_shapes, cx7_tf_full)}
+        cx7_tf = [cx7_by_shape.get(s, float("nan")) for s in shapes]
+
+    return shapes, fused_tf, nccl_tf, cx7_tf
+
+
+def _load_triton_dist(kernel: str, shapes):
+    """Return Triton-distributed TFLOPS aligned to `shapes`, or None if not
+    available for this kernel. Reads the published per-shape ms list from
+    `experiments/multinode/baselines/triton_dist/results/{q1,q5,q4}_efa.json`
+    and converts via the kernel's TFLOPS formula.
+    """
+    qkey = TRITON_DIST_KEY.get(kernel)
+    if qkey is None:
+        return None
+    path = TRITON_DIST_DIR / f"{qkey}_efa.json"
+    if not path.exists():
+        return None
+    try:
+        j = json.load(open(path))
+        td_ms = j.get("triton_dist_ms") or j.get("fused_ms") or []
+        td_shapes = [_parse_shape(s) for s in j.get("sizes", [])]
+        # ring_attention release shapes are seq_per_dev; Triton-dist data is
+        # keyed by total_seq for q4. Caller passes shapes already in the
+        # right space (load_series did the multiply for ring_attention).
+        td_by_shape = {sh: ms for sh, ms in zip(td_shapes, td_ms)}
+        out = []
+        for s in shapes:
+            ms = td_by_shape.get(s)
+            if ms is None or not math.isfinite(float(ms)) or float(ms) <= 0:
+                out.append(float("nan"))
+            else:
+                out.append(KERNELS[kernel]["tflops_fn"](s, float(ms)))
+        return out if any(math.isfinite(v) for v in out) else None
+    except Exception:
+        return None
+
+
+def _load_external_q4(shapes):
+    """Return (mercury_tf, magi_tf, te_p2p_tf, te_a2ap2p_tf, rfa_tf) aligned to
+    the ring_attention shape list. NaN where a baseline didn't run for that
+    shape. All come from the experiments-side baselines/ JSONs."""
+    mercury_tf = [float("nan")] * len(shapes)
+    magi_tf = [float("nan")] * len(shapes)
+    te_p2p_tf = [float("nan")] * len(shapes)
+    te_a2ap2p_tf = [float("nan")] * len(shapes)
+    rfa_tf = [float("nan")] * len(shapes)
+    WORLD = 16
+    # Mercury: results-list schema, samples_ms / median_ms per shape.
+    mpath = EXTERNAL / "mercury" / "results" / "q4_efa.json"
+    if mpath.exists():
+        try:
+            d = json.load(open(mpath))
+            import statistics as _st
+            for r in d.get("results", []):
+                seq_per_dev = r.get("seq_per_dev")
+                if seq_per_dev is None:
+                    continue
+                total_seq = seq_per_dev * WORLD
+                if total_seq not in shapes:
+                    continue
+                samples = r.get("samples_ms")
+                if isinstance(samples, list) and samples:
+                    ms = _st.median(samples)
+                else:
+                    ms = r.get("median_ms") or r.get("mercury_ms")
+                if ms is None or not math.isfinite(float(ms)):
+                    continue
+                mercury_tf[shapes.index(total_seq)] = ring_attn_tflops(total_seq, float(ms))
+        except Exception:
+            pass
+    # MagiAttention: flat sizes/magiattention_ms schema.
+    gpath = EXTERNAL / "magiattention" / "results" / "q4_efa.json"
+    if gpath.exists():
+        try:
+            d = json.load(open(gpath))
+            for sz_label, ms in zip(d.get("sizes", []), d.get("magiattention_ms", [])):
+                s = str(sz_label)
+                if "=" in s:
+                    s = s.split("=", 1)[1]
+                try:
+                    seq_per_dev = int(s)
+                except ValueError:
+                    continue
+                total_seq = seq_per_dev * WORLD
+                if total_seq not in shapes:
+                    continue
+                if ms is None or not math.isfinite(float(ms)):
+                    continue
+                magi_tf[shapes.index(total_seq)] = ring_attn_tflops(total_seq, float(ms))
+        except Exception:
+            pass
+    # TransformerEngine context-parallel: same sizes/te_cp_ms schema. Two
+    # JSONs — one per cp_comm_type. The "p2p" one is the apples-to-apples
+    # ring baseline; "a2a+p2p" is the hierarchical Ulysses+ring variant.
+    for tag, out in (("p2p", te_p2p_tf), ("a2a_p2p", te_a2ap2p_tf)):
+        tpath = EXTERNAL / "transformer_engine_cp" / "results" / f"q4_efa_{tag}.json"
+        if not tpath.exists():
+            continue
+        try:
+            d = json.load(open(tpath))
+            for sz_label, ms in zip(d.get("sizes", []), d.get("te_cp_ms", [])):
+                s = str(sz_label)
+                if "=" in s:
+                    s = s.split("=", 1)[1]
+                try:
+                    seq_per_dev = int(s)
+                except ValueError:
+                    continue
+                total_seq = seq_per_dev * WORLD
+                if total_seq not in shapes:
+                    continue
+                if ms is None or not math.isfinite(float(ms)):
+                    continue
+                out[shapes.index(total_seq)] = ring_attn_tflops(total_seq, float(ms))
+        except Exception:
+            pass
+    # zhuzilin/ring-flash-attention: schema {sizes, rfa_ms} keyed by
+    # seq_per_dev. Same shape conventions as the other CP baselines.
+    rpath = EXTERNAL / "ring_flash_attention" / "results" / "q4_efa.json"
+    if rpath.exists():
+        try:
+            d = json.load(open(rpath))
+            for sz_label, ms in zip(d.get("sizes", []), d.get("rfa_ms", [])):
+                s = str(sz_label)
+                if "=" in s:
+                    s = s.split("=", 1)[1]
+                try:
+                    seq_per_dev = int(s)
+                except ValueError:
+                    continue
+                total_seq = seq_per_dev * WORLD
+                if total_seq not in shapes:
+                    continue
+                if ms is None or not math.isfinite(float(ms)):
+                    continue
+                rfa_tf[shapes.index(total_seq)] = ring_attn_tflops(total_seq, float(ms))
+        except Exception:
+            pass
+    return mercury_tf, magi_tf, te_p2p_tf, te_a2ap2p_tf, rfa_tf
+
+
+def render_kernel_chart(kernel: str, ax=None, value_fontsize=13):
+    meta = KERNELS[kernel]
+    shapes, fused_tf, nccl_tf, cx7_tf = load_series(kernel)
+
+    new_fig = ax is None
+    if new_fig:
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = np.arange(len(shapes), dtype=float)
+    has_cx7 = cx7_tf is not None and any(math.isfinite(v) for v in cx7_tf)
+    # Ring-attention chart adds two external baselines (Mercury, MagiAttention).
+    # Other charts keep the original NCCL/Ours (+optional cx7) layout.
+    is_ring_attn = kernel == "ring_attention"
+    mercury_tf = magi_tf = te_p2p_tf = te_a2ap2p_tf = rfa_tf = None
+    if is_ring_attn:
+        mercury_tf, magi_tf, te_p2p_tf, te_a2ap2p_tf, rfa_tf = _load_external_q4(shapes)
+        has_mercury = any(math.isfinite(v) for v in mercury_tf)
+        has_magi = any(math.isfinite(v) for v in magi_tf)
+        has_te_p2p = any(math.isfinite(v) for v in te_p2p_tf)
+        has_te_a2ap2p = any(math.isfinite(v) for v in te_a2ap2p_tf)
+        has_rfa = any(math.isfinite(v) for v in rfa_tf)
+        has_te = has_te_p2p or has_te_a2ap2p
+    else:
+        has_mercury = has_magi = has_te_p2p = has_te_a2ap2p = has_te = has_rfa = False
+    width = 0.27 if has_cx7 else 0.4
+
+    if has_cx7:
+        # 3-bar group: NCCL (left), cx7 (middle), Ours (right).
+        cx7_label = json.load(open(CX7_PATH))[meta["cx7_key"]].get("label", "cx7 reference")
+        ax.bar(x - width, nccl_tf, width, color="#4C72B0", label="CuBLAS+NCCL", zorder=3)
+        ax.bar(x,         cx7_tf,  width, color="#EECA3B", label=cx7_label,    zorder=3)
+        ax.bar(x + width, fused_tf, width, color="#F58518", label="Ours",       zorder=3)
+
+        for xi, yi in zip(x, nccl_tf):
+            if math.isfinite(yi):
+                ax.annotate(f"{yi:.0f}", xy=(xi - width, yi), xytext=(0, 4),
+                            textcoords="offset points", ha="center",
+                            fontsize=value_fontsize, color="black")
+        for xi, yi in zip(x, cx7_tf):
+            if math.isfinite(yi):
+                ax.annotate(f"{yi:.0f}", xy=(xi, yi), xytext=(0, 4),
+                            textcoords="offset points", ha="center",
+                            fontsize=value_fontsize, color="black")
+        for xi, yi in zip(x, fused_tf):
+            if math.isfinite(yi):
+                ax.annotate(f"{yi:.0f}", xy=(xi + width, yi), xytext=(0, 4),
+                            textcoords="offset points", ha="center",
+                            fontsize=value_fontsize, color="black")
+    elif is_ring_attn and (has_mercury or has_magi or has_te_p2p or has_rfa):
+        # Apples-to-apples = same head-sharding assumption (each rank holds
+        # ALL H heads on its seq slice; no head a2a). We DROP TE-CP a2a+p2p
+        # because its intra-node Ulysses leg shards heads (H/8 per rank) —
+        # different parallelization. All other baselines preserve full-H.
+        # ring-flash-attn (RFA) = zhuzilin's canonical CP baseline: pure
+        # ring across 16 ranks, NCCL Send/Recv + flash-attn-2 local.
+        series = [
+            ("FA2+NCCL",          "#4C72B0", nccl_tf),
+            ("Ours",              "#F58518", fused_tf),
+            ("Mercury",           "#9D755D", mercury_tf),
+            ("MagiAttention",     "#C45BAF", magi_tf),
+            ("TE-CP (ring)",      "#54A24B", te_p2p_tf),
+            ("ring-flash-attn",   "#E45756", rfa_tf),
+        ]
+        # Drop columns whose entire series is NaN so the legend stays honest.
+        series = [(lbl, c, vals) for (lbl, c, vals) in series
+                  if any(math.isfinite(v) for v in vals)]
+        n = len(series)
+        bar_w = 0.85 / max(n, 1)
+        offsets = (np.arange(n) - (n - 1) / 2.0) * bar_w
+        for (lbl, c, vals), off in zip(series, offsets):
+            ax.bar(x + off, vals, bar_w, color=c, label=lbl, zorder=3)
+            for xi, yi in zip(x, vals):
+                if math.isfinite(yi):
+                    ax.annotate(f"{yi:.0f}", xy=(xi + off, yi), xytext=(0, 4),
+                                textcoords="offset points", ha="center",
+                                fontsize=value_fontsize, color="black")
+    else:
+        # Optional Triton-distributed series (ag_gemm ag_gemm, gemm_rs gemm_rs).
+        td_tf = _load_triton_dist(kernel, shapes)
+        has_td = td_tf is not None and any(math.isfinite(v) for v in td_tf)
+        if has_td:
+            tw = 0.27
+            ax.bar(x - tw, nccl_tf, tw, color="#4C72B0", label="CuBLAS+NCCL", zorder=3)
+            ax.bar(x,      td_tf,   tw, color="#E45756", label="Triton-distributed", zorder=3)
+            ax.bar(x + tw, fused_tf, tw, color="#F58518", label="Ours", zorder=3)
+            for xi, yi in zip(x, nccl_tf):
+                if math.isfinite(yi):
+                    ax.annotate(f"{yi:.0f}", xy=(xi - tw, yi), xytext=(0, 4),
+                                textcoords="offset points", ha="center",
+                                fontsize=value_fontsize, color="black")
+            for xi, yi in zip(x, td_tf):
+                if math.isfinite(yi):
+                    ax.annotate(f"{yi:.0f}", xy=(xi, yi), xytext=(0, 4),
+                                textcoords="offset points", ha="center",
+                                fontsize=value_fontsize, color="black")
+            for xi, yi in zip(x, fused_tf):
+                if math.isfinite(yi):
+                    ax.annotate(f"{yi:.0f}", xy=(xi + tw, yi), xytext=(0, 4),
+                                textcoords="offset points", ha="center",
+                                fontsize=value_fontsize, color="black")
+        else:
+            ax.bar(x - width / 2, nccl_tf, width, color="#4C72B0", label="CuBLAS+NCCL", zorder=3)
+            ax.bar(x + width / 2, fused_tf, width, color="#F58518", label="Ours", zorder=3)
+
+            for xi, yi in zip(x, nccl_tf):
+                if math.isfinite(yi):
+                    ax.annotate(f"{yi:.0f}", xy=(xi - width / 2, yi),
+                                xytext=(0, 4), textcoords="offset points",
+                                ha="center", fontsize=value_fontsize, color="black")
+            for xi, yi in zip(x, fused_tf):
+                if math.isfinite(yi):
+                    ax.annotate(f"{yi:.0f}", xy=(xi + width / 2, yi),
+                                xytext=(0, 4), textcoords="offset points",
+                                ha="center", fontsize=value_fontsize, color="black")
+
+    ax.set_xticks(x)
+    classes = [_classify(kernel, s) for s in shapes]
+    tick_labels = [
+        f"{meta['label_fn'](s)}\n[{lbl}]"
+        for s, (lbl, _c) in zip(shapes, classes)
+    ]
+    ax.set_xticklabels(tick_labels, rotation=15, fontsize=12)
+    # Color each tick label by its boundedness class.
+    for tl, (_lbl, color) in zip(ax.get_xticklabels(), classes):
+        tl.set_color(color)
+    ax.tick_params(axis="y", labelsize=13)
+    ax.set_xlabel(meta["xlabel"], fontsize=15)
+    ax.set_ylabel("TFLOPS per GPU (bf16)", fontsize=15)
+    ax.set_title(meta["title"], fontsize=15)
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(ncol=2, fontsize=15)
+
+    if new_fig:
+        fig.tight_layout()
+        fig.subplots_adjust(bottom=0.22)
+        out = HERE / f"{kernel}_efa.png"
+        fig.savefig(out, dpi=150)
+        print(f"wrote {out}")
+        plt.close(fig)
+
+
+def render_combined():
+    fig, axes = plt.subplots(1, 5, figsize=(28, 6.2))
+    for ax, kernel in zip(axes, ["ag_gemm", "gemm_ar", "dispatch_gemm", "ring_attention", "gemm_rs"]):
+        try:
+            render_kernel_chart(kernel, ax=ax, value_fontsize=9)
+        except FileNotFoundError as e:
+            ax.text(0.5, 0.5, f"missing: {e}", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=11, color="#aa3333")
+            ax.set_title(kernel, fontsize=13)
+    fig.tight_layout()
+    out = HERE / "all_kernels_multi_baseline_efa.png"
+    fig.savefig(out, dpi=150)
+    print(f"wrote {out}")
+    plt.close(fig)
+
+
+if __name__ == "__main__":
+    for kernel in KERNELS:
+        try:
+            render_kernel_chart(kernel)
+        except FileNotFoundError as e:
+            print(f"skip {kernel}: {e}")

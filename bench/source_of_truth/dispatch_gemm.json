@@ -1,0 +1,27 @@
+{
+    "kernel": "dispatch_gemm",
+    "sizes": [
+        "tokens=8192",
+        "tokens=16384",
+        "tokens=32768",
+        "tokens=65536",
+        "tokens=131072"
+    ],
+    "fused_ms": [
+        0.631,
+        1.057,
+        1.538,
+        2.669,
+        5.16
+    ],
+    "nccl_ms": [
+        null,
+        null,
+        null,
+        null,
+        null
+    ],
+    "world_size": 8,
+    "num_nodes": 2,
+    "_note": "dispatch_gemm v10 warpbar: zero-copy + Opt A/C/D/E + spintune + warp-collapsed barrier add (16x atomics->1) + per-shape (ns,copy) tuning. 131k=5.16ms=373 TFLOPS, beats cx7 329 by +13%. Warpbar wins at 8k/32k/65k/131k, slight regress at 16k (within variance). Bit-exact PASS at 4k/131k. 2026-05-01."
+}

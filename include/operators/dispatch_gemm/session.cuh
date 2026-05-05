@@ -1,0 +1,128 @@
+#pragma once
+
+// Session management + pybind module for moe_dispatch_gemm_multinode.
+// Included from src/dispatch_gemm.cu after the kernel namespace closes.
+
+// ============================================================================
+// Session management
+// ============================================================================
+#include "comm/internode/session_select.h"
+
+static internode::Session* g_session = nullptr;
+
+void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
+                       int64_t send_buf_ptr, int64_t send_buf_size,
+                       int64_t recv_buf_size, int num_tiles,
+                       int fifo_capacity, int device_id,
+                       int64_t external_recv_buf_ptr,
+                       int64_t pre_tokens_buf_ptr,
+                       int64_t pre_tokens_buf_size) {
+    if (g_session) { internode::destroy_session(g_session); g_session = nullptr; }
+    internode::SessionConfig cfg{};
+    cfg.rank = rank;
+    cfg.peer_ip = peer_ip.c_str();
+    cfg.tcp_port = tcp_port;
+// Zero-copy send: register pre_tokens (DistBuffer, VMM) as the
+    // session's only data MR via register_gpu_buffer(), which transparently
+    // uses cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr on VMM ranges.
+    // The kernel emits cmd.src_view=0 — proxy hot path is byte-identical to
+    // a regular send, only the source address changes. send_buf_ptr/size are
+    // kept in the signature for backwards compatibility but unused.
+    if (pre_tokens_buf_ptr == 0 || pre_tokens_buf_size == 0) {
+        fprintf(stderr, "create_session_py: dispatch_gemm zero-copy requires pre_tokens_buf ptr+size\n");
+        std::exit(EXIT_FAILURE);
+    }
+    (void)send_buf_ptr; (void)send_buf_size;
+    cfg.local_gpu_buf = reinterpret_cast<void*>(pre_tokens_buf_ptr);
+    cfg.local_gpu_buf_size = (size_t)pre_tokens_buf_size;
+    cfg.recv_buf_size = (size_t)recv_buf_size;
+    // Zero-copy inter-recv: when external_recv_buf_ptr != 0, the session
+    // registers caller-owned peer_tokens as the RDMA destination, replacing
+    // the staged recv_buf. fused_inter_copy_sm under DISPATCH_ZERO_COPY
+    // then drops the D2D copy entirely.
+    if (external_recv_buf_ptr != 0) {
+        cfg.external_recv_buf = reinterpret_cast<void*>(external_recv_buf_ptr);
+    }
+    cfg.num_tiles = num_tiles;
+    cfg.fifo_capacity = fifo_capacity;
+    cfg.device_id = device_id;
+    // Tier 1.2 (DeepEP-style sliding window): cap inflight WRs to keep queue
+    // pressure low. Sweep on EFA: 32 ≈ 64 < 256 < 1024 at 131k tokens.
+    // Benefit is small (~1-2%) on top of CHUNK_BYTES=512 KB but consistent.
+    cfg.max_inflight = 32;
+    if (const char* env_mi = std::getenv("OSGC_MAX_INFLIGHT")) {
+        cfg.max_inflight = std::atoi(env_mi);
+    }
+    // Round 24 (dispatch_gemm cross-kernel port from gemm_ar round 13 / ag_gemm round 23):
+    // multi-QP lets the proxy post WRs in parallel.
+    cfg.num_qps = 4;
+    if (const char* env_num_qps = std::getenv("OSGC_EFA_NUM_QPS")) {
+        cfg.num_qps = std::atoi(env_num_qps);
+    }
+    // Allow override of CPU proxy thread count (default = max(1,num_rails)=2).
+    // More threads parallelize ibv_post_send across QP slices.
+    if (const char* env_np = std::getenv("OSGC_NUM_PROXY_THREADS")) {
+        cfg.num_proxy_threads = std::atoi(env_np);
+    }
+    g_session = internode::create_session(cfg);
+}
+void destroy_session_py() { if (g_session) { internode::destroy_session(g_session); g_session = nullptr; } }
+void set_epoch_py(int epoch) { if (g_session) internode::set_epoch(g_session, (uint32_t)epoch); }
+std::tuple<int64_t, int64_t, int64_t, int64_t, int> get_fifo_handles_py() {
+    auto h = internode::get_fifo_device_handle(g_session);
+    if (h.num_fifos > 1) {
+        return {(int64_t)(&g_session->fifo_bundle), 0, 0, 0, -h.num_fifos};
+    }
+    auto fd = h.fifos[0];
+    return std::make_tuple(
+        (int64_t)fd.triggers, (int64_t)fd.head, (int64_t)fd.tail,
+        (int64_t)fd.tail_cache, fd.capacity);
+}
+int64_t get_arrival_flags_ptr_py() { return (int64_t)internode::get_arrival_device_ptr(g_session); }
+int64_t get_recv_buf_ptr_py() { return (int64_t)internode::get_recv_buf_ptr(g_session); }
+
+#include <torch/csrc/utils/pybind.h>
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    BIND_DIST_PARALLEL_BUFFER(m);
+    m.def("create_session", &create_session_py,
+          pybind11::arg("rank"), pybind11::arg("peer_ip"), pybind11::arg("tcp_port"),
+          pybind11::arg("send_buf_ptr"), pybind11::arg("send_buf_size"),
+          pybind11::arg("recv_buf_size"), pybind11::arg("num_tiles"),
+          pybind11::arg("fifo_capacity"), pybind11::arg("device_id"),
+          pybind11::arg("external_recv_buf_ptr"),
+          pybind11::arg("pre_tokens_buf_ptr"),
+          pybind11::arg("pre_tokens_buf_size"));
+    m.def("destroy_session", &destroy_session_py);
+    m.def("set_epoch", &set_epoch_py);
+    m.def("get_fifo_handles", &get_fifo_handles_py);
+    m.def("get_arrival_flags_ptr", &get_arrival_flags_ptr_py);
+    m.def("get_recv_buf_ptr", &get_recv_buf_ptr_py);
+    m.def("moe_dispatch_gemm_fused", &moe_dispatch_gemm_multinode::fused,
+          pybind11::arg("pre_tokens"),
+          pybind11::arg("peer_tokens"),
+          pybind11::arg("copy_ready"),
+          pybind11::arg("post_tokens"),
+          pybind11::arg("weights"),
+          pybind11::arg("outputs"),
+          pybind11::arg("padded_tokens_per_expert"),
+          pybind11::arg("pull_dispatch_indices"),
+          pybind11::arg("local_rb_per_expert"),
+          pybind11::arg("barrier"),
+          pybind11::arg("sync_barrier"),
+          pybind11::arg("recv_buf_ptr"),
+          pybind11::arg("fifo_triggers"),
+          pybind11::arg("fifo_head"),
+          pybind11::arg("fifo_tail"),
+          pybind11::arg("fifo_tail_cache"),
+          pybind11::arg("fifo_capacity"),
+          pybind11::arg("arrival_flags_ptr"),
+          pybind11::arg("epoch"),
+          pybind11::arg("node_idx"),
+          pybind11::arg("num_local_tokens"),
+          pybind11::arg("num_padded_local_tokens"),
+          pybind11::arg("num_send_sms"),
+          pybind11::arg("num_copy_sms"),
+          pybind11::arg("num_comm_sms_intra")
+          );
+}
