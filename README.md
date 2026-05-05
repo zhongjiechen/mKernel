@@ -1,4 +1,4 @@
-# mKernel — multi-GPU, multi-node fused kernels
+# mKernel
 
 <div align="center" >
     <img src="figs/mKernel.png" height=350 alt="mKernel" style="margin-bottom:px"/><br/>
@@ -8,9 +8,18 @@
 ## Highlights
 
 - **Multi-GPU + multi-node, in one kernel.** Intra-node NVLink and inter-node live inside the same kernel — the GEMM, the intra-collective, and the inter-node transfer are interleaved at tile granularity, not stitched at the host.
-- **Fine-grained intra-kernel overlapping.** Compute and communication overlap *within* a single kernel at tile granularity — producer CTAs release tiles via on-chip flags the moment they're ready, and consumer CTAs (intra-comm / inter-send / inter-reduce) pick them up immediately, so GEMM math, NVLink traffic, and internode traffic all run concurrently instead of in serialized phases.
-- **Persistent kernel with SM specialization.** All 132 SMs on each H200 are claimed at launch and stay resident; CTAs self-assign roles (compute / intra-comm / inter-send / inter-reduce) by `blockIdx.x`. Producers and consumers communicate through on-chip flags using PTX `ld.acquire` / `st.release`, so the GPU schedules itself instead of round-tripping to the host.
+- **Fine-grained intra-kernel overlapping.** Compute and communication overlap *within* a single kernel at tile/chunk granularity — producer CTAs release tiles via on-chip flags the moment they're ready, and consumer CTAs (intra-comm / inter-send / inter-reduce) pick them up immediately.
+- **Persistent kernel with SM specialization.** All 132 SMs on each H200 are claimed at launch and stay resident; CTAs self-assign roles, such as compute / intra-comm / inter-send / inter-reduce. 
 - **GPU-driven networking, built from scratch.** Using libfabric/libibverbs proxy (`include/comm/internode/`). The GPU itself posts sends and consumes arrivals. 
+
+## Roadmap
+- ✅ Fused, GPU-driven multi-node kernels
+- ✅ Add CX7 and EFA backend
+- 🚧 Support for IBGDA and EFAGDA
+- 🚧 Full support for heterogeneous accelerators and NICs
+  - 🚧 Topology-aware accelerator and NIC discovery, placement, and routing
+- 🚧 Internode megakernels
+- 🚧 Support for Blackwell GPUs
 
 ## Kernels
 
@@ -25,12 +34,31 @@
 ## Quick start
 
 ```sh
-make all                              # build all 5 .so's (both nodes need to do this)
-bash bench/run_2node.sh all bench     # 2-node, all kernels, default shapes
+make all                              # build all 5 .so's against AWS EFA (default)
+make BACKEND=cx7 all                  # build all 5 .so's against ConnectX-7 RC (libibverbs)
+bash bench/run.sh all bench 2         # 2 nodes, all kernels, default shapes
 make plots                            # regenerate the figures below
 ```
 
-## Comparison results
+## Backends
+
+| Backend | Macro | Transport | Where it runs |
+|---|---|---|---|
+| **CX7** | `-DINTERNODE_BACKEND_IBVERBS` | libibverbs RC | ConnectX-7 / InfiniBand / RoCE |
+| **EFA** | `-DINTERNODE_BACKEND_EFA` | libibverbs + efadv (SRD) | AWS p5/p5e (H200, EFA) |
+
+Both backends share the same host-side API and the same on-GPU kernel; only the proxy / session implementation differs (`include/comm/internode/session.h` for CX7, `session_efa.h` for EFA).
+
+## Comparison results — ConnectX-7
+
+| Kernel | Plot |
+|---|---|
+| AllGather + GEMM | ![ag_gemm_cx7](plots/ag_gemm_cx7.png) |
+| GEMM + AllReduce | ![gemm_ar_cx7](plots/gemm_ar_cx7.png) |
+| Ring Attention | ![ring_attention_cx7](plots/ring_attn_cx7.png) |
+| GEMM + ReduceScatter | ![gemm_rs_cx7](plots/gemm_rs_cx7.png) |
+
+## Comparison results — AWS EFA
 
 | Kernel | Plot |
 |---|---|
@@ -39,6 +67,7 @@ make plots                            # regenerate the figures below
 | MoE Dispatch + GEMM | ![dispatch_gemm](plots/dispatch_gemm_efa.png) |
 | Ring Attention | ![ring_attention](plots/ring_attention_efa.png) |
 | GEMM + ReduceScatter | ![gemm_rs](plots/gemm_rs_efa.png) |
+
 
 ## Acknowledgements
 

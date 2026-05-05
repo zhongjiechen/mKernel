@@ -19,7 +19,8 @@ import load_module  # noqa: E402
 from common import compare_named_results  # noqa: E402
 
 KERNEL_NAME = "ring_attention"
-NUM_NODES = 2
+from common import get_num_nodes  # noqa: E402
+NUM_NODES = get_num_nodes()
 BATCH = 4
 HEADS = 16
 D = 128
