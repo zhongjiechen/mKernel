@@ -1,5 +1,10 @@
 # mKernel — multi-GPU, multi-node fused kernels
 
+<div align="center" >
+    <img src="figs/mKernel.png" height=350 alt="mKernel" style="margin-bottom:px"/><br/>
+    <em>mKernel: multi-GPU, multi-node fused kernels</em><br/><br/>
+</div>
+
 ## Highlights
 
 - **Multi-GPU + multi-node, in one kernel.** Intra-node NVLink and inter-node live inside the same kernel — the GEMM, the intra-collective, and the inter-node transfer are interleaved at tile granularity, not stitched at the host.
