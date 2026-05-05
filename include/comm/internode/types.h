@@ -69,6 +69,30 @@ __host__ __device__ inline uint32_t unpack_arrival_num_tiles(uint32_t packed) {
 
 static constexpr int kMaxExchangeQPs = 24;
 static constexpr int kMaxRails = 4;
+// Cap on inter-node peer slots per session (== num_nodes - 1). The 2-node
+// case uses 1; left generous so a single header bump can support larger
+// N-node tests.
+static constexpr int kMaxPeers = 16;
+
+// Map a peer slot index to a global node rank, in "skip self" ordering:
+//   slot 0 = (node_idx + 1) % num_nodes
+//   slot 1 = (node_idx + 2) % num_nodes
+//   ...
+//   slot num_nodes - 2 = (node_idx + num_nodes - 1) % num_nodes
+//
+// For num_nodes == 2, slot 0 returns 1 - node_idx — bit-identical to today's
+// hard-coded `(uint8_t)(1 - G.node_idx)` 2-node peer.
+//
+// Used by every kernel's inter-node send path to fan out (num_nodes - 1)
+// commands per logical send. The session-side peer_slot_by_rank[] table
+// inverts this mapping for proxy-side dispatch.
+__host__ __device__ inline int peer_rank_for_slot(int node_idx,
+                                                   int num_nodes,
+                                                   int peer_slot) {
+    int r = node_idx + 1 + peer_slot;
+    if (r >= num_nodes) r -= num_nodes;
+    return r;
+}
 
 // Per-rail RDMA registration keys exchanged during TCP bootstrap.
 // Rail 0 uses the primary fields in ConnectionInfo; rails 1+ use these.

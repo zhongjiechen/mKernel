@@ -31,7 +31,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results  # noqa: E402
+from common import compare_named_results, get_peer_ips  # noqa: E402
 
 KERNEL_NAME = "dispatch_gemm"
 
@@ -261,6 +261,7 @@ def main():
               f"creating session peer={peer_ip}:{tcp_port}", flush=True)
         # Zero-copy send: register pre_tokens as the proxy's data MR. Kernel
         # reads straight from pre_tokens — no send_buf pack required.
+        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             send_buf.data_ptr(), pre_tokens_bytes,
@@ -268,6 +269,7 @@ def main():
             external_recv_buf_ptr,
             int(pre_tokens.data_.data_ptr()),
             pre_tokens_bytes,
+            peer_ips=peer_ips,
         )
         print(f"[dispatch_gemm] node{node_idx}/lr{local_rank} session created", flush=True)
         fifo = mod.get_fifo_handles()
@@ -292,6 +294,7 @@ def main():
                 arrival_ptr, epoch,
                 node_idx, num_local_tokens, num_padded_local,
                 n_send, n_copy, n_comm,
+                num_nodes=NUM_NODES,
             )
 
         def reset_state():

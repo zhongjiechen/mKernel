@@ -27,6 +27,26 @@ import load_module  # noqa: E402
 # Distributed init / launcher helpers
 # ----------------------------------------------------------------------
 
+_PEER_IP_DEFAULTS = {0: "172.31.1.237", 1: "172.31.11.6"}
+
+
+def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
+    """Resolve the list of peer IPs (length num_nodes - 1) for this node.
+
+    Reads NODE0_IP, NODE1_IP, ..., NODE{N-1}_IP from the environment, falling
+    back to the 2-node testbed defaults when the env var is unset (only sane
+    for N <= 2). Returns the list of OTHER nodes' IPs in slot order, skipping
+    self.
+    """
+    all_ips = []
+    for i in range(num_nodes):
+        ip = os.environ.get(f"NODE{i}_IP")
+        if not ip:
+            ip = _PEER_IP_DEFAULTS.get(i, "")
+        all_ips.append(ip)
+    return [ip for i, ip in enumerate(all_ips) if i != node_idx]
+
+
 def get_num_nodes() -> int:
     """Resolve number of nodes from the NUM_NODES env var (default: 2).
 

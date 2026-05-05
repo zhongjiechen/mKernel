@@ -310,7 +310,10 @@ struct fused_globals {
     // Dimensions
     int N;                    // output columns
     int dev_idx;              // local rank (0..7)
-    int node_idx;             // 0 or 1
+    int node_idx;             // 0 or 1 in the validated 2-node config
+    int num_nodes;            // total node count (>= 2). Scaffolding for
+                              // N-node fan-out; receive-buffer sizing not
+                              // yet generalized for N > 2.
     int slice_rows;           // M / NUM_DEVICES
     int row_blocks_per_slice; // slice_rows / ROW_BLOCK
     int col_blocks;           // N / COL_BLOCK
@@ -1136,7 +1139,8 @@ __host__ inline fused_globals gemm_ar_make_globals(
     int num_qps, int num_remote_queues,
     const gemm_ar_role_split& split,
     const gemm_ar_scratch_layout& scratch,
-    int64_t cross_node_barrier_ptr = 0
+    int64_t cross_node_barrier_ptr = 0,
+    int num_nodes = 2
 ) {
     fused_globals G{
         .A = ::dist::gl_from_tensor<fused_globals::A_gl>(A),
@@ -1231,6 +1235,7 @@ __host__ inline fused_globals gemm_ar_make_globals(
         .N = B.size(1),
         .dev_idx = C.local_rank_,
         .node_idx = node_idx,
+        .num_nodes = num_nodes,
         .slice_rows = scratch.slice_rows,
         .row_blocks_per_slice = scratch.row_blocks_per_slice,
         .col_blocks = scratch.col_blocks,
@@ -1297,7 +1302,8 @@ void entrypoint(
     // Iter-44 D×S×F: launch-time gate that, when true, selects
     // `wait_acquire()` (ld.acquire.sys) over `wait()` (ld.relaxed.sys) at the
     // intra-AR xdev barrier wait. Default false preserves canonical behavior.
-    bool use_acquire_poll = false
+    bool use_acquire_poll = false,
+    int num_nodes = 2
 ) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -1349,7 +1355,7 @@ void entrypoint(
         staging_buf_ptr, recv_buf_ptr, fifo_bundle,
         arrival_flags_ptr, arrival_tails_ptr, epoch, node_idx, ar_done_ptr,
         num_qps, num_remote_queues, split, scratch,
-        cross_node_barrier_ptr);
+        cross_node_barrier_ptr, num_nodes);
     // Small shapes: finish multicast in the main kernel to avoid the extra
     // epilogue launch overhead. For larger shapes, keep the epilogue path.
     const bool need_epilogue = (scratch.total_chunks > 16);

@@ -43,6 +43,23 @@
 namespace internode {
 
 
+// Per-peer endpoint info for the proxy hot path. Each proxy thread owns
+// QPs on a single local rail; for each peer slot p, peers[p] holds the
+// data the hot path needs to post a WR to peer p over THIS rail. Filled in
+// by session_efa.h create_session() when handing off ProxyConfig.
+struct PerPeerProxyData {
+    ibv_ah*  dst_ah                = nullptr;
+    uint32_t dst_qpns[kMaxExchangeQPs] = {};
+    uint64_t remote_data_addr      = 0;
+    uint32_t remote_data_rkey      = 0;
+    uint64_t remote_flags_addr     = 0;
+    uint32_t remote_flags_rkey     = 0;
+    uint64_t remote_tail_addr      = 0;
+    uint32_t remote_tail_rkey      = 0;
+    uint64_t remote_barrier_addr   = 0;
+    uint32_t remote_barrier_rkey   = 0;
+};
+
 struct ProxyConfig {
     D2HFifoHost*  fifo;
     // Multi-fifo extension. When num_fifos > 1, run() rotates current_fifo_idx
@@ -138,6 +155,18 @@ struct ProxyConfig {
     // and this field is absent.
     int64_t       gpu_to_host_offset_ns = 0;
 #endif
+
+    // Multi-peer routing. When num_peers > 1, the hot path resolves
+    // peer_slot = peer_slot_by_rank[cmd.dst_rank] and indexes into per_peer
+    // for AH/dst_qpns/remote_*. peer_slot_by_rank is owned by the Session
+    // (lifetime > Proxy); per_peer is owned by the Session too.
+    //
+    // For num_peers == 1 (the validated 2-node configuration) per_peer is
+    // optional and unused — the existing scalar dst_ah / dst_qpns / remote_*
+    // fields above are read directly so the fast path is byte-identical.
+    int                  num_peers           = 1;
+    const PerPeerProxyData* per_peer         = nullptr;  // length = num_peers
+    const int*           peer_slot_by_rank   = nullptr;  // length = kMaxPeers + 1
 };
 
 class Proxy {
@@ -624,6 +653,7 @@ private:
     }
 
     void post_write_imm_batch(ibv_qp_ex* qpx, uint32_t dst_qpn,
+                              const PerPeerProxyData& eff,
                               const TransferCmd* batch, int count) {
         for (int i = 0; i < count; i++) {
             const TransferCmd& cmd = batch[i];
@@ -636,10 +666,10 @@ private:
             qpx->comp_mask = 0;
             qpx->wr_flags = IBV_SEND_SIGNALED;
             ibv_wr_rdma_write_imm(qpx,
-                cfg_.remote_data_rkey,
-                cfg_.remote_data_addr + cmd.remote_offset,
+                eff.remote_data_rkey,
+                eff.remote_data_addr + cmd.remote_offset,
                 htonl(static_cast<uint32_t>(cmd.tile_id)));
-            ibv_wr_set_ud_addr(qpx, cfg_.dst_ah, dst_qpn, rdma::QKEY);
+            ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
             // Src MR selection: direct-DMA-BUF (src_view=1) sources from the
             // caller-owned output buffer; default (src_view=0) sources from
             // the staging buffer. Strided (src_view=2) isn't implemented here
@@ -659,6 +689,7 @@ private:
     }
 
     void post_remote_flag_batch(ibv_qp_ex* qpx, uint32_t dst_qpn,
+                                const PerPeerProxyData& eff,
                                 const TransferCmd* batch, int count) {
 #ifndef Q2_ARRIVAL_QUEUE
         // Flat layout: every command's flag slot is (tile_id * 4) from the base
@@ -686,9 +717,9 @@ private:
             qpx->comp_mask = 0;
             qpx->wr_flags = IBV_SEND_SIGNALED;
             ibv_wr_rdma_write(qpx,
-                cfg_.remote_data_rkey,
-                cfg_.remote_data_addr + cmd.remote_offset);
-            ibv_wr_set_ud_addr(qpx, cfg_.dst_ah, dst_qpn, rdma::QKEY);
+                eff.remote_data_rkey,
+                eff.remote_data_addr + cmd.remote_offset);
+            ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
             if (cfg_.direct_dmabuf_enabled && cmd.src_view == 1) {
                 ibv_wr_set_sge(qpx,
                     cfg_.clocal_data_lkey,
@@ -710,9 +741,9 @@ private:
             qpx->comp_mask = 0;
             qpx->wr_flags = IBV_SEND_SIGNALED;
             ibv_wr_rdma_write(qpx,
-                cfg_.remote_flags_rkey,
-                cfg_.remote_flags_addr + cmd.tile_id * sizeof(uint32_t));
-            ibv_wr_set_ud_addr(qpx, cfg_.dst_ah, dst_qpn, rdma::QKEY);
+                eff.remote_flags_rkey,
+                eff.remote_flags_addr + cmd.tile_id * sizeof(uint32_t));
+            ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
             ibv_wr_set_sge(qpx,
                 cfg_.flag_staging->mr->lkey,
                 (uint64_t)cfg_.flag_staging->host_ptr,
@@ -736,7 +767,7 @@ private:
             const uint32_t logical_q = (total_logical_queues > 0)
                 ? (cmd.lane_id % total_logical_queues) : 0u;
             const uint32_t q_slot = sender_seq_[logical_q]++;
-            const uint64_t flag_remote_addr = cfg_.remote_flags_addr +
+            const uint64_t flag_remote_addr = eff.remote_flags_addr +
                 (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) *
                 sizeof(uint32_t);
 
@@ -745,12 +776,12 @@ private:
             // tail completion instead. Otherwise, the flag WR is the last WR
             // for this command and carries wr_id=1.
             const bool has_tail = cfg_.enable_remote_tail &&
-                                  cfg_.remote_tail_addr != 0;
+                                  eff.remote_tail_addr != 0;
             qpx->wr_id = has_tail ? 0 : 1;
             qpx->comp_mask = 0;
             qpx->wr_flags = IBV_SEND_SIGNALED;
-            ibv_wr_rdma_write(qpx, cfg_.remote_flags_rkey, flag_remote_addr);
-            ibv_wr_set_ud_addr(qpx, cfg_.dst_ah, dst_qpn, rdma::QKEY);
+            ibv_wr_rdma_write(qpx, eff.remote_flags_rkey, flag_remote_addr);
+            ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
             ibv_wr_set_sge(qpx,
                 cfg_.flag_staging->mr->lkey,
                 (uint64_t)(cfg_.flag_staging->host_ptr + flag_slot),
@@ -764,9 +795,9 @@ private:
                 qpx->comp_mask = 0;
                 qpx->wr_flags = IBV_SEND_SIGNALED;
                 ibv_wr_rdma_write(qpx,
-                    cfg_.remote_tail_rkey,
-                    cfg_.remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t));
-                ibv_wr_set_ud_addr(qpx, cfg_.dst_ah, dst_qpn, rdma::QKEY);
+                    eff.remote_tail_rkey,
+                    eff.remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t));
+                ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
                 ibv_wr_set_sge(qpx,
                     cfg_.flag_staging->mr->lkey,
                     (uint64_t)(cfg_.flag_staging->host_ptr + tail_slot),
@@ -1002,13 +1033,31 @@ private:
                 }
 
                 ibv_qp_ex* qpx = qpx_[batch_qp];
-                const uint32_t dst_qpn = cfg_.dst_qpns[batch_qp];
+
+                // Resolve the per-peer endpoint for this batch. Today's
+                // batch-fill loop only breaks on QP changes — for N>2
+                // we'd need to also break on cmd.dst_rank changes to keep
+                // batches single-peer. At N=2 every cmd.dst_rank is the
+                // same value (1 - node_idx), so single-peer-per-batch
+                // already holds. For num_peers <= 1 we use per_peer[0]
+                // unconditionally; per_peer[0] aliases the legacy fields
+                // at slot 0, so the fast path is byte-identical.
+                int peer_slot = 0;
+                if (cfg_.num_peers > 1 && cfg_.peer_slot_by_rank != nullptr) {
+                    const uint8_t r = batch[0].dst_rank;
+                    const int s = cfg_.peer_slot_by_rank[r];
+                    if (s >= 0) peer_slot = s;
+                }
+                // Session always populates per_peer (slot 0 mirrors the
+                // legacy single-peer fields in the 2-node config).
+                const PerPeerProxyData& eff = cfg_.per_peer[peer_slot];
+                const uint32_t dst_qpn = eff.dst_qpns[batch_qp];
 
                 ibv_wr_start(qpx);
                 if (notify_mode_ == NotifyMode::RemoteFlag) {
-                    post_remote_flag_batch(qpx, dst_qpn, batch, count);
+                    post_remote_flag_batch(qpx, dst_qpn, eff, batch, count);
                 } else {
-                    post_write_imm_batch(qpx, dst_qpn, batch, count);
+                    post_write_imm_batch(qpx, dst_qpn, eff, batch, count);
                 }
 
                 int ret = ibv_wr_complete(qpx);

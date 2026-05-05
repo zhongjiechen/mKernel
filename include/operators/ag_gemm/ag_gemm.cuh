@@ -131,6 +131,13 @@ struct globals {
 
     const int dev_idx;
     const int node_idx;
+    // Total node count (>= 2). For N == 2 the kernel's inter-node fan-out
+    // loop runs once with peer rank == 1 - node_idx — bit-identical to the
+    // legacy 2-node code path. For N > 2 the loop runs (N - 1) times,
+    // writing each peer's dst_rank in turn. The buffer / arrival-flag
+    // sizing required for true N > 2 operation is NOT yet in place; this
+    // field is scaffolding for kernel-side multi-peer iteration only.
+    const int num_nodes;
     const int num_intra_comm;  // CTAs for intra-node IPC gather + RDMA push
     const int num_comp_sms;    // CTAs for GEMM compute
 
@@ -212,20 +219,31 @@ __device__ inline void post_merge_wrs_for_intra_row(
         int chunks_per_sub = chunks_per_rb / split;
         uint32_t bytes_per_sub = (uint32_t)(chunks_per_sub * CHUNK_BYTES);
 
+        // Fan out one cmd per peer (num_nodes - 1 peers). The buffer and
+        // arrival-flag layouts haven't been generalized for N > 2 yet, so
+        // for N > 2 multiple peers would race on the same recv slot —
+        // tracked under "kernel-side multi-peer scaffolding". For N == 2
+        // (the validated configuration) the loop runs once with the
+        // legacy peer rank.
+        const int n_peers = G.num_nodes - 1;
         if (split == 1) {
             // Fast-path unchanged behavior: single WR per rb, keyed by rb.
-            internode::TransferCmd cmd{};
-            cmd.cmd_type = internode::CmdType::WRITE;
-            cmd.dst_rank = (uint8_t)(1 - G.node_idx);
-            cmd.tile_id = (uint16_t)first_chunk;
-            cmd.bytes = rb_bytes;
-            cmd.local_offset = base_offset;
-            cmd.remote_offset = base_offset;
-            cmd.src_view = 1;
-            cmd.lane_id = (uint16_t)rb;
-            internode::D2HFifoDevice fifo =
-                internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)rb);
-            fifo.push(cmd);
+            for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                const int peer_rank = internode::peer_rank_for_slot(
+                    G.node_idx, G.num_nodes, peer_slot);
+                internode::TransferCmd cmd{};
+                cmd.cmd_type = internode::CmdType::WRITE;
+                cmd.dst_rank = (uint8_t)peer_rank;
+                cmd.tile_id = (uint16_t)first_chunk;
+                cmd.bytes = rb_bytes;
+                cmd.local_offset = base_offset;
+                cmd.remote_offset = base_offset;
+                cmd.src_view = 1;
+                cmd.lane_id = (uint16_t)rb;
+                internode::D2HFifoDevice fifo =
+                    internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)rb);
+                fifo.push(cmd);
+            }
         } else {
             for (int sw = 0; sw < split; ++sw) {
                 int sub_first_chunk = first_chunk + sw * chunks_per_sub;
@@ -233,19 +251,23 @@ __device__ inline void post_merge_wrs_for_intra_row(
                 uint32_t sub_end = sub_base + bytes_per_sub;
                 if (sw == split - 1 && sub_end > end_offset) sub_end = end_offset;
                 uint32_t sub_bytes = sub_end - sub_base;
-                internode::TransferCmd cmd{};
-                cmd.cmd_type = internode::CmdType::WRITE;
-                cmd.dst_rank = (uint8_t)(1 - G.node_idx);
-                cmd.tile_id = (uint16_t)sub_first_chunk;
-                cmd.bytes = sub_bytes;
-                cmd.local_offset = sub_base;
-                cmd.remote_offset = sub_base;
-                cmd.src_view = 1;
-                cmd.lane_id = (uint16_t)(rb * split + sw);
-                internode::D2HFifoDevice fifo =
-                    internode::gemm_ar_select_fifo_for_lane(
-                        G.d2h_fifos, (uint32_t)(rb * split + sw));
-                fifo.push(cmd);
+                for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                    const int peer_rank = internode::peer_rank_for_slot(
+                        G.node_idx, G.num_nodes, peer_slot);
+                    internode::TransferCmd cmd{};
+                    cmd.cmd_type = internode::CmdType::WRITE;
+                    cmd.dst_rank = (uint8_t)peer_rank;
+                    cmd.tile_id = (uint16_t)sub_first_chunk;
+                    cmd.bytes = sub_bytes;
+                    cmd.local_offset = sub_base;
+                    cmd.remote_offset = sub_base;
+                    cmd.src_view = 1;
+                    cmd.lane_id = (uint16_t)(rb * split + sw);
+                    internode::D2HFifoDevice fifo =
+                        internode::gemm_ar_select_fifo_for_lane(
+                            G.d2h_fifos, (uint32_t)(rb * split + sw));
+                    fifo.push(cmd);
+                }
             }
         }
     }
@@ -273,7 +295,12 @@ void entrypoint(
     int a_half_bytes,
     dist::ParallelBuffer& A_recv,  // #8: multicast-backed peer A_half
     const int active_sms = config::NUM_BLOCKS,
-    int num_intra_comm_override = 0
+    int num_intra_comm_override = 0,
+    int num_nodes = 2  // total node count (>= 2). N == 2 reproduces the
+                       // legacy 2-node behavior bit-for-bit. N > 2 routes
+                       // each cmd to the right peer rank but receive
+                       // buffers / arrival flags are still single-peer-
+                       // sized — finishing N > 2 needs a 4-node testbed.
 ) {
     TORCH_CHECK(B.is_cuda() && B.is_contiguous(), "B must be contiguous CUDA");
     TORCH_CHECK(C.is_cuda() && C.is_contiguous(), "C must be contiguous CUDA");
@@ -391,6 +418,7 @@ void entrypoint(
         .a_half_bytes = a_half_bytes,
         .dev_idx = dev_idx,
         .node_idx = node_idx,
+        .num_nodes = num_nodes,
         .num_intra_comm = num_intra_comm,
         .num_comp_sms = num_comp_sms,
     };

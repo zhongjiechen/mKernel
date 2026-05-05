@@ -547,21 +547,30 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
 
             if (tid == 0) {
                 const uint32_t offset = (uint32_t)((long)pack_first_tile * TILE_BYTES);
-                internode::TransferCmd cmd{};
-                cmd.cmd_type = internode::CmdType::WRITE;
-                cmd.dst_rank = (uint8_t)(1 - G.node_idx);
-                cmd.tile_id = (uint16_t)pack_first_tile;
-                cmd.bytes = (uint32_t)((long)group_tiles * TILE_BYTES);
-                cmd.local_offset = offset;
-                cmd.src_view = 0;
-                // EFAGDA: encode num_tiles in imm so receiver marks all
-                // group_tiles chunks arrived (proxy_efa.h:724 equivalent).
-                cmd.row_count = (uint16_t)group_tiles;
-                cmd.remote_offset = offset;
-                cmd.lane_id = (uint16_t)logical_q;
-                cmd.enqueue_device_ns = gemm_ar_globaltimer();
-                // v2 default: per-WR fence + DB. Safe across all shapes.
-                gemm_ar_post_send_cmd(G, send_id, logical_q, cmd);
+                // Fan out to every peer. For N == 2 the loop runs once with
+                // peer rank == 1 - node_idx (legacy behavior). N > 2
+                // currently double-writes the same remote slot — needs
+                // per-peer remote_offset to be correct.
+                const int n_peers = G.num_nodes - 1;
+                for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                    const int peer_rank = internode::peer_rank_for_slot(
+                        G.node_idx, G.num_nodes, peer_slot);
+                    internode::TransferCmd cmd{};
+                    cmd.cmd_type = internode::CmdType::WRITE;
+                    cmd.dst_rank = (uint8_t)peer_rank;
+                    cmd.tile_id = (uint16_t)pack_first_tile;
+                    cmd.bytes = (uint32_t)((long)group_tiles * TILE_BYTES);
+                    cmd.local_offset = offset;
+                    cmd.src_view = 0;
+                    // EFAGDA: encode num_tiles in imm so receiver marks all
+                    // group_tiles chunks arrived (proxy_efa.h:724 equivalent).
+                    cmd.row_count = (uint16_t)group_tiles;
+                    cmd.remote_offset = offset;
+                    cmd.lane_id = (uint16_t)logical_q;
+                    cmd.enqueue_device_ns = gemm_ar_globaltimer();
+                    // v2 default: per-WR fence + DB. Safe across all shapes.
+                    gemm_ar_post_send_cmd(G, send_id, logical_q, cmd);
+                }
                 atomicAdd(G.send_issued_chunks, 1u);
                 __threadfence();
             }

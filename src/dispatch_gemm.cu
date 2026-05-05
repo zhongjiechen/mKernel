@@ -44,17 +44,22 @@ __device__ inline void fused_inter_send_sm(const fused_globals &G) {
         for (int chunk_id = my_pusher; chunk_id < G.total_chunks; chunk_id += total_pushers) {
             uint32_t off = (uint32_t)(chunk_id * CHUNK_BYTES);
             uint32_t bytes = min(CHUNK_BYTES, G.pre_tokens_bytes - (int)off);
-            internode::TransferCmd cmd{};
-            cmd.cmd_type = internode::CmdType::WRITE;
-            cmd.dst_rank = (uint8_t)(1 - G.node_idx);
-            cmd.tile_id = (uint16_t)chunk_id;
-            cmd.bytes = bytes;
-            cmd.local_offset = off;
-            cmd.remote_offset = off;
-            cmd.lane_id = (uint16_t)chunk_id;
-            internode::D2HFifoDevice fifo =
-                internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
-            fifo.push(cmd);
+            const int n_peers = G.num_nodes - 1;
+            for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                const int peer_rank = internode::peer_rank_for_slot(
+                    G.node_idx, G.num_nodes, peer_slot);
+                internode::TransferCmd cmd{};
+                cmd.cmd_type = internode::CmdType::WRITE;
+                cmd.dst_rank = (uint8_t)peer_rank;
+                cmd.tile_id = (uint16_t)chunk_id;
+                cmd.bytes = bytes;
+                cmd.local_offset = off;
+                cmd.remote_offset = off;
+                cmd.lane_id = (uint16_t)chunk_id;
+                internode::D2HFifoDevice fifo =
+                    internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
+                fifo.push(cmd);
+            }
         }
     }
 }

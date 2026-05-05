@@ -80,16 +80,35 @@ pybind11::dict get_globaltimer_calibration_py(int samples = 64) {
 } // namespace
 
 static internode::Session* g_session = nullptr;
+static std::vector<std::string> g_peer_ips_storage;
+static std::vector<const char*> g_peer_ips_cstr;
+static std::vector<int>         g_peer_ports_storage;
 void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int64_t send_buf_ptr, int64_t send_buf_size,
                        int64_t recv_buf_size, int num_tiles,
                        int fifo_capacity, int device_id,
                        int64_t clocal_buf_ptr = 0,
                        int64_t clocal_buf_size = 0,
-                       int64_t row_stride_bytes = 0) {
+                       int64_t row_stride_bytes = 0,
+                       std::vector<std::string> peer_ips = {},
+                       std::vector<int> peer_tcp_ports = {}) {
     if (g_session) { internode::destroy_session(g_session); g_session = nullptr; }
     internode::SessionConfig cfg{}; cfg.rank = rank; cfg.peer_ip = peer_ip.c_str();
     cfg.tcp_port = tcp_port; cfg.local_gpu_buf = reinterpret_cast<void*>(send_buf_ptr);
+    if (!peer_ips.empty()) {
+        g_peer_ips_storage   = std::move(peer_ips);
+        g_peer_ports_storage = std::move(peer_tcp_ports);
+        if (g_peer_ports_storage.empty()) {
+            g_peer_ports_storage.assign(g_peer_ips_storage.size(), tcp_port);
+        }
+        g_peer_ips_cstr.resize(g_peer_ips_storage.size());
+        for (size_t i = 0; i < g_peer_ips_storage.size(); ++i) {
+            g_peer_ips_cstr[i] = g_peer_ips_storage[i].c_str();
+        }
+        cfg.num_peers      = (int)g_peer_ips_storage.size();
+        cfg.peer_ips       = g_peer_ips_cstr.data();
+        cfg.peer_tcp_ports = g_peer_ports_storage.data();
+    }
     cfg.local_gpu_buf_size = (size_t)send_buf_size; cfg.recv_buf_size = (size_t)recv_buf_size;
     cfg.num_tiles = num_tiles; cfg.fifo_capacity = fifo_capacity;
     cfg.device_id = device_id; cfg.max_inflight = 256;
@@ -205,7 +224,16 @@ void set_ready_queue_total_py(int total) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
-    m.def("create_session", &create_session_py);
+    m.def("create_session", &create_session_py,
+          pybind11::arg("rank"), pybind11::arg("peer_ip"), pybind11::arg("tcp_port"),
+          pybind11::arg("send_buf_ptr"), pybind11::arg("send_buf_size"),
+          pybind11::arg("recv_buf_size"), pybind11::arg("num_tiles"),
+          pybind11::arg("fifo_capacity"), pybind11::arg("device_id"),
+          pybind11::arg("clocal_buf_ptr") = 0,
+          pybind11::arg("clocal_buf_size") = 0,
+          pybind11::arg("row_stride_bytes") = 0,
+          pybind11::arg("peer_ips") = std::vector<std::string>{},
+          pybind11::arg("peer_tcp_ports") = std::vector<int>{});
     m.def("destroy_session", &destroy_session_py);
     m.def("set_epoch", &set_epoch_py);
     m.def("get_proxy_diagnostics", &get_proxy_diagnostics_py);
@@ -247,6 +275,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("rq_total") = 0,
           pybind11::arg("cross_node_barrier_ptr") = (int64_t)0,
           pybind11::arg("trace_slot") = -1,
-          pybind11::arg("use_acquire_poll") = false);
+          pybind11::arg("use_acquire_poll") = false,
+          pybind11::arg("num_nodes") = 2);
 }
 // -- END inlined from gemm_ar_multinode_module.cuh

@@ -166,6 +166,8 @@ struct kv_exchange_globals {
     int   total_chunks_K;
     int   total_chunks_V;
     int   node_idx;
+    int   num_nodes;  // total node count (>= 2). Scaffolding for multi-
+                      // peer K/V exchange; recv_buf still single-peer-sized.
     int   num_send_sms;
     int   num_copy_sms;
 
@@ -240,7 +242,9 @@ inline void entrypoint(
     int node_idx,
     int num_comm_sms,
     int num_send_sms,
-    int num_copy_sms
+    int num_copy_sms,
+    int num_nodes = 2  // total node count (>= 2). N == 2 reproduces the
+                       // legacy 2-node behavior bit-for-bit.
 ) {
     const int dev_idx = barrier.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -306,6 +310,7 @@ inline void entrypoint(
         .total_chunks_K = total_chunks_K,
         .total_chunks_V = total_chunks_V,
         .node_idx = node_idx,
+        .num_nodes = num_nodes,
         .num_send_sms = n_send,
         .num_copy_sms = n_copy,
         .d2h_fifos = fifo_bundle,

@@ -10,6 +10,9 @@
 #include <torch/csrc/utils/pybind.h>
 
 static internode::Session* g_session = nullptr;
+static std::vector<std::string> g_peer_ips_storage;
+static std::vector<const char*> g_peer_ips_cstr;
+static std::vector<int>         g_peer_ports_storage;
 
 void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int64_t send_buf_ptr, int64_t send_buf_size,
@@ -18,12 +21,28 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int64_t k0_buf_ptr,
                        int64_t k0_buf_size,
                        int64_t v0_buf_ptr,
-                       int64_t v0_buf_size) {
+                       int64_t v0_buf_size,
+                       std::vector<std::string> peer_ips = {},
+                       std::vector<int> peer_tcp_ports = {}) {
     if (g_session) { internode::destroy_session(g_session); g_session = nullptr; }
     internode::SessionConfig cfg{};
     cfg.rank = rank;
     cfg.peer_ip = peer_ip.c_str();
     cfg.tcp_port = tcp_port;
+    if (!peer_ips.empty()) {
+        g_peer_ips_storage   = std::move(peer_ips);
+        g_peer_ports_storage = std::move(peer_tcp_ports);
+        if (g_peer_ports_storage.empty()) {
+            g_peer_ports_storage.assign(g_peer_ips_storage.size(), tcp_port);
+        }
+        g_peer_ips_cstr.resize(g_peer_ips_storage.size());
+        for (size_t i = 0; i < g_peer_ips_storage.size(); ++i) {
+            g_peer_ips_cstr[i] = g_peer_ips_storage[i].c_str();
+        }
+        cfg.num_peers      = (int)g_peer_ips_storage.size();
+        cfg.peer_ips       = g_peer_ips_cstr.data();
+        cfg.peer_tcp_ports = g_peer_ports_storage.data();
+    }
     // Zero-copy send: K0 (src_view=0) and V0 (src_view=1) registered as
     // DMA-BUF MRs. Proxy posts single-SGE WRs straight from the VMM tensors
     // — no pack copy. send_buf_ptr/size are kept in the signature for
@@ -75,7 +94,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("recv_buf_size"), pybind11::arg("num_tiles"),
           pybind11::arg("fifo_capacity"), pybind11::arg("device_id"),
           pybind11::arg("k0_buf_ptr"), pybind11::arg("k0_buf_size"),
-          pybind11::arg("v0_buf_ptr"), pybind11::arg("v0_buf_size"));
+          pybind11::arg("v0_buf_ptr"), pybind11::arg("v0_buf_size"),
+          pybind11::arg("peer_ips") = std::vector<std::string>{},
+          pybind11::arg("peer_tcp_ports") = std::vector<int>{});
     m.def("destroy_session", &destroy_session_py);
     m.def("set_epoch", &set_epoch_py);
     m.def("get_fifo_handles", &get_fifo_handles_py);
@@ -104,5 +125,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("node_idx"),
           pybind11::arg("num_comm_sms"),
           pybind11::arg("num_send_sms"),
-          pybind11::arg("num_copy_sms"));
+          pybind11::arg("num_copy_sms"),
+          pybind11::arg("num_nodes") = 2);
 }
