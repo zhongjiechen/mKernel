@@ -35,3 +35,11 @@ make plots                            # regenerate the figures below
 | Ring Attention | ![ring_attention](plots/ring_attention_efa.png) |
 | GEMM + ReduceScatter | ![gemm_rs](plots/gemm_rs_efa.png) |
 
+## Acknowledgements
+
+The MMA / compute code is adapted from [ThunderKittens](https://github.com/HazyResearch/ThunderKittens) (HazyResearch). Many thanks to the TK authors for the tile-level abstractions and warpgroup MMA primitives we build on top of.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
