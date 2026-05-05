@@ -7,8 +7,23 @@
 #   make plots     — regenerate TFLOPS bar charts under release/plots/
 #   make clean     — remove release/build/
 
-# === Backend (the only backend macro in the entire release) ===
-BACKEND_DEFINES := -DINTERNODE_BACKEND_EFA
+# === Backend selection ===
+#
+# Two backends are supported:
+#   BACKEND=efa  → AWS EFA SRD via libibverbs+efadv (default)
+#   BACKEND=cx7  → ConnectX-7 RC via libibverbs (InfiniBand / RoCE)
+#
+# Override with: `make BACKEND=cx7 all`
+BACKEND ?= efa
+ifeq ($(BACKEND),efa)
+    BACKEND_DEFINES := -DINTERNODE_BACKEND_EFA
+    BACKEND_LIBS    := -L$(EFA_HOME)/lib -lfabric -libverbs -lefa
+else ifeq ($(BACKEND),cx7)
+    BACKEND_DEFINES := -DINTERNODE_BACKEND_IBVERBS
+    BACKEND_LIBS    := -libverbs
+else
+    $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7.)
+endif
 
 # === Tooling ===
 CUDA_HOME       ?= /usr/local/cuda-12.9
@@ -20,7 +35,11 @@ PYTHON          ?= /home/ubuntu/efs/yzhou/uccl/.venv/bin/python3
 # === Include paths (must precede LDFLAGS — TORCH_LIB feeds both) ===
 HERE            := $(abspath .)
 INC_RELEASE     := -I$(HERE)/include
-INC_EFA         := -I$(EFA_HOME)/include
+ifeq ($(BACKEND),efa)
+    INC_EFA     := -I$(EFA_HOME)/include
+else
+    INC_EFA     :=
+endif
 PY_INC          := $(shell $(PYTHON) -c "import sysconfig; print('-I'+sysconfig.get_path('include'))")
 TORCH_INC       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(' '.join('-I'+p for p in e.include_paths()))")
 TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(e.library_paths()[0])")
@@ -29,7 +48,7 @@ TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; 
 ARCH            := -gencode arch=compute_90a,code=sm_90a
 COMMON_DEFINES  := -DKITTENS_HOPPER -DTK_NUM_DEVICES=8 $(BACKEND_DEFINES)
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH)
-LDFLAGS         := -shared -lcuda -L$(EFA_HOME)/lib -lfabric -libverbs -lefa \
+LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
                    -Xlinker -rpath -Xlinker $(TORCH_LIB)
 
