@@ -40,7 +40,8 @@ H = 7168
 I = 2048
 NUM_EXPERTS = 256
 TOP_K = 8
-NUM_NODES = 2
+from common import get_num_nodes  # noqa: E402
+NUM_NODES = get_num_nodes()
 ROW_BLOCK = 128
 CHUNK_BYTES = 512 * 1024  # baked in source
 

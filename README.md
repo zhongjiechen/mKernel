@@ -22,7 +22,7 @@
 ```sh
 make all                              # build all 5 .so's against AWS EFA (default)
 make BACKEND=cx7 all                  # build all 5 .so's against ConnectX-7 RC (libibverbs)
-bash bench/run_2node.sh all bench     # 2-node, all kernels, default shapes
+bash bench/run.sh all bench 2         # 2 nodes, all kernels, default shapes
 make plots                            # regenerate the figures below
 ```
 
