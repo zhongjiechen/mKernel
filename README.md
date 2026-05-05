@@ -13,6 +13,8 @@
 - **GPU-driven networking, built from scratch.** Using libfabric/libibverbs proxy (`include/comm/internode/`). The GPU itself posts sends and consumes arrivals. 
 
 ## Roadmap
+- ✅ Fused, GPU-driven multi-node kernels
+- ✅ Add CX7 and EFA backend
 - 🚧 Full support for heterogeneous accelerators and NICs
   - 🚧 Topology-aware accelerator and NIC discovery, placement, and routing
 - 🚧 Internode megakernels
