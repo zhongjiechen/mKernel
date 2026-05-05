@@ -8,8 +8,8 @@
 ## Highlights
 
 - **Multi-GPU + multi-node, in one kernel.** Intra-node NVLink and inter-node live inside the same kernel — the GEMM, the intra-collective, and the inter-node transfer are interleaved at tile granularity, not stitched at the host.
-- **Fine-grained intra-kernel overlapping.** Compute and communication overlap *within* a single kernel at tile granularity — producer CTAs release tiles via on-chip flags the moment they're ready, and consumer CTAs (intra-comm / inter-send / inter-reduce) pick them up immediately, so GEMM math, NVLink traffic, and internode traffic all run concurrently instead of in serialized phases.
-- **Persistent kernel with SM specialization.** All 132 SMs on each H200 are claimed at launch and stay resident; CTAs self-assign roles (compute / intra-comm / inter-send / inter-reduce) by `blockIdx.x`. Producers and consumers communicate through on-chip flags using PTX `ld.acquire` / `st.release`, so the GPU schedules itself instead of round-tripping to the host.
+- **Fine-grained intra-kernel overlapping.** Compute and communication overlap *within* a single kernel at tile/chunk granularity — producer CTAs release tiles via on-chip flags the moment they're ready, and consumer CTAs (intra-comm / inter-send / inter-reduce) pick them up immediately.
+- **Persistent kernel with SM specialization.** All 132 SMs on each H200 are claimed at launch and stay resident; CTAs self-assign roles, such as compute / intra-comm / inter-send / inter-reduce. 
 - **GPU-driven networking, built from scratch.** Using libfabric/libibverbs proxy (`include/comm/internode/`). The GPU itself posts sends and consumes arrivals. 
 
 ## Roadmap
