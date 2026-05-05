@@ -1,4 +1,4 @@
-# mKernel — multi-GPU, multi-node fused kernels
+# mKernel
 
 <div align="center" >
     <img src="figs/mKernel.png" height=350 alt="mKernel" style="margin-bottom:px"/><br/>
