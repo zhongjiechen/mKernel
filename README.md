@@ -12,6 +12,12 @@
 - **Persistent kernel with SM specialization.** All 132 SMs on each H200 are claimed at launch and stay resident; CTAs self-assign roles (compute / intra-comm / inter-send / inter-reduce) by `blockIdx.x`. Producers and consumers communicate through on-chip flags using PTX `ld.acquire` / `st.release`, so the GPU schedules itself instead of round-tripping to the host.
 - **GPU-driven networking, built from scratch.** Using libfabric/libibverbs proxy (`include/comm/internode/`). The GPU itself posts sends and consumes arrivals. 
 
+## Roadmap
+- 🚧 Full support for heterogeneous accelerators and NICs
+  - 🚧 Topology-aware accelerator and NIC discovery, placement, and routing
+- 🚧 Internode megakernels
+- 🚧 Support for Blackwell GPUs
+
 ## Kernels
 
 | Kernel | What it fuses | Description |
