@@ -463,7 +463,7 @@ def render_kernel_chart(kernel: str, ax=None, value_fontsize=13):
         cx7_label = json.load(open(CX7_PATH))[meta["cx7_key"]].get("label", "cx7 reference")
         ax.bar(x - width, nccl_tf, width, color="#4C72B0", label="CuBLAS+NCCL", zorder=3)
         ax.bar(x,         cx7_tf,  width, color="#EECA3B", label=cx7_label,    zorder=3)
-        ax.bar(x + width, fused_tf, width, color="#F58518", label="Ours",       zorder=3)
+        ax.bar(x + width, fused_tf, width, color="#F58518", label="mKernel",       zorder=3)
 
         for xi, yi in zip(x, nccl_tf):
             if math.isfinite(yi):
@@ -489,11 +489,11 @@ def render_kernel_chart(kernel: str, ax=None, value_fontsize=13):
         # ring across 16 ranks, NCCL Send/Recv + flash-attn-2 local.
         series = [
             ("FA2+NCCL",          "#4C72B0", nccl_tf),
-            ("Ours",              "#F58518", fused_tf),
             ("Mercury",           "#9D755D", mercury_tf),
             ("MagiAttention",     "#C45BAF", magi_tf),
             ("TE-CP (ring)",      "#54A24B", te_p2p_tf),
             ("ring-flash-attn",   "#E45756", rfa_tf),
+            ("mKernel",           "#F58518", fused_tf),
         ]
         # Drop columns whose entire series is NaN so the legend stays honest.
         series = [(lbl, c, vals) for (lbl, c, vals) in series
@@ -516,7 +516,7 @@ def render_kernel_chart(kernel: str, ax=None, value_fontsize=13):
             tw = 0.27
             ax.bar(x - tw, nccl_tf, tw, color="#4C72B0", label="CuBLAS+NCCL", zorder=3)
             ax.bar(x,      td_tf,   tw, color="#E45756", label="Triton-distributed", zorder=3)
-            ax.bar(x + tw, fused_tf, tw, color="#F58518", label="Ours", zorder=3)
+            ax.bar(x + tw, fused_tf, tw, color="#F58518", label="mKernel", zorder=3)
             for xi, yi in zip(x, nccl_tf):
                 if math.isfinite(yi):
                     ax.annotate(f"{yi:.0f}", xy=(xi - tw, yi), xytext=(0, 4),
@@ -534,7 +534,7 @@ def render_kernel_chart(kernel: str, ax=None, value_fontsize=13):
                                 fontsize=value_fontsize, color="black")
         else:
             ax.bar(x - width / 2, nccl_tf, width, color="#4C72B0", label="CuBLAS+NCCL", zorder=3)
-            ax.bar(x + width / 2, fused_tf, width, color="#F58518", label="Ours", zorder=3)
+            ax.bar(x + width / 2, fused_tf, width, color="#F58518", label="mKernel", zorder=3)
 
             for xi, yi in zip(x, nccl_tf):
                 if math.isfinite(yi):
@@ -548,15 +548,8 @@ def render_kernel_chart(kernel: str, ax=None, value_fontsize=13):
                                 ha="center", fontsize=value_fontsize, color="black")
 
     ax.set_xticks(x)
-    classes = [_classify(kernel, s) for s in shapes]
-    tick_labels = [
-        f"{meta['label_fn'](s)}\n[{lbl}]"
-        for s, (lbl, _c) in zip(shapes, classes)
-    ]
+    tick_labels = [meta['label_fn'](s) for s in shapes]
     ax.set_xticklabels(tick_labels, rotation=15, fontsize=12)
-    # Color each tick label by its boundedness class.
-    for tl, (_lbl, color) in zip(ax.get_xticklabels(), classes):
-        tl.set_color(color)
     ax.tick_params(axis="y", labelsize=13)
     ax.set_xlabel(meta["xlabel"], fontsize=15)
     ax.set_ylabel("TFLOPS per GPU (bf16)", fontsize=15)

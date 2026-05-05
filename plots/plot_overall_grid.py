@@ -170,7 +170,7 @@ def main():
     ax.set_title("TFLOPS vs best baseline "
                  "(NCCL on EFA; +DeepEP+DeepGEMM/cx7 for MoE Dispatch+GEMM; "
                  "+Mercury/MagiAttention/TE-CP-ring for Ring Attention)\n"
-                 "green = Ours > baseline, red = Ours < baseline (alpha 0.6)",
+                 "green = mKernel > baseline, red = mKernel < baseline (alpha 0.6)",
                  fontsize=11)
 
     sm = ScalarMappable(norm=norm, cmap=cmap)
