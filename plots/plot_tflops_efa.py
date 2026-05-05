@@ -31,6 +31,10 @@ CX7_PATH = RELEASE / "bench" / "cx7_reference.json"
 # auxiliary).
 REPO = RELEASE.parent
 EXTERNAL = REPO / "experiments" / "multinode" / "baselines"
+if not EXTERNAL.exists():
+    _alt = Path("/home/ubuntu/efs/zm/kernels/experiments/multinode/baselines")
+    if _alt.exists():
+        EXTERNAL = _alt
 TRITON_DIST_DIR = EXTERNAL / "triton_dist" / "results"
 
 # Map our kernel name → the Q-key used for Triton-dist results JSONs.
