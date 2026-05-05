@@ -31,7 +31,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results, get_peer_ips  # noqa: E402
+from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
 
 KERNEL_NAME = "dispatch_gemm"
 
@@ -270,6 +270,7 @@ def main():
             int(pre_tokens.data_.data_ptr()),
             pre_tokens_bytes,
             peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
         print(f"[dispatch_gemm] node{node_idx}/lr{local_rank} session created", flush=True)
         fifo = mod.get_fifo_handles()

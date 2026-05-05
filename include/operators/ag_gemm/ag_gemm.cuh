@@ -226,18 +226,28 @@ __device__ inline void post_merge_wrs_for_intra_row(
         // (the validated configuration) the loop runs once with the
         // legacy peer rank.
         const int n_peers = G.num_nodes - 1;
+        // Per-peer recv_buf / arrival-flag layout: peer p's data lands at
+        //   recv_buf  + slot_at_peer * G.a_half_bytes
+        //   arrival   + slot_at_peer * G.total_chunks
+        // For N == 2, slot_at_peer is always 0, so the multiplications below
+        // contribute zero and behavior is bit-identical. For N > 2 these
+        // place each sender's data into its own slot at the receiver. The
+        // bench must allocate (N-1) × the legacy size for recv_buf and
+        // num_tiles; consumer-side wait loops over (N-1) peer slots — the
+        // bench/consumer-side counterpart is the next testbed-side step.
         if (split == 1) {
             // Fast-path unchanged behavior: single WR per rb, keyed by rb.
             for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                 const int peer_rank = internode::peer_rank_for_slot(
                     G.node_idx, G.num_nodes, peer_slot);
+                const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
                 internode::TransferCmd cmd{};
                 cmd.cmd_type = internode::CmdType::WRITE;
                 cmd.dst_rank = (uint8_t)peer_rank;
-                cmd.tile_id = (uint16_t)first_chunk;
+                cmd.tile_id = (uint16_t)(sap * G.total_chunks + first_chunk);
                 cmd.bytes = rb_bytes;
                 cmd.local_offset = base_offset;
-                cmd.remote_offset = base_offset;
+                cmd.remote_offset = (uint32_t)sap * (uint32_t)G.a_half_bytes + base_offset;
                 cmd.src_view = 1;
                 cmd.lane_id = (uint16_t)rb;
                 internode::D2HFifoDevice fifo =
@@ -254,13 +264,14 @@ __device__ inline void post_merge_wrs_for_intra_row(
                 for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                     const int peer_rank = internode::peer_rank_for_slot(
                         G.node_idx, G.num_nodes, peer_slot);
+                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
                     internode::TransferCmd cmd{};
                     cmd.cmd_type = internode::CmdType::WRITE;
                     cmd.dst_rank = (uint8_t)peer_rank;
-                    cmd.tile_id = (uint16_t)sub_first_chunk;
+                    cmd.tile_id = (uint16_t)(sap * G.total_chunks + sub_first_chunk);
                     cmd.bytes = sub_bytes;
                     cmd.local_offset = sub_base;
-                    cmd.remote_offset = sub_base;
+                    cmd.remote_offset = (uint32_t)sap * (uint32_t)G.a_half_bytes + sub_base;
                     cmd.src_view = 1;
                     cmd.lane_id = (uint16_t)(rb * split + sw);
                     internode::D2HFifoDevice fifo =

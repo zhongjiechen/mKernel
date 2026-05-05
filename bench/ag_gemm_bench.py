@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results, get_peer_ips  # noqa: E402
+from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
 
 KERNEL_NAME = "ag_gemm"
 from common import get_num_nodes  # noqa: E402
@@ -152,6 +152,7 @@ def main():
             total_chunks, fifo_cap, local_rank,
             clocal_buf_ptr=a_tk_ptr, clocal_buf_size=a_half_bytes,
             peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
         print(f"[ag_gemm] node{node_idx}/lr{local_rank} post create_session", flush=True)
         fifo = mod.get_fifo_handles()

@@ -467,16 +467,22 @@ __device__ inline void kv_stage_and_send_sm(const kv_exchange_globals &G) {
                 src_view = 1;
             }
             const int n_peers = G.num_nodes - 1;
+            // Per-peer slot offsets (zero at N == 2). single_peer_bytes is
+            // this rank's K + V combined byte count; single_peer_tiles is
+            // the chunk count for one peer's worth.
+            const int single_peer_bytes = G.K_bytes + G.V_bytes;
+            const int single_peer_tiles = G.total_chunks_K + G.total_chunks_V;
             for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                 const int peer_rank = internode::peer_rank_for_slot(
                     G.node_idx, G.num_nodes, peer_slot);
+                const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
                 internode::TransferCmd cmd{};
                 cmd.cmd_type = internode::CmdType::WRITE;
                 cmd.dst_rank = (uint8_t)peer_rank;
-                cmd.tile_id = (uint16_t)chunk_id;
+                cmd.tile_id = (uint16_t)(sap * single_peer_tiles + chunk_id);
                 cmd.bytes = bytes;
                 cmd.local_offset = off;
-                cmd.remote_offset = remote_off;
+                cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes + remote_off;
                 cmd.src_view = src_view;
                 cmd.lane_id = (uint16_t)chunk_id;
                 internode::D2HFifoDevice fifo =
@@ -504,6 +510,9 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
             uint32_t off, bytes;
             bool is_v = (chunk_id >= G.total_chunks_K);
             const int n_peers = G.num_nodes - 1;
+            // Per-peer slot offsets (zero at N == 2).
+            const int single_peer_bytes = G.K_bytes + G.V_bytes;
+            const int single_peer_tiles = G.total_chunks_K + G.total_chunks_V;
             if (!is_v) {
                 off = (uint32_t)(chunk_id * CHUNK_BYTES);
                 bytes = min(CHUNK_BYTES, G.K_bytes - (int)off);
@@ -511,13 +520,14 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
                 for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                     const int peer_rank = internode::peer_rank_for_slot(
                         G.node_idx, G.num_nodes, peer_slot);
+                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
                     internode::TransferCmd cmd{};
                     cmd.cmd_type = internode::CmdType::WRITE;
                     cmd.dst_rank = (uint8_t)peer_rank;
-                    cmd.tile_id  = (uint16_t)chunk_id;
+                    cmd.tile_id  = (uint16_t)(sap * single_peer_tiles + chunk_id);
                     cmd.bytes    = bytes;
                     cmd.local_offset  = off;
-                    cmd.remote_offset = off;
+                    cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes + off;
                     cmd.lane_id = (uint16_t)chunk_id;
                     internode::D2HFifoDevice fifo =
                         internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
@@ -530,13 +540,15 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
                 for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                     const int peer_rank = internode::peer_rank_for_slot(
                         G.node_idx, G.num_nodes, peer_slot);
+                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
                     internode::TransferCmd cmd{};
                     cmd.cmd_type = internode::CmdType::WRITE;
                     cmd.dst_rank = (uint8_t)peer_rank;
-                    cmd.tile_id  = (uint16_t)chunk_id;
+                    cmd.tile_id  = (uint16_t)(sap * single_peer_tiles + chunk_id);
                     cmd.bytes    = bytes;
                     cmd.local_offset  = (uint32_t)(G.K_bytes) + off;
-                    cmd.remote_offset = (uint32_t)(G.K_bytes) + off;
+                    cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes
+                                        + (uint32_t)(G.K_bytes) + off;
                     cmd.lane_id = (uint16_t)chunk_id;
                     internode::D2HFifoDevice fifo =
                         internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);

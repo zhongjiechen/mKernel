@@ -94,6 +94,24 @@ __host__ __device__ inline int peer_rank_for_slot(int node_idx,
     return r;
 }
 
+// Return THIS rank's peer slot in `peer_rank`'s "skip self" peer table.
+//
+// Used by the sender so its inter-node WRITE lands in the right per-peer
+// slot of the receiver's recv_buf / arrival_flags array. Inverse of
+// peer_rank_for_slot from the perspective of the receiver:
+//   slot_at_peer = my_rank if my_rank < peer_rank else my_rank - 1
+//
+// For N == 2 (the validated configuration) slot_at_peer is always 0,
+// regardless of (my_rank, peer_rank). The expressions
+//   cmd.remote_offset = slot_at_peer * single_peer_bytes + base_offset
+//   cmd.tile_id      = slot_at_peer * single_peer_tiles + chunk_id
+// therefore add zero offsets at N == 2 and keep behavior bit-identical to
+// the legacy 2-node code. For N > 2 the offsets partition the receiver's
+// recv_buf and arrival flag array by sender slot.
+__host__ __device__ inline int slot_at_peer(int my_rank, int peer_rank) {
+    return my_rank < peer_rank ? my_rank : my_rank - 1;
+}
+
 // Per-rail RDMA registration keys exchanged during TCP bootstrap.
 // Rail 0 uses the primary fields in ConnectionInfo; rails 1+ use these.
 struct RailExchangeInfo {

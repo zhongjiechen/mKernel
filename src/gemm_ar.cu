@@ -547,25 +547,31 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
 
             if (tid == 0) {
                 const uint32_t offset = (uint32_t)((long)pack_first_tile * TILE_BYTES);
-                // Fan out to every peer. For N == 2 the loop runs once with
-                // peer rank == 1 - node_idx (legacy behavior). N > 2
-                // currently double-writes the same remote slot — needs
-                // per-peer remote_offset to be correct.
+                // Per-peer slot offsets: at N == 2, sap == 0 so the offsets
+                // are zero (bit-identical). At N > 2 they partition the
+                // receiver's recv_buf / arrival flag space by sender slot.
+                // Receiver-side wait loop + (N-1)× bench allocation are the
+                // testbed-side counterpart.
+                const long single_peer_bytes =
+                    (long)G.row_blocks_per_slice * (long)G.col_blocks * TILE_BYTES;
+                const int  single_peer_tiles =
+                    G.row_blocks_per_slice * G.col_blocks;
                 const int n_peers = G.num_nodes - 1;
                 for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                     const int peer_rank = internode::peer_rank_for_slot(
                         G.node_idx, G.num_nodes, peer_slot);
+                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
                     internode::TransferCmd cmd{};
                     cmd.cmd_type = internode::CmdType::WRITE;
                     cmd.dst_rank = (uint8_t)peer_rank;
-                    cmd.tile_id = (uint16_t)pack_first_tile;
+                    cmd.tile_id = (uint16_t)(sap * single_peer_tiles + pack_first_tile);
                     cmd.bytes = (uint32_t)((long)group_tiles * TILE_BYTES);
                     cmd.local_offset = offset;
                     cmd.src_view = 0;
                     // EFAGDA: encode num_tiles in imm so receiver marks all
                     // group_tiles chunks arrived (proxy_efa.h:724 equivalent).
                     cmd.row_count = (uint16_t)group_tiles;
-                    cmd.remote_offset = offset;
+                    cmd.remote_offset = (uint32_t)((long)sap * single_peer_bytes) + offset;
                     cmd.lane_id = (uint16_t)logical_q;
                     cmd.enqueue_device_ns = gemm_ar_globaltimer();
                     // v2 default: per-WR fence + DB. Safe across all shapes.

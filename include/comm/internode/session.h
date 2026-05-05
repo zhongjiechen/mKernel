@@ -170,8 +170,19 @@ inline std::string select_nic_for_device(int device_id) {
 
 struct SessionConfig {
     int         rank;                // 0 or 1 (our node rank)
-    const char* peer_ip;             // remote node IP (e.g., "38.123.21.6")
-    int         tcp_port;            // port for TCP bootstrap (e.g., 18515)
+    const char* peer_ip   = nullptr; // legacy single peer; honored when
+                                     // num_peers == 0 (peer_ips unused).
+    int         tcp_port  = 0;       // legacy single TCP port for bootstrap.
+    // Multi-peer (N-node) fields. When num_peers > 0 the create_session()
+    // implementation should iterate over peer_ips[]/peer_tcp_ports[] for
+    // its TCP exchange + RC RTR transition. Today CX7's create_session
+    // still requires num_peers <= 1; >1 aborts with a clear message.
+    // (The EFA backend has the per-peer loop wired through; CX7 mirror
+    // is the natural next step at a CX7 testbed.)
+    int                num_peers       = 0;
+    const char* const* peer_ips        = nullptr;
+    const int*         peer_tcp_ports  = nullptr;
+    const int*         peer_ranks      = nullptr;
 
     void*       local_gpu_buf;       // existing GPU buffer to register for RDMA reads
     size_t      local_gpu_buf_size;  // size of local_gpu_buf
@@ -515,9 +526,22 @@ inline Session* create_session(const SessionConfig& cfg) {
         local_info.extra_psns[i - 1] = 0;  // PSN 0 for extra QPs
     }
 
+    // Multi-peer normalization: when num_peers > 0, peer_ips[0] / peer_tcp_ports[0]
+    // are the inputs; otherwise fall back to the legacy single peer_ip/tcp_port.
+    // CX7 still aborts on num_peers > 1 since the per-peer RTR loop isn't wired.
+    const char* sess_peer_ip = (cfg.num_peers > 0) ? cfg.peer_ips[0] : cfg.peer_ip;
+    int sess_tcp_port        = (cfg.num_peers > 0) ? cfg.peer_tcp_ports[0] : cfg.tcp_port;
+    if (cfg.num_peers > 1) {
+        fprintf(stderr,
+                "session.h (CX7): num_peers=%d > 1 is WIP — only slot 0 is "
+                "wired through TCP exchange / RC RTR. Aborting.\n",
+                cfg.num_peers);
+        delete s;
+        return nullptr;
+    }
     bool is_server = (cfg.rank == 0);
-    s->remote_info = rdma::exchange_info_tcp(local_info, cfg.peer_ip,
-                                              cfg.tcp_port, is_server);
+    s->remote_info = rdma::exchange_info_tcp(local_info, sess_peer_ip,
+                                              sess_tcp_port, is_server);
 
     // --- 8. QP transitions ---
     rdma::modify_qp_rtr(s->qp, s->remote_info);

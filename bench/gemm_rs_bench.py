@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results, get_peer_ips  # noqa: E402
+from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
 
 KERNEL_NAME = "gemm_rs"
 from common import get_num_nodes  # noqa: E402
@@ -179,6 +179,7 @@ def main():
             staging_buf.data_ptr(), staging_bytes,
             recv_bytes, total_inter_tiles, fifo_cap, local_rank,
             peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
         print(f"[gemm_rs] node{node_idx}/lr{local_rank} post create_session", flush=True)
         fifo = mod.get_fifo_handles()

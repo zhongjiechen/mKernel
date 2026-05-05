@@ -47,22 +47,40 @@ def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
     return [ip for i, ip in enumerate(all_ips) if i != node_idx]
 
 
+def get_peer_ports(node_idx: int, num_nodes: int, base_port: int) -> list[int]:
+    """Compute symmetric per-pair TCP ports (length num_nodes - 1) for this node.
+
+    For N == 2 returns [base_port] — a single shared port per pair, matching
+    the legacy 2-node setup bit-for-bit.
+
+    For N > 2 each unordered (lo, hi) rank pair gets a unique port computed as
+    `base_port + lo * num_nodes + hi`, so both sides of a pair derive the same
+    port from `(min(self, peer), max(self, peer))`. Avoids the listen-socket
+    collision that would otherwise hit any rank serving more than one peer
+    when num_nodes > 2.
+    """
+    ports = []
+    for i in range(num_nodes):
+        if i == node_idx:
+            continue
+        if num_nodes == 2:
+            ports.append(base_port)
+        else:
+            lo, hi = (node_idx, i) if node_idx < i else (i, node_idx)
+            ports.append(base_port + lo * num_nodes + hi)
+    return ports
+
+
 def get_num_nodes() -> int:
     """Resolve number of nodes from the NUM_NODES env var (default: 2).
 
     Bench scripts and the launcher consult this to size the global world
-    (`WORLD_SIZE = NUM_NODES * LOCAL_WORLD_SIZE`) and to drive future
-    multi-peer session setup. For now, only NUM_NODES=2 is fully wired
-    through the kernels and session layer; >2 prints a WIP warning so we
-    don't silently produce wrong results.
+    (`WORLD_SIZE = NUM_NODES * LOCAL_WORLD_SIZE`) and the multi-peer
+    session bringup (peer_ips / peer_tcp_ports lists). The 2-node config
+    is regression-tested; N > 2 has been wired through the session, proxy,
+    and kernel layers but is still untested without a 4+ node testbed.
     """
-    n = int(os.environ.get("NUM_NODES", "2"))
-    if n > 2 and int(os.environ.get("LOCAL_RANK", "0")) == 0 \
-            and int(os.environ.get("NODE_IDX", "0")) == 0:
-        print(f"[bench] NUM_NODES={n} > 2: WIP — kernel/session layer "
-              f"still assumes 2 nodes; results for N>2 are not yet "
-              f"validated. Tracking: see README §Backends.", flush=True)
-    return n
+    return int(os.environ.get("NUM_NODES", "2"))
 
 
 def init_dist():
