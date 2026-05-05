@@ -20,12 +20,22 @@
 ## Quick start
 
 ```sh
-make all                              # build all 5 .so's (both nodes need to do this)
+make all                              # build all 5 .so's against AWS EFA (default)
+make BACKEND=cx7 all                  # build all 5 .so's against ConnectX-7 RC (libibverbs)
 bash bench/run_2node.sh all bench     # 2-node, all kernels, default shapes
 make plots                            # regenerate the figures below
 ```
 
-## Comparison results
+## Backends
+
+| Backend | Macro | Transport | Where it runs |
+|---|---|---|---|
+| **EFA** (default) | `-DINTERNODE_BACKEND_EFA` | libibverbs + efadv (SRD) | AWS p5/p5e (H200, EFA) |
+| **CX7** | `-DINTERNODE_BACKEND_IBVERBS` | libibverbs RC | ConnectX-7 / InfiniBand / RoCE |
+
+Both backends share the same host-side API and the same on-GPU kernel; only the proxy / session implementation differs (`include/comm/internode/session.h` for CX7, `session_efa.h` for EFA).
+
+## Comparison results — AWS EFA
 
 | Kernel | Plot |
 |---|---|
@@ -34,6 +44,15 @@ make plots                            # regenerate the figures below
 | MoE Dispatch + GEMM | ![dispatch_gemm](plots/dispatch_gemm_efa.png) |
 | Ring Attention | ![ring_attention](plots/ring_attention_efa.png) |
 | GEMM + ReduceScatter | ![gemm_rs](plots/gemm_rs_efa.png) |
+
+## Comparison results — ConnectX-7
+
+| Kernel | Plot |
+|---|---|
+| AllGather + GEMM | ![ag_gemm_cx7](plots/ag_gemm_cx7.png) |
+| GEMM + AllReduce | ![gemm_ar_cx7](plots/gemm_ar_cx7.png) |
+| Ring Attention | ![ring_attention_cx7](plots/ring_attn_cx7.png) |
+| GEMM + ReduceScatter | ![gemm_rs_cx7](plots/gemm_rs_cx7.png) |
 
 ## Acknowledgements
 
