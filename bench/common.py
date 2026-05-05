@@ -27,6 +27,24 @@ import load_module  # noqa: E402
 # Distributed init / launcher helpers
 # ----------------------------------------------------------------------
 
+def get_num_nodes() -> int:
+    """Resolve number of nodes from the NUM_NODES env var (default: 2).
+
+    Bench scripts and the launcher consult this to size the global world
+    (`WORLD_SIZE = NUM_NODES * LOCAL_WORLD_SIZE`) and to drive future
+    multi-peer session setup. For now, only NUM_NODES=2 is fully wired
+    through the kernels and session layer; >2 prints a WIP warning so we
+    don't silently produce wrong results.
+    """
+    n = int(os.environ.get("NUM_NODES", "2"))
+    if n > 2 and int(os.environ.get("LOCAL_RANK", "0")) == 0 \
+            and int(os.environ.get("NODE_IDX", "0")) == 0:
+        print(f"[bench] NUM_NODES={n} > 2: WIP — kernel/session layer "
+              f"still assumes 2 nodes; results for N>2 are not yet "
+              f"validated. Tracking: see README §Backends.", flush=True)
+    return n
+
+
 def init_dist():
     """Init torch.distributed from torchrun env. Returns (local_rank, world_size, node_idx)."""
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -233,7 +251,7 @@ def write_results_json(
 
     # Build a merged map: existing shapes first, new ones overwrite.
     # If OSGC_BENCH_BEST_OF_N=1, between-sweep best-of: take min when same
-    # shape is rewritten. Used by run_2node.sh's BEST_OF_N=k loop to absorb
+    # shape is rewritten. Used by run.sh's BEST_OF_N=k loop to absorb
     # cluster-noise variance. Reset by deleting the JSON before the loop.
     best_of = os.environ.get("OSGC_BENCH_BEST_OF_N", "0") == "1"
     merged: dict = {}

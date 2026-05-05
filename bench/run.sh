@@ -1,13 +1,19 @@
 #!/bin/bash
-# release/bench/run_2node.sh — single 2-node launcher for the 5 release kernels.
+# bench/run.sh — multi-node launcher for the 5 release kernels.
 #
 # Usage:
-#   bash run_2node.sh <kernel|all> [check|bench] [shapes_csv]
+#   bash run.sh <kernel|all> [check|bench] [num_nodes] [shapes_csv]
 #
 # Examples:
-#   bash run_2node.sh dispatch_gemm bench
-#   bash run_2node.sh ag_gemm check
-#   bash run_2node.sh all bench
+#   bash run.sh dispatch_gemm bench               # default 2 nodes
+#   bash run.sh ag_gemm check 2
+#   bash run.sh all bench 2 4096,8192
+#   NUM_NODES=2 bash run.sh all bench             # via env, equivalent
+#
+# Multi-node WIP: only num_nodes=2 is fully validated. The bench layer
+# resolves NUM_NODES (CLI arg > env var > default 2) and prints a WIP
+# warning for >2 (see bench/common.py:get_num_nodes); the launcher itself
+# refuses >2 because it only knows about NODE0/NODE1 SSH endpoints.
 #
 # Cluster (override via env if it changes):
 #   NODE0_IP   — private IP of this (master) node
@@ -15,9 +21,18 @@
 #   NODE1_SSH  — host this script SSHs into to launch node 1 (public or private)
 set -u
 
-KERNEL=${1:?usage: $0 <kernel|all> [check|bench] [shapes_csv]}
+KERNEL=${1:?usage: $0 <kernel|all> [check|bench] [num_nodes] [shapes_csv]}
 MODE=${2:-bench}
-SHAPES=${3:-}
+# Third positional is num_nodes if numeric, else treated as shapes_csv (back-compat
+# with the old `<kernel> <mode> [shapes_csv]` 3-arg form).
+if [[ "${3:-}" =~ ^[0-9]+$ ]]; then
+    NUM_NODES=${3}
+    SHAPES=${4:-}
+else
+    NUM_NODES=${NUM_NODES:-2}
+    SHAPES=${3:-}
+fi
+export NUM_NODES
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 RELEASE=$(dirname "$HERE")
@@ -26,6 +41,10 @@ RELEASE=$(dirname "$HERE")
 NODE0_IP=${NODE0_IP:-172.31.1.237}
 NODE1_SSH=${NODE1_SSH:-15.164.130.63}
 NODE1_IP=${NODE1_IP:-172.31.11.6}
+if (( NUM_NODES > 2 )); then
+    echo "[run] NUM_NODES=$NUM_NODES > 2: WIP — launcher only knows about NODE0 and NODE1. Aborting." >&2
+    exit 1
+fi
 
 # Python venv with torch installed (EFS-shared, both nodes see this path).
 PY=${PY:-/home/ubuntu/efs/yzhou/uccl/.venv/bin/python3}
@@ -53,6 +72,7 @@ COMMON_ENV=(
     "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7"
     "TORCH_CUDA_ARCH_LIST=9.0a"
     "MASTER_ADDR=$NODE0_IP"
+    "NUM_NODES=$NUM_NODES"
 )
 
 KERNELS_ALL="dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention"
@@ -75,7 +95,7 @@ run_one_2node() {
     local kernel=$1
     local script="$HERE/${kernel}_bench.py"
     if [[ ! -f "$script" ]]; then
-        echo "[run_2node] no bench script for $kernel ($script)"
+        echo "[run] no bench script for $kernel ($script)"
         return 1
     fi
 
@@ -136,12 +156,12 @@ run_one_2node() {
     local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port OSGC_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
     local launch_node0="cd '$RELEASE' && $env_str NODE_IDX=0 \
         TCP_PORT=$tcp_port_base \
-        '$TORCHRUN' --nproc_per_node=8 --nnodes=2 --node_rank=0 \
+        '$TORCHRUN' --nproc_per_node=8 --nnodes=$NUM_NODES --node_rank=0 \
             --master_addr=$NODE0_IP --master_port=$master_port \
             '$script' $extra_args"
     local launch_node1="cd '$RELEASE' && $env_str NODE_IDX=1 \
         TCP_PORT=$tcp_port_base \
-        '$TORCHRUN' --nproc_per_node=8 --nnodes=2 --node_rank=1 \
+        '$TORCHRUN' --nproc_per_node=8 --nnodes=$NUM_NODES --node_rank=1 \
             --master_addr=$NODE0_IP --master_port=$master_port \
             '$script' $extra_args"
 

@@ -91,10 +91,10 @@ clean:
 	rm -rf $(BUILD)
 
 bench: all
-	cd bench && bash run_2node.sh all bench
+	cd bench && bash run.sh all bench
 
 check: all
-	cd bench && bash run_2node.sh all check
+	cd bench && bash run.sh all check
 
 plots:
 	cd plots && python3 plot_tflops_efa.py
