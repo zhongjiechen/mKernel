@@ -6,9 +6,7 @@
 #pragma once
 
 #include "tk_ops_thread_util_sync.cuh"
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 #include "tk_ops_thread_util_tma.cuh"
-#endif
 
 namespace kittens {
 
@@ -166,7 +164,6 @@ template<> struct move<float4> {
         asm volatile("st.global.v4.f32 [%4], {%0, %1, %2, %3};\n" : : "f"(src.x), "f"(src.y), "f"(src.z), "f"(src.w), "l"(dst));
     }
 };
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 template<> struct move<fp8e4m3_4> {
     __device__ static inline void ldsm4(fp8e4m3_4& dst1, fp8e4m3_4& dst2, fp8e4m3_4& dst3, fp8e4m3_4& dst4, uint32_t src) {
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];\n" :
@@ -188,7 +185,6 @@ template<> struct move<fp8e5m2_4> {
                      "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
     }
 };
-#endif
 
 /* ----------   Constants for Cache policies  ---------- */
 
@@ -219,65 +215,7 @@ template<cache_policy policy> __device__ inline uint64_t make_cache_policy() {
 
 /* CLC scheduler operations */
 
-#ifdef KITTENS_BLACKWELL
 
-namespace clc {
-
-struct handle {
-    uint4 internal_value;
-}; // note that this is an opaque type, so the value should not be accessed directly.
-
-struct result {
-    uint32_t success;
-    uint32_t x;
-    uint32_t y;
-    uint32_t z;
-};
-
-/**
- * @brief Schedules a new threadblock. Must be called by a single thread in the entire CTA cluster.
- *        The caller must wait on the semaphore with tma::cluster::expect_bytes followed by tma::cluster::wait.
- *        The handle is multicasted to all CTAs in the cluster and signals the semaphore of all CTAs in the cluster.
- * @param h The CLC handle.
- * @param sem The semaphore that the caller will wait on.
- */
-__device__ static inline void schedule(handle &h, semaphore &sem) {
-    asm volatile("{clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [%0], [%1];}"
-        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&h.internal_value))), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&sem)))
-        : "memory"
-    );
-}
-
-/**
- * @brief Queries the result of a schedule operation. Calling this again after failure is undefined behavior.
- * @param h The CLC handle.
- */
-__device__ static inline result query(handle &h) {
-    result r;
-    asm volatile(
-        "{\n"
-        ".reg .pred SUCCESS;\n"
-        ".reg .b128 CLC_HANDLE;\n"
-        "ld.shared.b128 CLC_HANDLE, [%4];\n"
-        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 SUCCESS, CLC_HANDLE;\n"
-        "selp.u32 %0, 1, 0, SUCCESS;\n"
-        "@!SUCCESS bra.uni DONE;\n"
-        "clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%1, %2, %3, _}, CLC_HANDLE;\n"
-        "fence.proxy.async.shared::cta;\n"
-        "DONE:\n"
-        "}"
-        : "=r"(r.success), "=r"(r.x), "=r"(r.y), "=r"(r.z)
-        : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&h.internal_value)))
-        : "memory"
-    );
-    return r;
-}
-
-} // namespace clc
-
-#endif
-
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 __device__ static inline bool elect_warp_leader() {
     uint32_t elected = 0;
     asm volatile(
@@ -289,6 +227,5 @@ __device__ static inline bool elect_warp_leader() {
     );
     return static_cast<bool>(elected);
 }
-#endif
 
 } // namespace kittens

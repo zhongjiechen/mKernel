@@ -62,18 +62,10 @@ static inline void tensor_check(const at::Tensor &t) {
         TORCH_CHECK(t.dtype() == at::ScalarType::Int, "Tensor has invalid dtype (expected int32)");
     } else if constexpr (std::is_same_v<typename Layout::dtype, long>) {
         TORCH_CHECK(t.dtype() == at::ScalarType::Long, "Tensor has invalid dtype (expected int64)");
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
     } else if constexpr (std::is_same_v<typename Layout::dtype, ::kittens::fp8e4m3>) {
         TORCH_CHECK(t.dtype() == at::ScalarType::Float8_e4m3fn, "Tensor has invalid dtype (expected fp8e4m3)");
     } else if constexpr (std::is_same_v<typename Layout::dtype, ::kittens::fp8e5m2>) {
         TORCH_CHECK(t.dtype() == at::ScalarType::Float8_e5m2, "Tensor has invalid dtype (expected fp8e5m2)");
-#endif
-#ifdef KITTENS_BLACKWELL
-    } else if constexpr (std::is_same_v<typename Layout::dtype, ::kittens::fp8e8m0>) {
-        TORCH_CHECK(t.dtype() == at::ScalarType::Float8_e8m0fnu || t.dtype() == at::ScalarType::Byte, "Tensor has invalid dtype (expected fp8e8m0)");
-    } else if constexpr (std::is_same_v<typename Layout::dtype, ::kittens::fp4e2m1_2>) {
-        TORCH_CHECK(t.dtype() == at::ScalarType::Float4_e2m1fn_x2, "Tensor has invalid dtype (expected fp4_2)");
-#endif
     } else if constexpr (std::is_same_v<typename Layout::dtype, ::kittens::bf16>) {
         TORCH_CHECK(t.dtype() == at::ScalarType::BFloat16, "Tensor has invalid dtype (expected bfloat16)");
     } else if constexpr (std::is_same_v<typename Layout::dtype, ::kittens::half>) {
@@ -141,13 +133,7 @@ static inline void launch_kernel(const Globals &G) {
         CUDACHECK(cudaFuncSetAttribute(global_kernel_unclustered<Config, Globals, Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_shared_memory));
         global_kernel_unclustered<Config, Globals, Kernel><<<grid, block, dynamic_shared_memory, stream>>>(G);
     } else {
-#if defined(KITTENS_HOPPER)
         static_assert(Config::CLUSTER_SIZE <= 8, "Cluster size must be less than or equal to 8 for Hopper");
-#elif defined(KITTENS_BLACKWELL)
-        static_assert(Config::CLUSTER_SIZE <= 16, "Cluster size must be less than or equal to 16 for Blackwell");
-        if constexpr (Config::CLUSTER_SIZE > 8)
-            CUDACHECK(cudaFuncSetAttribute(global_kernel_clustered<Config, Globals, Kernel>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-#endif
         CUDACHECK(cudaFuncSetAttribute(global_kernel_clustered<Config, Globals, Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_shared_memory));
         global_kernel_clustered<Config, Globals, Kernel><<<grid, block, dynamic_shared_memory, stream>>>(G);
     }
@@ -176,13 +162,7 @@ static inline void launch_kernel(const Globals &G, unsigned int num_blocks) {
         CUDACHECK(cudaFuncSetAttribute(global_kernel_unclustered<Config, Globals, Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_shared_memory));
         global_kernel_unclustered<Config, Globals, Kernel><<<grid, block, dynamic_shared_memory, stream>>>(G);
     } else {
-#if defined(KITTENS_HOPPER)
         static_assert(Config::CLUSTER_SIZE <= 8, "Cluster size must be less than or equal to 8 for Hopper");
-#elif defined(KITTENS_BLACKWELL)
-        static_assert(Config::CLUSTER_SIZE <= 16, "Cluster size must be less than or equal to 16 for Blackwell");
-        if constexpr (Config::CLUSTER_SIZE > 8)
-            CUDACHECK(cudaFuncSetAttribute(global_kernel_clustered<Config, Globals, Kernel>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-#endif
         CUDACHECK(cudaFuncSetAttribute(global_kernel_clustered<Config, Globals, Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_shared_memory));
         global_kernel_clustered<Config, Globals, Kernel><<<grid, block, dynamic_shared_memory, stream>>>(G);
     }

@@ -57,9 +57,6 @@ struct st_subtile;
  */
 template<typename _T, int _rows, int _cols, bool _swizzle=true, int _swizzle_bytes=0>
 struct KITTENS_DEFAULT_ALIGN st {
-#ifdef KITTENS_BLACKWELL
-    static_assert(!std::is_same_v<_T, fp4e2m1>, "For FP4 types, you must use a packed type (i.e., fp4e2m1_2 or fp4e2m1_4).");
-#endif
     using identifier = ducks::st::identifier; ///< Type identifier for shared memory tile.
     using T = base_types::packing<_T>::unpacked_type;
     using T2 = base_types::packing<_T>::packed_type;
@@ -79,12 +76,7 @@ struct KITTENS_DEFAULT_ALIGN st {
     static_assert(!swizzle || (rows % kittens::TILE_ROW_DIM<T> == 0), "Rows must be divisible by the tile dimension");
     static_assert((swizzle && (cols % kittens::TILE_COL_DIM<T> == 0)) || (!swizzle && (cols % kittens::BASE_TILE_DIM == 0)), "Cols must be divisible by the tile dimension");
 
-#ifdef KITTENS_BLACKWELL
-    // Must be a 1-packed type (e.g. float, bf16, etc) unless fp4
-    static_assert(base_types::packing<dtype>::num() == 1 || std::is_same_v<dtype, fp4e2m1_2>); 
-#else
     static_assert(base_types::packing<dtype>::num() == 1); 
-#endif
 
     // If a user specifies a swizzle bytes value, the column byte size must be a multiple of the swizzle bytes.
     static_assert(_swizzle_bytes == 0 || _swizzle_bytes == 32 || _swizzle_bytes == 64 || _swizzle_bytes == 128);
@@ -315,17 +307,9 @@ template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0>
 using st_hf = st<half,  _height, _width, _swizzle, _swizzle_bytes>;
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fl = st<float, _height, _width, _swizzle, _swizzle_bytes>;
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fp8e4m3 = st<fp8e4m3, _height, _width, _swizzle, _swizzle_bytes>;
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fp8e5m2 = st<fp8e5m2, _height, _width, _swizzle, _swizzle_bytes>;
-#endif
-#if defined(KITTENS_BLACKWELL)
-template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
-using st_fp8e8m0 = st<fp8e8m0, _height, _width, _swizzle, _swizzle_bytes>;
-template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
-using st_fp4e2m1_2 = st<fp4e2m1_2, _height, _width, _swizzle, _swizzle_bytes>;
-#endif
 
 } // namespace kittens

@@ -164,7 +164,6 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 tmp[1] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[1]);
                 tmp[2] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[2]);
                 tmp[3] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[3]);
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
                 int row = (local_warpid*warp_height + i)*src.tile_size_row + (warp_laneid % 16);
                 int col = j*src.tile_size_col + (warp_laneid / 16) * 8;
                 if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
@@ -173,28 +172,6 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 else {
                     move<U2>::stsm4t(dst.idx(shared_addr, {row, col}), tmp[0], tmp[2], tmp[1], tmp[3]);
                 }
-#else
-                if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
-                    int row = (local_warpid*warp_height + i)*src.tile_size_row + (warp_laneid / 4);
-                    int col = j*src.tile_size_col + 2*(warp_laneid % 4);
-                    move<U2>::sts(dst.idx(shared_addr, {row+0, col+0}), tmp[0]);
-                    move<U2>::sts(dst.idx(shared_addr, {row+8, col+0}), tmp[1]);
-                    move<U2>::sts(dst.idx(shared_addr, {row+0, col+8}), tmp[2]);
-                    move<U2>::sts(dst.idx(shared_addr, {row+8, col+8}), tmp[3]);
-                }
-                else {
-                    int row = (local_warpid*warp_height + i)*src.tile_size_row + 2*(warp_laneid % 4);
-                    int col = j*src.tile_size_col + (warp_laneid / 4);
-                    move<U>::sts(dst.idx(shared_addr, {row+0, col+0}), tmp[0].x);
-                    move<U>::sts(dst.idx(shared_addr, {row+1, col+0}), tmp[0].y);
-                    move<U>::sts(dst.idx(shared_addr, {row+0, col+8}), tmp[1].x);
-                    move<U>::sts(dst.idx(shared_addr, {row+1, col+8}), tmp[1].y);
-                    move<U>::sts(dst.idx(shared_addr, {row+8, col+0}), tmp[2].x);
-                    move<U>::sts(dst.idx(shared_addr, {row+9, col+0}), tmp[2].y);
-                    move<U>::sts(dst.idx(shared_addr, {row+8, col+8}), tmp[3].x);
-                    move<U>::sts(dst.idx(shared_addr, {row+9, col+8}), tmp[3].y);
-                }
-#endif
             }
             else if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row> && sizeof(typename ST::dtype) == 1) { 
                 // handle the row-major layout for 8-bit types

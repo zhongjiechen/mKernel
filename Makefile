@@ -66,7 +66,9 @@ COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 # PUSH_NVL_FANOUT, DISPATCH_DONATE_INTER_SEND, ACTIVITY_TRACE, etc.) so
 # their #ifdef branches stay disabled.
 DEFS_ag_gemm        :=
-DEFS_gemm_ar        := -DQ2_ARRIVAL_QUEUE
+# Arrival-flag layout is now a runtime flag (SessionConfig.use_arrival_queue);
+# gemm_ar's session shim sets it to true. No compile-time switch needed.
+DEFS_gemm_ar        :=
 
 DEFS_dispatch_gemm  := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
 DEFS_ring_attention :=

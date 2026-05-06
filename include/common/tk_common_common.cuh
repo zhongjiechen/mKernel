@@ -10,6 +10,4 @@
 #include "tk_common_base_ops.cuh"
 #include "tk_common_util.cuh"
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 #include "../comm/multimem.cuh"
-#endif
