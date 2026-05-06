@@ -15,12 +15,6 @@
 #include "rdma_transport.h"
 #include "proxy_diagnostics.h"
 
-// The entire CPU-proxy class is inert under IBGDA (GPU posts WQEs directly).
-// proxy_diagnostics.h already defines ProxyTimestamps/ProxyDiagnostics/
-// ProxyTimeline, so session.h's ifdef-guarded accessors can return empty
-// instances under IBGDA without any forward-declaration help.
-#if !defined(INTERNODE_BACKEND_IBGDA)
-
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -77,7 +71,8 @@ struct ProxyConfig {
     uint32_t      remote_flags_rkey;
     uint64_t      remote_tail_addr;
     uint32_t      remote_tail_rkey;
-    uint32_t      remote_queue_stride; // slots per remote logical queue (Q2_ARRIVAL_QUEUE)
+    bool          use_arrival_queue = false; // selects queue vs flat arrival layout at runtime
+    uint32_t      remote_queue_stride; // slots per remote logical queue (queue layout)
     int           logical_queues_per_qp; // number of software queues mapped onto each QP
     bool          enable_remote_tail = false; // publish queue tail after metadata write
 
@@ -268,36 +263,37 @@ public:
         // makes progress.
         ibv_send_wr& flag_wr = wrs[n_data_wrs];
         memset(&flag_wr, 0, sizeof(flag_wr));
-#ifdef Q2_ARRIVAL_QUEUE
-        const uint32_t flag_slot = (uint32_t)(BATCH_SIZE * 2);
-        const uint32_t run_tiles = (cmd.bytes + kTileBytes - 1u) / kTileBytes;
-        cfg_.flag_staging->host_ptr[flag_slot] =
-            pack_arrival_work((uint32_t)cmd.tile_id, run_tiles);
-        sges[sge_cursor].addr = (uint64_t)(cfg_.flag_staging->host_ptr + flag_slot);
-#else
-        cfg_.flag_staging->host_ptr[0] = cfg_.epoch;
-        sges[sge_cursor].addr = (uint64_t)cfg_.flag_staging->host_ptr;
-#endif
+        uint32_t logical_q = 0;
+        uint32_t q_slot    = 0;
+        if (cfg_.use_arrival_queue) {
+            const uint32_t flag_slot = (uint32_t)(BATCH_SIZE * 2);
+            const uint32_t run_tiles = (cmd.bytes + kTileBytes - 1u) / kTileBytes;
+            cfg_.flag_staging->host_ptr[flag_slot] =
+                pack_arrival_work((uint32_t)cmd.tile_id, run_tiles);
+            sges[sge_cursor].addr = (uint64_t)(cfg_.flag_staging->host_ptr + flag_slot);
+        } else {
+            cfg_.flag_staging->host_ptr[0] = cfg_.epoch;
+            sges[sge_cursor].addr = (uint64_t)cfg_.flag_staging->host_ptr;
+        }
         sges[sge_cursor].length = sizeof(uint32_t);
         sges[sge_cursor].lkey = cfg_.flag_staging->mr->lkey;
         flag_wr.sg_list = &sges[sge_cursor++];
         flag_wr.num_sge = 1;
         flag_wr.opcode = IBV_WR_RDMA_WRITE;
-#ifdef Q2_ARRIVAL_QUEUE
-        const uint32_t logical_q =
-            total_logical_queues > 0 ? (cmd.lane_id % total_logical_queues) : 0u;
-        const uint32_t q_slot = sender_seq_[logical_q]++;
-        flag_wr.wr.rdma.remote_addr = cfg_.remote_flags_addr +
-            (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) * sizeof(uint32_t);
-#else
-        flag_wr.wr.rdma.remote_addr = cfg_.remote_flags_addr +
-            (uint64_t)cmd.tile_id * sizeof(uint32_t);
-#endif
+        if (cfg_.use_arrival_queue) {
+            logical_q = total_logical_queues > 0
+                ? (cmd.lane_id % total_logical_queues) : 0u;
+            q_slot = sender_seq_[logical_q]++;
+            flag_wr.wr.rdma.remote_addr = cfg_.remote_flags_addr +
+                (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) * sizeof(uint32_t);
+        } else {
+            flag_wr.wr.rdma.remote_addr = cfg_.remote_flags_addr +
+                (uint64_t)cmd.tile_id * sizeof(uint32_t);
+        }
         flag_wr.wr.rdma.rkey = cfg_.remote_flags_rkey;
         flag_wr.send_flags = IBV_SEND_INLINE;
 
-#ifdef Q2_ARRIVAL_QUEUE
-        if (cfg_.enable_remote_tail) {
+        if (cfg_.use_arrival_queue && cfg_.enable_remote_tail) {
             flag_wr.next = &wrs[n_data_wrs + 1];
             ibv_send_wr& tail_wr = wrs[n_data_wrs + 1];
             memset(&tail_wr, 0, sizeof(tail_wr));
@@ -315,9 +311,7 @@ public:
             tail_wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
             tail_wr.wr_id = encode_wr_id(batch_qp, 1);
             tail_wr.next = nullptr;
-        } else
-#endif
-        {
+        } else {
             flag_wr.send_flags |= IBV_SEND_SIGNALED;
             flag_wr.wr_id = encode_wr_id(batch_qp, 1);
             flag_wr.next = nullptr;
@@ -615,82 +609,87 @@ private:
             int batch_qp = qp_rr_idx_;
 
             int pre_inflight = inflight_.load(std::memory_order_relaxed);
-#ifdef Q2_ARRIVAL_QUEUE
-            if (has_pending_cmd_ && pre_inflight < effective_max_inflight_) {
-                batch[0] = pending_cmd_;
-                has_pending_cmd_ = false;
-                count = 1;
-                const int global_qp =
-                    (cfg_.global_num_qps > 0) ? (batch[0].lane_id % cfg_.global_num_qps) : 0;
-                batch_qp = global_qp - cfg_.qp_base_idx;
+            if (cfg_.use_arrival_queue) {
+                // Queue layout collect: pre-routed by lane→global_qp→local_qp
+                // so a batch is single-QP; cross-QP cmds get stashed in
+                // pending_cmd_ for the next outer iteration.
+                if (has_pending_cmd_ && pre_inflight < effective_max_inflight_) {
+                    batch[0] = pending_cmd_;
+                    has_pending_cmd_ = false;
+                    count = 1;
+                    const int global_qp =
+                        (cfg_.global_num_qps > 0) ? (batch[0].lane_id % cfg_.global_num_qps) : 0;
+                    batch_qp = global_qp - cfg_.qp_base_idx;
+                }
+                while (count < BATCH_SIZE && pre_inflight + count < effective_max_inflight_) {
+                    TransferCmd cmd{};
+                    if (!cfg_.fifo->poll(&cmd)) break;
+                    const uint64_t host_seen_ns = now_ns();
+                    if (cmd.enqueue_device_ns != 0) {
+                        int64_t delta_ns =
+                            (int64_t)host_seen_ns - (int64_t)cmd.enqueue_device_ns -
+                            cfg_.gpu_to_host_offset_ns;
+                        if (delta_ns < 0) delta_ns = 0;
+                        diag_.enqueue_to_seen_count++;
+                        diag_.enqueue_to_seen_raw_sum_ns += delta_ns;
+                        if (delta_ns > diag_.enqueue_to_seen_raw_max_ns) {
+                            diag_.enqueue_to_seen_raw_max_ns = delta_ns;
+                        }
+                        if (delta_ns < diag_.enqueue_to_seen_raw_min_ns) {
+                            diag_.enqueue_to_seen_raw_min_ns = delta_ns;
+                        }
+                    }
+                    if (cmd.cmd_type == CmdType::BARRIER_NOTIFY) {
+                        post_stage_barrier(/*slot=*/0, cfg_.epoch);
+                        continue;
+                    }
+                    if (cmd.cmd_type != CmdType::WRITE) continue;
+                    const int global_qp =
+                        (cfg_.global_num_qps > 0) ? (cmd.lane_id % cfg_.global_num_qps) : 0;
+                    const int cmd_qp = global_qp - cfg_.qp_base_idx;
+                    if (cmd_qp < 0 || cmd_qp >= cfg_.num_qps) {
+                        fprintf(stderr,
+                                "proxy: lane %u routed to global_qp=%d outside local range [%d, %d)\n",
+                                (unsigned)cmd.lane_id, global_qp, cfg_.qp_base_idx,
+                                cfg_.qp_base_idx + cfg_.num_qps);
+                        continue;
+                    }
+                    if (count == 0) batch_qp = cmd_qp;
+                    if (cmd_qp != batch_qp) {
+                        pending_cmd_ = cmd;
+                        has_pending_cmd_ = true;
+                        break;
+                    }
+                    batch[count++] = cmd;
+                }
+            } else {
+                // Flat layout collect: simpler — round-robin across QPs and
+                // accumulate up to BATCH_SIZE without pre-routing by lane.
+                while (count < BATCH_SIZE &&
+                       pre_inflight + count < effective_max_inflight_ &&
+                       cfg_.fifo->poll(&batch[count])) {
+                    const uint64_t host_seen_ns = now_ns();
+                    if (batch[count].enqueue_device_ns != 0) {
+                        int64_t delta_ns =
+                            (int64_t)host_seen_ns - (int64_t)batch[count].enqueue_device_ns -
+                            cfg_.gpu_to_host_offset_ns;
+                        if (delta_ns < 0) delta_ns = 0;
+                        diag_.enqueue_to_seen_count++;
+                        diag_.enqueue_to_seen_raw_sum_ns += delta_ns;
+                        if (delta_ns > diag_.enqueue_to_seen_raw_max_ns) {
+                            diag_.enqueue_to_seen_raw_max_ns = delta_ns;
+                        }
+                        if (delta_ns < diag_.enqueue_to_seen_raw_min_ns) {
+                            diag_.enqueue_to_seen_raw_min_ns = delta_ns;
+                        }
+                    }
+                    if (batch[count].cmd_type == CmdType::BARRIER_NOTIFY) {
+                        post_stage_barrier(/*slot=*/0, cfg_.epoch);
+                    } else if (batch[count].cmd_type == CmdType::WRITE) {
+                        count++;
+                    }
+                }
             }
-            while (count < BATCH_SIZE && pre_inflight + count < effective_max_inflight_) {
-                TransferCmd cmd{};
-                if (!cfg_.fifo->poll(&cmd)) break;
-                const uint64_t host_seen_ns = now_ns();
-                if (cmd.enqueue_device_ns != 0) {
-                    int64_t delta_ns =
-                        (int64_t)host_seen_ns - (int64_t)cmd.enqueue_device_ns -
-                        cfg_.gpu_to_host_offset_ns;
-                    if (delta_ns < 0) delta_ns = 0;
-                    diag_.enqueue_to_seen_count++;
-                    diag_.enqueue_to_seen_raw_sum_ns += delta_ns;
-                    if (delta_ns > diag_.enqueue_to_seen_raw_max_ns) {
-                        diag_.enqueue_to_seen_raw_max_ns = delta_ns;
-                    }
-                    if (delta_ns < diag_.enqueue_to_seen_raw_min_ns) {
-                        diag_.enqueue_to_seen_raw_min_ns = delta_ns;
-                    }
-                }
-                if (cmd.cmd_type == CmdType::BARRIER_NOTIFY) {
-                    post_stage_barrier(/*slot=*/0, cfg_.epoch);
-                    continue;
-                }
-                if (cmd.cmd_type != CmdType::WRITE) continue;
-                const int global_qp =
-                    (cfg_.global_num_qps > 0) ? (cmd.lane_id % cfg_.global_num_qps) : 0;
-                const int cmd_qp = global_qp - cfg_.qp_base_idx;
-                if (cmd_qp < 0 || cmd_qp >= cfg_.num_qps) {
-                    fprintf(stderr,
-                            "proxy: lane %u routed to global_qp=%d outside local range [%d, %d)\n",
-                            (unsigned)cmd.lane_id, global_qp, cfg_.qp_base_idx,
-                            cfg_.qp_base_idx + cfg_.num_qps);
-                    continue;
-                }
-                if (count == 0) batch_qp = cmd_qp;
-                if (cmd_qp != batch_qp) {
-                    pending_cmd_ = cmd;
-                    has_pending_cmd_ = true;
-                    break;
-                }
-                batch[count++] = cmd;
-            }
-#else
-            while (count < BATCH_SIZE &&
-                   pre_inflight + count < effective_max_inflight_ &&
-                   cfg_.fifo->poll(&batch[count])) {
-                const uint64_t host_seen_ns = now_ns();
-                if (batch[count].enqueue_device_ns != 0) {
-                    int64_t delta_ns =
-                        (int64_t)host_seen_ns - (int64_t)batch[count].enqueue_device_ns -
-                        cfg_.gpu_to_host_offset_ns;
-                    if (delta_ns < 0) delta_ns = 0;
-                    diag_.enqueue_to_seen_count++;
-                    diag_.enqueue_to_seen_raw_sum_ns += delta_ns;
-                    if (delta_ns > diag_.enqueue_to_seen_raw_max_ns) {
-                        diag_.enqueue_to_seen_raw_max_ns = delta_ns;
-                    }
-                    if (delta_ns < diag_.enqueue_to_seen_raw_min_ns) {
-                        diag_.enqueue_to_seen_raw_min_ns = delta_ns;
-                    }
-                }
-                if (batch[count].cmd_type == CmdType::BARRIER_NOTIFY) {
-                    post_stage_barrier(/*slot=*/0, cfg_.epoch);
-                } else if (batch[count].cmd_type == CmdType::WRITE) {
-                    count++;
-                }
-            }
-#endif
 
             int visible_backlog = count;
             if (has_pending_cmd_) visible_backlog++;
@@ -796,44 +795,44 @@ private:
                     wrs_[fi].wr_id      = is_last ? encode_wr_id(batch_qp, count) : 0;
                     wrs_[fi].send_flags = IBV_SEND_INLINE |
                                           (is_last ? IBV_SEND_SIGNALED : 0);
-#ifdef Q2_ARRIVAL_QUEUE
-                    constexpr uint32_t kTileBytes = 128u * 256u * 2u;
-                    const uint32_t run_tiles = (cmd.bytes + kTileBytes - 1u) / kTileBytes;
-                    cfg_.flag_staging->host_ptr[i] =
-                        pack_arrival_work((uint32_t)cmd.tile_id, run_tiles);
-                    sges_[fi].addr = (uint64_t)(cfg_.flag_staging->host_ptr + i);
-                    const uint32_t logical_q =
-                        total_logical_queues > 0 ? (cmd.lane_id % total_logical_queues) : 0u;
-                    const uint32_t q_slot = sender_seq_[logical_q]++;
-                    wrs_[fi].wr.rdma.remote_addr = cfg_.remote_flags_addr +
-                                                    (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) * sizeof(uint32_t);
-                    if (cfg_.enable_remote_tail) {
-                        cfg_.flag_staging->host_ptr[BATCH_SIZE + i] = q_slot + 1u;
-                        sges_[ti].addr = (uint64_t)(cfg_.flag_staging->host_ptr + BATCH_SIZE + i);
-                        wrs_[fi].wr_id = 0;
-                        wrs_[fi].send_flags = IBV_SEND_INLINE;
-                        wrs_[fi].next = &wrs_[ti];
-                        wrs_[ti].wr_id = is_last ? encode_wr_id(batch_qp, count) : 0;
-                        wrs_[ti].send_flags = IBV_SEND_INLINE |
-                                              (is_last ? IBV_SEND_SIGNALED : 0);
-                        wrs_[ti].wr.rdma.remote_addr =
-                            cfg_.remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t);
-                        wrs_[ti].next = is_last ? nullptr : &wrs_[(i + 1) * 3];
+                    if (cfg_.use_arrival_queue) {
+                        constexpr uint32_t kTileBytes = 128u * 256u * 2u;
+                        const uint32_t run_tiles = (cmd.bytes + kTileBytes - 1u) / kTileBytes;
+                        cfg_.flag_staging->host_ptr[i] =
+                            pack_arrival_work((uint32_t)cmd.tile_id, run_tiles);
+                        sges_[fi].addr = (uint64_t)(cfg_.flag_staging->host_ptr + i);
+                        const uint32_t logical_q =
+                            total_logical_queues > 0 ? (cmd.lane_id % total_logical_queues) : 0u;
+                        const uint32_t q_slot = sender_seq_[logical_q]++;
+                        wrs_[fi].wr.rdma.remote_addr = cfg_.remote_flags_addr +
+                                                        (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) * sizeof(uint32_t);
+                        if (cfg_.enable_remote_tail) {
+                            cfg_.flag_staging->host_ptr[BATCH_SIZE + i] = q_slot + 1u;
+                            sges_[ti].addr = (uint64_t)(cfg_.flag_staging->host_ptr + BATCH_SIZE + i);
+                            wrs_[fi].wr_id = 0;
+                            wrs_[fi].send_flags = IBV_SEND_INLINE;
+                            wrs_[fi].next = &wrs_[ti];
+                            wrs_[ti].wr_id = is_last ? encode_wr_id(batch_qp, count) : 0;
+                            wrs_[ti].send_flags = IBV_SEND_INLINE |
+                                                  (is_last ? IBV_SEND_SIGNALED : 0);
+                            wrs_[ti].wr.rdma.remote_addr =
+                                cfg_.remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t);
+                            wrs_[ti].next = is_last ? nullptr : &wrs_[(i + 1) * 3];
+                        } else {
+                            wrs_[fi].wr_id      = is_last ? encode_wr_id(batch_qp, count) : 0;
+                            wrs_[fi].send_flags = IBV_SEND_INLINE |
+                                                  (is_last ? IBV_SEND_SIGNALED : 0);
+                            wrs_[fi].next = is_last ? nullptr : &wrs_[(i + 1) * 3];
+                        }
                     } else {
+                        sges_[fi].addr = (uint64_t)cfg_.flag_staging->host_ptr;
+                        wrs_[fi].wr.rdma.remote_addr = cfg_.remote_flags_addr +
+                                                        cmd.tile_id * sizeof(uint32_t);
                         wrs_[fi].wr_id      = is_last ? encode_wr_id(batch_qp, count) : 0;
                         wrs_[fi].send_flags = IBV_SEND_INLINE |
                                               (is_last ? IBV_SEND_SIGNALED : 0);
                         wrs_[fi].next = is_last ? nullptr : &wrs_[(i + 1) * 3];
                     }
-#else
-                    sges_[fi].addr = (uint64_t)cfg_.flag_staging->host_ptr;
-                    wrs_[fi].wr.rdma.remote_addr = cfg_.remote_flags_addr +
-                                                    cmd.tile_id * sizeof(uint32_t);
-                    wrs_[fi].wr_id      = is_last ? encode_wr_id(batch_qp, count) : 0;
-                    wrs_[fi].send_flags = IBV_SEND_INLINE |
-                                          (is_last ? IBV_SEND_SIGNALED : 0);
-                    wrs_[fi].next = is_last ? nullptr : &wrs_[(i + 1) * 3];
-#endif
                 }
 
                 ibv_qp* post_qp = (batch_qp == 0) ? cfg_.qp
@@ -864,10 +863,12 @@ private:
                     signaled_post_ns_.push_back(post_ns);
                     inflight_.fetch_add(count, std::memory_order_release);
                 }
-#ifndef Q2_ARRIVAL_QUEUE
-                // Advance round-robin to next QP
-                qp_rr_idx_ = (qp_rr_idx_ + 1) % cfg_.num_qps;
-#endif
+                if (!cfg_.use_arrival_queue) {
+                    // Flat layout: round-robin to the next QP. Queue layout
+                    // already pre-routes by lane→QP, so it leaves the index
+                    // alone (next iter picks up via cmd_qp).
+                    qp_rr_idx_ = (qp_rr_idx_ + 1) % cfg_.num_qps;
+                }
             }
             if (strided_posted > 0) {
                 inflight_.fetch_add(strided_posted, std::memory_order_release);
@@ -936,5 +937,3 @@ private:
 };
 
 } // namespace internode
-
-#endif  // !INTERNODE_BACKEND_IBGDA

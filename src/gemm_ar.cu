@@ -5,7 +5,7 @@
  * Single kernel launch. Four CTA groups run concurrently:
  *
  *   Compute CTAs [0, num_comp_sms):
- *     GEMM A@B, TMA-store result tiles into C_pgl (IPC multicast buffer).
+ *     GEMM A@B, TMA-store result tiles into C_distributed_tensor (IPC multicast buffer).
  *     Signals per-tile barrier so intra-AR CTAs know each tile is ready.
  *     Tile visit order is selectable: default slice-major, optional
  *     slice-interleaved (GEMM_AR_GEMM_INTERLEAVE_SLICES) to balance intra-AR,
@@ -39,7 +39,7 @@
 
 #include "common/cuda_checks.cuh"
 #include "common/types.cuh"
-#include "dist/dbuf.cuh"
+#include "dist/distributed_buffer.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
 #include "memory/tk_ops_group_group.cuh"
 #include "dist/tma.cuh"
@@ -56,11 +56,6 @@
 #include <vector>
 
 using namespace kittens;
-
-#ifndef TK_NUM_DEVICES
-#define TK_NUM_DEVICES 8
-#endif
-
 
 #include "operators/gemm_ar/gemm_ar.cuh"
 
@@ -128,7 +123,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                 }
             }
         } else if (warp_id == 1 && lane_id == 0) {
-            // TMA store warp — write to C_pgl, signal barrier for intra-AR
+            // TMA store warp — write to C_distributed_tensor, signal barrier for intra-AR
             for (int task_id = blockIdx.x; task_id < num_blocks; task_id += G.num_comp_sms) {
                 int row_idx, col_idx;
                 gemm_ar_decode_comp_task(
@@ -210,9 +205,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 // reducing num_intra_comm_sms at launch time (Python-side O3 formula).
 constexpr int GEMM_AR_AR_UNROLL = 8;
 __device__ __forceinline__ void gemm_ar_pipelined_ar_tile(
-    const fused_globals::C_pgl& pgl, int tile_row, int tile_col
+    const fused_globals::C_distributed_tensor& dbuf, int tile_row, int tile_col
 ) {
-    // pgl uses element-level row/col indexing in mc_ptr_at.
+    // dbuf uses element-level row/col indexing in mc_ptr_at.
     constexpr int TILE_ROWS   = fused_globals::ROW_BLOCK;          // 128
     constexpr int TILE_COLS   = fused_globals::COL_BLOCK;          // 256
     constexpr int GROUP_WARPS = config::NUM_WARPS;                  // 12
@@ -234,7 +229,7 @@ __device__ __forceinline__ void gemm_ar_pipelined_ar_tile(
             if (ii < total_iters) {
                 const int ri = row_base + ii / warps_per_row;
                 const int ci = col_base + (ii % warps_per_row) * WARP_THREADS * ELEMS_PER_TH + warp_laneid * ELEMS_PER_TH;
-                ptrs[u] = reinterpret_cast<bf16_2*>(pgl.mc_ptr_at({0, 0, ri, ci}));
+                ptrs[u] = reinterpret_cast<bf16_2*>(dbuf.mc_ptr_at({0, 0, ri, ci}));
             }
         }
 
@@ -245,10 +240,8 @@ __device__ __forceinline__ void gemm_ar_pipelined_ar_tile(
         for (int u = 0; u < GEMM_AR_AR_UNROLL; u++) {
             const int ii = i + u * GROUP_WARPS;
             if (ii < total_iters) {
-                asm volatile(
-                    "multimem.ld_reduce.weak.global.add.acc::f32.bf16x2 %0, [%1];"
-                    : "=r"(tmps[u]) : "l"(ptrs[u])
-                );  // No "memory" clobber — loads are independent post-syncthreads fence
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(
+                    tmps[u], ptrs[u]);  // No memory clobber — loads are independent post-syncthreads fence
             }
         }
 
@@ -257,10 +250,7 @@ __device__ __forceinline__ void gemm_ar_pipelined_ar_tile(
         for (int u = 0; u < GEMM_AR_AR_UNROLL; u++) {
             const int ii = i + u * GROUP_WARPS;
             if (ii < total_iters) {
-                asm volatile(
-                    "multimem.st.weak.global.bf16x2 [%0], %1;"
-                    :: "l"(ptrs[u]), "r"(tmps[u])
-                );
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(ptrs[u], tmps[u]);
             }
         }
     }
@@ -288,7 +278,7 @@ __device__ __forceinline__ void gemm_ar_pipelined_ar_tile(
 // of this tile's TILE_ROWS×TILE_COLS staging region (G.staging_buf +
 // tile_id*TILE_ELEMS in our layout). Null = legacy single-store behavior.
 __device__ __forceinline__ void gemm_ar_pipelined_rs_tile(
-    const fused_globals::C_pgl& pgl, int tile_row, int tile_col,
+    const fused_globals::C_distributed_tensor& dbuf, int tile_row, int tile_col,
     bf16* C_local, int N, bf16* tx_tile_base = nullptr
 ) {
     constexpr int TILE_ROWS   = fused_globals::ROW_BLOCK;          // 128
@@ -312,7 +302,7 @@ __device__ __forceinline__ void gemm_ar_pipelined_rs_tile(
             if (ii < total_iters) {
                 const int ri = row_base + ii / warps_per_row;
                 const int ci = col_base + (ii % warps_per_row) * WARP_THREADS * ELEMS_PER_TH + warp_laneid * ELEMS_PER_TH;
-                mc_ptrs[u]    = reinterpret_cast<bf16_2*>(pgl.mc_ptr_at({0, 0, ri, ci}));
+                mc_ptrs[u]    = reinterpret_cast<bf16_2*>(dbuf.mc_ptr_at({0, 0, ri, ci}));
                 local_ptrs[u] = reinterpret_cast<bf16_2*>(C_local + (long)ri * N + (long)ci);
             }
         }
@@ -322,10 +312,8 @@ __device__ __forceinline__ void gemm_ar_pipelined_rs_tile(
         for (int u = 0; u < GEMM_AR_AR_UNROLL; u++) {
             const int ii = i + u * GROUP_WARPS;
             if (ii < total_iters) {
-                asm volatile(
-                    "multimem.ld_reduce.weak.global.add.acc::f32.bf16x2 %0, [%1];"
-                    : "=r"(tmps[u]) : "l"(mc_ptrs[u])
-                );  // No "memory" clobber — same reasoning as AR version
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(
+                    tmps[u], mc_ptrs[u]);  // No memory clobber — same reasoning as AR version
             }
         }
 
@@ -346,15 +334,9 @@ __device__ __forceinline__ void gemm_ar_pipelined_rs_tile(
                         + (long)ri_in_tile * fused_globals::COL_BLOCK
                         + (long)ci_in_tile);
                 }
-                asm volatile(
-                    "st.global.u32 [%0], %1;"
-                    :: "l"(local_ptrs[u]), "r"(tmps[u])
-                );
+                comm::multimem<comm::bf16_2>::st_global_bits_no_clobber(local_ptrs[u], tmps[u]);
                 if (tx_ptr_u != nullptr) {
-                    asm volatile(
-                        "st.global.u32 [%0], %1;"
-                        :: "l"(tx_ptr_u), "r"(tmps[u])
-                    );
+                    comm::multimem<comm::bf16_2>::st_global_bits_no_clobber(tx_ptr_u, tmps[u]);
                 }
             }
         }
@@ -376,13 +358,6 @@ __device__ inline void fused_intra_ar_sm(const fused_globals& G) {
     const int my_offset = blockIdx.x - G.num_comp_sms;
     const int stride = G.num_intra_ar_sms;
 
-    // Secondary CTAs (offset >= stride/2) wait on primary CTA's L2-cached flag.
-    // DISABLED in per-tile mode: each CTA only processes ~1 tile for small M,
-    // so secondary CTAs would stall indefinitely waiting on a primary CTA that
-    // already finished. Leave flag logic present but skip the wait.
-    const int half_stride = stride / 2;
-    const bool is_secondary = (stride > 4 && my_offset >= half_stride);
-
     for (int raw_step = 0; raw_step * stride < total_tiles; raw_step++) {
         int tile_id = my_offset + raw_step * stride;
         if (tile_id >= total_tiles) break;
@@ -394,11 +369,8 @@ __device__ inline void fused_intra_ar_sm(const fused_globals& G) {
         const int chunk_id = rb_in_slice * G.chunks_per_row + chunk_col;
 
 
-        // Hardware barrier waits for all 8 devices to signal this tile/chunk.
-        // Iter-44 D×S×F: hoist the acquire-vs-relaxed branch OUTSIDE the
-        // spin-loop. Per-wait-call branch cost is one register compare + one
-        // conditional branch per chunk wait, NOT per-load iteration. The
-        // spin-loop body is a single PTX op either way (identical to canonical).
+        // Hardware barrier waits for all local devices to signal this chunk.
+        // The acquire-vs-relaxed choice is outside the spin loop.
         if (G.use_acquire_poll) {
             wait_acquire(G.barrier, {row_idx, chunk_col}, G.dev_idx, fused_globals::NUM_DEVICES);
         } else {
@@ -430,11 +402,9 @@ __device__ inline void fused_intra_ar_sm(const fused_globals& G) {
                 // decrement back to 0. Safe because all tiles_this_chunk CTAs
                 // have already passed wait() (wait precedes the reduce that
                 // precedes this atomicAdd), so no reader will miss the full count.
-                asm volatile(
-                    "red.release.sys.global.add.s32 [%0], %1;"
-                    :: "l"(&G.barrier[G.dev_idx][{row_idx, chunk_col}]),
-                       "r"(-(int)fused_globals::NUM_DEVICES)
-                    : "memory");
+                comm::atomic_u32::release_add_sys(
+                    &G.barrier[G.dev_idx][{row_idx, chunk_col}],
+                    -(int)fused_globals::NUM_DEVICES);
                 // Also reset the tile-done counter so next iter starts from 0
                 // (ar_done.zero_() is skipped under steady-state in Python).
                 gemm_ar_release_store_u32(G.intra_chunk_tiles_done + chunk_id, 0u);
@@ -496,12 +466,9 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
 
     for (int rb_in_slice = send_id; rb_in_slice < row_blocks; rb_in_slice += stride) {
         const int first_chunk = rb_in_slice * chunks_per_row;
-        const int row_idx = G.dev_idx * G.row_blocks_per_slice + rb_in_slice;
 
 
-        // Per-chunk send (non-coalesced path), with optional adjacent-chunk
-        // coalescing into groups of GEMM_AR_SEND_COALESCE_K (partial coalesce).
-        // K=1 reproduces the canonical per-chunk behavior exactly.
+        // Per-chunk send, optionally grouping adjacent chunks.
         constexpr int kCoalesceK = 1;
         int c = first_chunk;
         while (c < first_chunk + chunks_per_row) {
@@ -550,8 +517,6 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
                 // Per-peer slot offsets: at N == 2, sap == 0 so the offsets
                 // are zero (bit-identical). At N > 2 they partition the
                 // receiver's recv_buf / arrival flag space by sender slot.
-                // Receiver-side wait loop + (N-1)× bench allocation are the
-                // testbed-side counterpart.
                 const long single_peer_bytes =
                     (long)G.row_blocks_per_slice * (long)G.col_blocks * TILE_BYTES;
                 const int  single_peer_tiles =
@@ -568,8 +533,8 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
                     cmd.bytes = (uint32_t)((long)group_tiles * TILE_BYTES);
                     cmd.local_offset = offset;
                     cmd.src_view = 0;
-                    // EFAGDA: encode num_tiles in imm so receiver marks all
-                    // group_tiles chunks arrived (proxy_efa.h:724 equivalent).
+                    // Encode the grouped tile count so the proxy can publish all
+                    // arrivals covered by this send.
                     cmd.row_count = (uint16_t)group_tiles;
                     cmd.remote_offset = (uint32_t)((long)sap * single_peer_bytes) + offset;
                     cmd.lane_id = (uint16_t)logical_q;
@@ -733,28 +698,9 @@ __device__ inline void shared_reduce_my_slice_worksteal(
 }
 
 // ============================================================================
-// Small-M static inter-reduce: no CAS, no linear scan.
-//
-// For small M (total_chunks ≤ 32), the CAS-based dynamic scan in
-// shared_reduce_my_slice creates two problems:
-//
-//   1. CAS pile-up at M=2048 (allow_recycled=true): up to 132 CTAs race to
-//      CAS-claim only 4 chunks. The winner takes the work; the other 131 CTAs
-//      retry — wasting cycles on failed atomicCAS operations.
-//
-//   2. Scan overhead: every outer loop iteration linearly reads O(total_chunks)
-//      flag entries. With many competing CTAs, L2 cache thrash adds latency.
-//
-// Fix: each dedicated reduce CTA (red_id >= 0) statically owns chunks
-//   {red_id, red_id + stride, ...} where stride = num_inter_reduce_store_sms.
-// No CAS is ever needed — each chunk has exactly one owner. Queue draining
-// (RDMA arrival flag publication) continues inside the per-chunk wait loop
-// for CTAs that own a queue (red_id < num_remote_queues).
-//
-// Recycled CTAs (red_id < 0) return immediately: static ownership removes
-// their only role (CAS-racing), and they add L2 pressure without benefit.
-// CTAs with red_id >= total_chunks have no chunks but still drain their queue
-// and spin-wait on published_chunks, ensuring arrival flags are serviced.
+// Static inter-reduce for small chunk counts. Each dedicated reduce CTA owns
+// chunks {red_id, red_id + stride, ...}, so no CAS is needed to claim work.
+// CTAs without chunks still service arrival queues.
 // ============================================================================
 __device__ inline void shared_reduce_my_slice_static(
     const fused_globals& G
@@ -874,19 +820,14 @@ __device__ inline void shared_reduce_my_slice_static(
 __device__ inline void shared_reduce_my_slice(
     const fused_globals& G
 ) {
-    // Out-of-order work-stealing for large M only (total_chunks >= 512,
-    // i.e. M=32768). At this size the reduce tail from RDMA jitter is
-    // significant and the cursor+scan overhead is amortised. Smaller
-    // shapes use the existing static/dynamic paths where sequential
-    // cache locality outweighs the out-of-order benefit.
+    // Large chunk counts use work stealing to absorb RDMA arrival jitter.
     if (G.total_chunks >= 512) {
         shared_reduce_my_slice_worksteal(G
         );
         return;
     }
 
-    // For small/medium M (total_chunks ≤ 64), use static chunk ownership to
-    // eliminate CAS contention and linear scan overhead.
+    // Small/medium chunk counts use static ownership to avoid CAS contention.
     if (G.total_chunks <= 64) {
         shared_reduce_my_slice_static(G
         );
@@ -899,13 +840,8 @@ __device__ inline void shared_reduce_my_slice(
     const int reduce_base = G.num_comp_sms + G.num_intra_ar_sms + G.num_inter_send_sms;
     const int red_id = blockIdx.x - reduce_base;
     const bool consumer_only = (G.num_comp_sms == 0 && G.num_intra_ar_sms == 0 && G.num_inter_send_sms == 0);
-    // Recycled CTA reduction: compute/intra/send CTAs (red_id < 0) join the
-    // scan+claim loop after their primary work, but only when total_chunks is
-    // very small (≤8). Beyond that, 100+ recycled CTAs scanning the flag array
-    // causes cache-coherence pile-up: for M=4096 (16 chunks), 122 recycled +
-    // 8 dedicated CTAs competing via atomicAdd on a 16-entry array creates
-    // severe atomic serialization that outweighs the detection-latency benefit.
-    // Threshold=8 covers only M=2048 (4 chunks) where recycled CTAs help.
+    // Recycled compute/intra/send CTAs only join the scan loop for tiny chunk
+    // counts; otherwise they add cache pressure without enough work to claim.
     const bool allow_recycled = (G.total_chunks <= 8);
     if (!consumer_only && red_id < 0 && !allow_recycled) return;
 
@@ -927,8 +863,7 @@ __device__ inline void shared_reduce_my_slice(
         // flag array. Each CTA starts from a diversified scan_start (seeded by
         // blockIdx.x) and advances by CAS_SCAN_WIN on miss, wrapping around
         // to cover the full array after total_chunks/CAS_SCAN_WIN misses.
-        // Unlike the worksteal cursor (atomicAdd, iter 9: +3.3% regression),
-        // scan_start is per-CTA local — no additional atomic contention.
+        // scan_start is per-CTA local, so misses do not add atomic contention.
         constexpr int CAS_SCAN_WIN = 32;
         if (tid == 0) {
             s_chunk_id = -1;
@@ -1043,21 +978,16 @@ __device__ inline void fused_inter_reduce_and_publish_sm(const fused_globals& G)
 // ============================================================================
 
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    int _hb_role = -1;
     if (blockIdx.x < G.num_comp_sms) {
-        _hb_role = 0;
         fused_comp_sm(G);
         shared_reduce_my_slice(G);
     } else if (blockIdx.x < G.num_comp_sms + G.num_intra_ar_sms) {
-        _hb_role = 1;
         fused_intra_ar_sm(G);
         shared_reduce_my_slice(G);
     } else if (blockIdx.x < G.num_comp_sms + G.num_intra_ar_sms + G.num_inter_send_sms) {
-        _hb_role = 2;
         fused_inter_send_sm(G);
         shared_reduce_my_slice(G);
     } else {
-        _hb_role = 3;
         fused_inter_reduce_and_publish_sm(G);
     }
     // Small shapes (defer_final_multicast_finish == 0) skip the epilogue launch;
@@ -1114,7 +1044,7 @@ void gemm_ar_fused_epilogue_kernel_stub(const __grid_constant__ fused_globals G)
 void launch_fused_gemm_ar(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int dynamic_shared_memory = config::DYNAMIC_SHARED_MEMORY;
-    OSGC_CUDACHECK(cudaFuncSetAttribute(
+    MKERNEL_CUDACHECK(cudaFuncSetAttribute(
         gemm_ar_fused_kernel_stub,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         dynamic_shared_memory));
@@ -1124,7 +1054,7 @@ void launch_fused_gemm_ar(const fused_globals& G) {
 void launch_fused_gemm_ar_epilogue(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int dynamic_shared_memory = config::DYNAMIC_SHARED_MEMORY;
-    OSGC_CUDACHECK(cudaFuncSetAttribute(
+    MKERNEL_CUDACHECK(cudaFuncSetAttribute(
         gemm_ar_fused_epilogue_kernel_stub,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         dynamic_shared_memory));

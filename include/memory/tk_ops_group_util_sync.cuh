@@ -82,7 +82,6 @@ template<int num_warps> __device__ static inline void arrive(barrier<num_warps> 
     asm volatile("bar.arrive %0, %1;\n" :: "r"(bar.barrier_id), "n"(num_warps*WARP_THREADS) : "memory");
 }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 /**
 * @brief Arrives at a semaphore.
 *
@@ -102,7 +101,6 @@ __device__ static inline void arrive(semaphore& sem, uint32_t count) {
         );
     }
 }
-#endif
 
 /**
 * @brief Waits for the requested semaphore phase.
@@ -114,7 +112,6 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
     void const* const ptr = &sem;
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr)); 
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
     asm volatile (
         "{\n"
         ".reg .pred                P1;\n"
@@ -127,24 +124,8 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
         :: "r"(mbar_ptr),
         "r"(kPhaseBit)
     );
-#else
-    asm volatile (
-        "{\n"
-        ".reg .pred                P1;\n"
-        "LAB_WAIT:\n"
-        "mbarrier.test_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-        "@P1                       bra.uni DONE;\n"
-        "nanosleep.u32 5;\n" // wait a few nanoseconds on pre-Hopper architectures to save instruction issue slots
-        "bra.uni                   LAB_WAIT;\n"
-        "DONE:\n"
-        "}\n"
-        :: "r"(mbar_ptr),
-        "r"(kPhaseBit)
-    );
-#endif
 }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 __device__ static inline bool try_wait(semaphore &sem, int kPhaseBit) {
     void const* const ptr = &sem;
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr)); 
@@ -163,7 +144,6 @@ __device__ static inline bool try_wait(semaphore &sem, int kPhaseBit) {
 
     return static_cast<bool>(success);
 }
-#endif
 
 /**
 * @brief Checks if the requested semaphore phase is ready.

@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse, json, os, sys, time
 from pathlib import Path
 
-os.environ["OSGC_BIND_RETAINED_HANDLE"] = "1"
+os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
 
 import torch
 import torch.distributed as dist

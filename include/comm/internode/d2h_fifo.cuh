@@ -14,19 +14,20 @@
 #pragma once
 
 #include "types.h"
+#include "../global_u64.cuh"
 #include "../../common/cuda_checks.cuh"
 
 #include <cuda_runtime.h>
+#include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <stdexcept>
 
 
 
 namespace internode {
 
-// Under IBGDA we have at most one D2HFifoDevice per QP (= one SQ each), and
-// Q2 configures up to 24 QPs via OSGC_IB_NUM_QPS=24. Bump the bundle capacity
-// so the per-QP entries fit. The proxy-based IBVERBS path still only creates
-// kMaxProxyThreads=8 proxy threads; extra slots stay zero.
+// Bundle capacity covers the maximum configured QP/thread fanout.
 static constexpr int kMaxProxyThreads = 24;
 
 
@@ -63,8 +64,7 @@ struct D2HFifoDevice {
             uint64_t t;
             do {
                 // Volatile load from host-pinned memory
-                asm volatile("ld.volatile.global.u64 %0, [%1];"
-                             : "=l"(t) : "l"(tail) : "memory");
+                t = comm::global_u64::volatile_load(tail);
                 *tail_cache = t;
                 if (slot < (uint64_t)capacity + t) break;
                 __nanosleep(64);
@@ -90,12 +90,9 @@ struct D2HFifoDevice {
         char* slot_bytes = reinterpret_cast<char*>(slot_ptr);
 #pragma unroll
         for (int wi = 1; wi < kCmdWords; ++wi) {
-            asm volatile("st.global.u64 [%0], %1;"
-                         :: "l"(slot_bytes + wi * (int)sizeof(uint64_t)), "l"(words[wi])
-                         : "memory");
+            comm::global_u64::store(slot_bytes + wi * (int)sizeof(uint64_t), words[wi]);
         }
-        asm volatile("st.global.release.gpu.u64 [%0], %1;"
-                     :: "l"(slot_bytes), "l"(words[0]) : "memory");
+        comm::global_u64::release_store_gpu(slot_bytes, words[0]);
 
         return slot;
     }
@@ -103,10 +100,6 @@ struct D2HFifoDevice {
     uint64_t push(const TransferCmd&) const { return 0; } // host stub
 #endif
 };
-
-
-// Cap on per-bundle TX/RX-QP arrays under EFAGDA v2. Same upper bound as
-// kMaxProxyThreads since the reference's per-CTA-QP count fits comfortably.
 
 struct D2HFifoDeviceBundle {
     D2HFifoDevice fifos[kMaxProxyThreads];
@@ -132,6 +125,40 @@ inline __host__ __device__ D2HFifoDeviceBundle make_fifo_bundle(
     return bundle;
 }
 
+inline __host__ D2HFifoDeviceBundle resolve_fifo_bundle(
+    int64_t fifo_triggers,
+    int64_t fifo_head,
+    int64_t fifo_tail,
+    int64_t fifo_tail_cache,
+    int fifo_capacity,
+    int default_num_qps,
+    int logical_queues_per_qp = 1,
+    const char* num_qps_env = "MKERNEL_EFA_NUM_QPS",
+    const char* null_bundle_msg = "FIFO bundle pointer is null"
+) {
+    if (fifo_capacity < 0) {
+        auto* bundle_ptr = reinterpret_cast<const D2HFifoDeviceBundle*>(fifo_triggers);
+        if (!bundle_ptr) throw std::runtime_error(null_bundle_msg);
+        return *bundle_ptr;
+    }
+
+    D2HFifoDevice fd{};
+    fd.triggers   = reinterpret_cast<TransferCmd*>(fifo_triggers);
+    fd.head       = reinterpret_cast<uint64_t*>(fifo_head);
+    fd.tail       = reinterpret_cast<uint64_t*>(fifo_tail);
+    fd.tail_cache = reinterpret_cast<uint64_t*>(fifo_tail_cache);
+    fd.capacity   = fifo_capacity;
+
+    int num_qps = default_num_qps > 0 ? default_num_qps : 1;
+    if (num_qps_env) {
+        if (const char* e = std::getenv(num_qps_env)) {
+            int v = std::atoi(e);
+            if (v > 0) num_qps = v;
+        }
+    }
+    return make_fifo_bundle(fd, num_qps, logical_queues_per_qp);
+}
+
 inline __host__ __device__ D2HFifoDevice gemm_ar_select_fifo_for_lane(
     const D2HFifoDeviceBundle& bundle,
     uint32_t lane_id
@@ -151,10 +178,16 @@ inline __host__ __device__ D2HFifoDevice gemm_ar_select_fifo_for_lane(
     return bundle.fifos[fifo_idx];
 }
 
+inline __host__ __device__ D2HFifoDevice q2_select_fifo_for_lane(
+    const D2HFifoDeviceBundle& bundle,
+    uint32_t lane_id
+) {
+    return gemm_ar_select_fifo_for_lane(bundle, lane_id);
+}
+
 
 // ---------------------------------------------------------------------------
-// Host-side handle — used by CPU proxy thread
-// (Compiled out under IBGDA / EFAGDA: no proxy thread, no FIFO drain.)
+// Host-side handle — used by CPU proxy thread.
 // ---------------------------------------------------------------------------
 
 struct D2HFifoHost {
@@ -250,26 +283,26 @@ inline D2HFifoPair create_d2h_fifo(int capacity = 1024) {
 
     // Triggers: host-pinned, zeroed (EMPTY cmd_type = 0)
     TransferCmd* triggers = nullptr;
-    OSGC_CUDACHECK(cudaHostAlloc(&triggers,
+    MKERNEL_CUDACHECK(cudaHostAlloc(&triggers,
                                   capacity * sizeof(TransferCmd),
                                   cudaHostAllocMapped));
     memset(triggers, 0, capacity * sizeof(TransferCmd));
 
     // Head: device memory, initialized to 0
     uint64_t* head_dev = nullptr;
-    OSGC_CUDACHECK(cudaMalloc(&head_dev, sizeof(uint64_t)));
-    OSGC_CUDACHECK(cudaMemset(head_dev, 0, sizeof(uint64_t)));
+    MKERNEL_CUDACHECK(cudaMalloc(&head_dev, sizeof(uint64_t)));
+    MKERNEL_CUDACHECK(cudaMemset(head_dev, 0, sizeof(uint64_t)));
 
     // Tail: host-pinned, initialized to 0
     uint64_t* tail_host = nullptr;
-    OSGC_CUDACHECK(cudaHostAlloc(&tail_host, sizeof(uint64_t),
+    MKERNEL_CUDACHECK(cudaHostAlloc(&tail_host, sizeof(uint64_t),
                                   cudaHostAllocMapped));
     *tail_host = 0;
 
     // Tail cache: device memory, initialized to 0
     uint64_t* tail_cache_dev = nullptr;
-    OSGC_CUDACHECK(cudaMalloc(&tail_cache_dev, sizeof(uint64_t)));
-    OSGC_CUDACHECK(cudaMemset(tail_cache_dev, 0, sizeof(uint64_t)));
+    MKERNEL_CUDACHECK(cudaMalloc(&tail_cache_dev, sizeof(uint64_t)));
+    MKERNEL_CUDACHECK(cudaMemset(tail_cache_dev, 0, sizeof(uint64_t)));
 
     // Device handle
     pair.device.triggers   = triggers;  // host-pinned, accessible from GPU

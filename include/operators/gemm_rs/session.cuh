@@ -6,7 +6,7 @@
 // ============================================================================
 // Session management (same as v1)
 // ============================================================================
-#include "comm/internode/session_select.h"
+#include "comm/internode/session_py.cuh"
 
 static internode::Session* g_session = nullptr;
 static std::vector<std::string> g_peer_ips_storage;
@@ -21,31 +21,14 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int output_n = 0,
                        std::vector<std::string> peer_ips = {},
                        std::vector<int> peer_tcp_ports = {}) {
-    if (g_session) { internode::destroy_session(g_session); g_session = nullptr; }
-    internode::SessionConfig cfg{};
-    cfg.rank = rank;
-    cfg.peer_ip = peer_ip.c_str();
-    cfg.tcp_port = tcp_port;
-    if (!peer_ips.empty()) {
-        g_peer_ips_storage   = std::move(peer_ips);
-        g_peer_ports_storage = std::move(peer_tcp_ports);
-        if (g_peer_ports_storage.empty()) {
-            g_peer_ports_storage.assign(g_peer_ips_storage.size(), tcp_port);
-        }
-        g_peer_ips_cstr.resize(g_peer_ips_storage.size());
-        for (size_t i = 0; i < g_peer_ips_storage.size(); ++i) {
-            g_peer_ips_cstr[i] = g_peer_ips_storage[i].c_str();
-        }
-        cfg.num_peers      = (int)g_peer_ips_storage.size();
-        cfg.peer_ips       = g_peer_ips_cstr.data();
-        cfg.peer_tcp_ports = g_peer_ports_storage.data();
-    }
-    cfg.local_gpu_buf = reinterpret_cast<void*>(send_buf_ptr);
-    cfg.local_gpu_buf_size = (size_t)send_buf_size;
-    cfg.recv_buf_size = (size_t)recv_buf_size;
-    cfg.num_tiles = num_tiles;
-    cfg.fifo_capacity = fifo_capacity;
-    cfg.device_id = device_id;
+    internode::py::destroy_session(g_session);
+    internode::SessionConfig cfg = internode::py::make_base_config(
+        rank, peer_ip.c_str(), tcp_port,
+        send_buf_ptr, send_buf_size, recv_buf_size,
+        num_tiles, fifo_capacity, device_id);
+    internode::py::apply_peer_ips(
+        cfg, peer_ips, peer_tcp_ports, tcp_port,
+        g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
 
     // GEMM_RS_DIRECT_DMABUF_SEND: register output_local as a DMA-BUF MR on every
     // rail's PD so the send path can skip the pack + gather step. Session
@@ -54,23 +37,23 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     cfg.max_inflight = 256;
     // Round 26: default to 4 QPs per endpoint to match the gemm_ar round-13 win
     // (51e19e8). Multi-NIC striping is also enabled by default via the
-    // round-18 cluster default OSGC_EFA_NUM_NICS=2 in session_fi.h.
+    // round-18 cluster default MKERNEL_EFA_NUM_NICS=2 in session_fi.h.
     cfg.num_qps = 4;
-    if (const char* env_num_qps = std::getenv("OSGC_EFA_NUM_QPS")) {
+    if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
         cfg.num_qps = std::atoi(env_num_qps);
     }
     // gemm_rs proxy-thread count: default 1 (bumped to num_rails=2 inside session
     // setup). Multi-proxy spreads send-cmd dispatch across host threads —
     // matters when the per-proxy dispatch rate approaches NIC latency floor
-    // (~2 µs). Overridable with OSGC_PROXY_THREADS (gemm_ar uses the same env).
+    // (~2 µs). Overridable with MKERNEL_PROXY_THREADS (gemm_ar uses the same env).
     cfg.num_proxy_threads = 1;
-    if (const char* env_proxy = std::getenv("OSGC_PROXY_THREADS")) {
+    if (const char* env_proxy = std::getenv("MKERNEL_PROXY_THREADS")) {
         cfg.num_proxy_threads = std::atoi(env_proxy);
     } else if (const char* env_proxy = std::getenv("GEMM_RS_PROXY_THREADS")) {
         cfg.num_proxy_threads = std::atoi(env_proxy);
     }
     cfg.logical_queues_per_qp = 1;
-    if (const char* env_lq = std::getenv("OSGC_INTERNODE_LOGICAL_QUEUES_PER_QP")) {
+    if (const char* env_lq = std::getenv("MKERNEL_INTERNODE_LOGICAL_QUEUES_PER_QP")) {
         cfg.logical_queues_per_qp = std::atoi(env_lq);
     } else if (const char* env_lq = std::getenv("GEMM_RS_LOGICAL_QUEUES_PER_QP")) {
         cfg.logical_queues_per_qp = std::atoi(env_lq);
@@ -79,25 +62,16 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
 }
 
 void destroy_session_py() {
-    if (g_session) { internode::destroy_session(g_session); g_session = nullptr; }
+    internode::py::destroy_session(g_session);
 }
 void set_epoch_py(int epoch) {
-    if (g_session) internode::set_epoch(g_session, (uint32_t)epoch);
+    internode::py::set_epoch(g_session, epoch);
 }
 std::tuple<int64_t, int64_t, int64_t, int64_t, int> get_fifo_handles_py() {
-    auto h = internode::get_fifo_device_handle(g_session);
-    // GPU-initiated backends (EFAGDA/IBGDA) always carry a bundle; there's
-    // no host-pinned FIFO tuple to flatten. Force the bundle-pointer path.
-    if (h.num_fifos > 1) {
-        return {(int64_t)(&g_session->fifo_bundle), 0, 0, 0, -h.num_fifos};
-    }
-    auto fd = h.fifos[0];
-    return std::make_tuple(
-        (int64_t)fd.triggers, (int64_t)fd.head, (int64_t)fd.tail,
-        (int64_t)fd.tail_cache, fd.capacity);
+    return internode::py::get_fifo_handles(g_session);
 }
-int64_t get_arrival_flags_ptr_py() { return (int64_t)internode::get_arrival_device_ptr(g_session); }
-int64_t get_recv_buf_ptr_py() { return (int64_t)internode::get_recv_buf_ptr(g_session); }
+int64_t get_arrival_flags_ptr_py() { return internode::py::get_arrival_flags_ptr(g_session); }
+int64_t get_recv_buf_ptr_py() { return internode::py::get_recv_buf_ptr(g_session); }
 
 #include <torch/csrc/utils/pybind.h>
 

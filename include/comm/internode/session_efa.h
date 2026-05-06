@@ -36,64 +36,7 @@
 #include "proxy_diagnostics.h"
 
 
-#ifdef Q2_PROBE_PROXY_TAIL
-#include <limits>
-#endif
-
 namespace internode {
-
-#ifdef Q2_PROBE_PROXY_TAIL
-// Iter 30 probe: local helpers to calibrate the GPU %globaltimer → host
-// CLOCK_MONOTONIC offset once per session. Same math as session.h:54-83 but
-// defined inside the EFA session header (session.h is not included on the
-// EFA path; proxy.h's CX7 backend owns the canonical copy). Gated entirely
-// behind Q2_PROBE_PROXY_TAIL so canonical builds are byte-identical.
-inline uint64_t q2_probe_host_now_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-__global__ inline void q2_probe_read_globaltimer_kernel(unsigned long long* out) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        unsigned long long t;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-        out[0] = t;
-    }
-}
-
-inline int64_t calibrate_gpu_to_host_offset_ns(int samples = 32) {
-    if (samples <= 0) samples = 1;
-    unsigned long long* dev_out = nullptr;
-    unsigned long long host_out = 0;
-    cudaStream_t stream = nullptr;
-    OSGC_CUDACHECK(cudaMalloc(&dev_out, sizeof(unsigned long long)));
-    OSGC_CUDACHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-    uint64_t best_window_ns = std::numeric_limits<uint64_t>::max();
-    int64_t best_offset_ns = 0;
-    for (int i = 0; i < samples; ++i) {
-        const uint64_t host_before_ns = q2_probe_host_now_ns();
-        q2_probe_read_globaltimer_kernel<<<1, 1, 0, stream>>>(dev_out);
-        OSGC_CUDACHECK(cudaGetLastError());
-        OSGC_CUDACHECK(cudaMemcpyAsync(
-            &host_out, dev_out, sizeof(unsigned long long),
-            cudaMemcpyDeviceToHost, stream));
-        OSGC_CUDACHECK(cudaStreamSynchronize(stream));
-        const uint64_t host_after_ns = q2_probe_host_now_ns();
-        const uint64_t window_ns = host_after_ns - host_before_ns;
-        if (window_ns < best_window_ns) {
-            best_window_ns = window_ns;
-            const uint64_t host_mid_ns = host_before_ns + window_ns / 2ULL;
-            best_offset_ns = (int64_t)host_mid_ns - (int64_t)host_out;
-        }
-    }
-
-    OSGC_CUDACHECK(cudaStreamDestroy(stream));
-    OSGC_CUDACHECK(cudaFree(dev_out));
-    return best_offset_ns;
-}
-#endif
 
 // Match CX7: two stage-barrier slots per session.
 static constexpr int kEfaStageBarrierSlots = 2;
@@ -259,8 +202,6 @@ struct Session {
     gpu_mr::GpuRdmaBuffer recv_buf;
 
     // D2H command FIFOs (one per proxy thread / FIFO channel).
-    // Under EFAGDA the FIFO + host-side proxy are absent; the same
-    // `fifo_bundle` slot holds the EFA SQ/DB handles instead.
     D2HFifoPair         fifos[kMaxProxyThreads];
     D2HFifoDeviceBundle fifo_bundle;
 
@@ -301,9 +242,9 @@ inline Session* create_session(const SessionConfig& cfg) {
     // --- 0. Clamp knobs and derive session-wide counters.
     int num_rails = cfg.num_rails <= 0 ? 1 : cfg.num_rails;
     if (num_rails > kMaxRails) num_rails = kMaxRails;
-    // Allow OSGC_EFA_NUM_RAILS env override.
+    // Allow MKERNEL_EFA_NUM_RAILS env override.
     {
-        const char* env = std::getenv("OSGC_EFA_NUM_RAILS");
+        const char* env = std::getenv("MKERNEL_EFA_NUM_RAILS");
         if (env && env[0]) {
             int v = std::atoi(env);
             if (v >= 1 && v <= kMaxRails) num_rails = v;
@@ -482,12 +423,12 @@ inline Session* create_session(const SessionConfig& cfg) {
 
     // --- 4. D2H FIFOs.
     // Default: one FIFO per proxy thread (num_fifos = num_proxy_threads).
-    // OSGC_FIFO_PER_QP=1 enables one-fifo-per-QP mode (num_fifos = num_qps),
+    // MKERNEL_FIFO_PER_QP=1 enables one-fifo-per-QP mode (num_fifos = num_qps),
     // which decouples FIFO count from thread count and reduces GPU-side
     // atomicAdd contention on the FIFO head pointer (each QP gets its own
     // head). Each proxy thread then round-robins through its slice of fifos.
     bool fifo_per_qp = false;
-    if (const char* e = std::getenv("OSGC_FIFO_PER_QP")) {
+    if (const char* e = std::getenv("MKERNEL_FIFO_PER_QP")) {
         fifo_per_qp = (std::atoi(e) != 0);
     }
     int num_fifos = fifo_per_qp ? num_qps : num_proxy_threads;
@@ -661,15 +602,6 @@ inline Session* create_session(const SessionConfig& cfg) {
         }
     }
 
-#ifdef Q2_PROBE_PROXY_TAIL
-    // Iter 30 probe: calibrate the GPU %globaltimer → host CLOCK_MONOTONIC
-    // offset once per session. Used by proxy_efa.h's account_polled_cmd_for_probe_
-    // helper to convert the kernel's `cmd.enqueue_device_ns` (GPU domain)
-    // into the host domain for enqueue→seen delta computation. Matches the
-    // CX7 backend pattern (session.h:414, pcfg.gpu_to_host_offset_ns line 451).
-    const int64_t gpu_to_host_offset_ns = calibrate_gpu_to_host_offset_ns(64);
-#endif
-
     // --- 9. Spawn proxy threads. Each proxy handles QPs on its assigned rail.
     for (int t = 0; t < num_proxy_threads; t++) {
         const int qp_base = t * qps_per_proxy;
@@ -751,6 +683,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         pcfg.remote_flags_addr = s->remote_info.flags_addr;
         pcfg.remote_flags_rkey = remote_flags_rkey;
 
+        pcfg.use_arrival_queue   = cfg.use_arrival_queue;
         pcfg.remote_queue_stride = (uint32_t)logical_queue_stride;
         pcfg.remote_tail_addr    = s->remote_info.tail_addr;
         pcfg.remote_tail_rkey    = remote_tail_rkey;
@@ -759,11 +692,7 @@ inline Session* create_session(const SessionConfig& cfg) {
             pcfg.enable_remote_tail =
                 (tail_env != nullptr && tail_env[0] == '1');
         }
-        // R1 Commit 1: plumbing for the adaptive post/poll controller inside
-        // Proxy::run(). Default 0 → byte-identical to the pre-R1 static
-        // BATCH_SIZE/ACCUMULATE_SPINS path. When 1, the controller state
-        // declared in Proxy is still unread until Commit 2/3; setting the
-        // flag today only exercises the plumbing.
+        // Optional proxy post/poll controller.
         {
             const char* pipe_env = std::getenv("Q2_PROXY_PIPELINE");
             pcfg.pipeline_enabled =
@@ -818,13 +747,6 @@ inline Session* create_session(const SessionConfig& cfg) {
         pcfg.sq_depth     = s->sq_depth;
         pcfg.device_id    = cfg.device_id;
         pcfg.pin_proxy    = cfg.pin_proxy;
-
-#ifdef Q2_PROBE_PROXY_TAIL
-        // Iter 30 probe: pass the pre-calibrated GPU→host offset to each proxy
-        // so account_polled_cmd_for_probe_ can compute enqueue_to_seen deltas
-        // in the host clock domain.
-        pcfg.gpu_to_host_offset_ns = gpu_to_host_offset_ns;
-#endif
 
         s->proxies[t] = new Proxy(pcfg);
         s->proxies[t]->start();
@@ -1016,7 +938,7 @@ inline ReadyQueueDevice get_ready_queue_device(const Session* /*s*/) {
 /** Set total expected ready-queue entries — no-op on SRD. */
 inline void set_ready_queue_total(Session* /*s*/, uint32_t /*total*/) {}
 
-/** Per-proxy-thread diagnostic counters. (EFAGDA: empty — no proxy threads.) */
+/** Per-proxy-thread diagnostic counters. */
 inline std::vector<ProxyDiagnostics> get_proxy_diagnostics(const Session* s) {
     std::vector<ProxyDiagnostics> out;
     if (!s) return out;
@@ -1084,7 +1006,7 @@ inline void prepare_epoch(Session* s) {
  * Phase 2 of the epoch transition — mirrors session.h::commit_epoch.
  * Updates epoch, resets arrivals/stage-barrier/FIFOs, resumes all proxies.
  *
- * When OSGC_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1, skips arrival/stage-barrier
+ * When MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1, skips arrival/stage-barrier
  * resets and FIFO reinit. This is safe under Q2_STEADY_STATE_BENCH because:
  *   - arrival flags: kernel resets them on-GPU via q2_iter_end_reset_arrival_flags
  *     before the epilogue barrier, so they're clean by the time the next iter starts.
@@ -1104,7 +1026,7 @@ inline void commit_epoch(Session* s, uint32_t epoch) {
     // Read every call — Python sets this env var AFTER the first set_epoch(1)
     // call (line 629 of benchmark_gemm_ar_multinode.py), so a static-const
     // cache would latch false and never pick up the later mutation.
-    const char* skip_env = getenv("OSGC_COMMIT_EPOCH_SKIP_ARRIVAL_RESET");
+    const char* skip_env = getenv("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET");
     const bool skip_reset = (skip_env && skip_env[0] == '1');
 
     s->epoch = epoch;
@@ -1300,10 +1222,10 @@ inline void prime_first_launch_transport(Session* s) {
         for (int t = 0; t < s->num_proxy_threads; t++) {
             if (injected[t] == 0) continue;
             const uint64_t new_head = target_heads[t];
-            OSGC_CUDACHECK(cudaMemcpy(
+            MKERNEL_CUDACHECK(cudaMemcpy(
                 s->fifos[t].device.head, &new_head, sizeof(uint64_t),
                 cudaMemcpyHostToDevice));
-            OSGC_CUDACHECK(cudaMemcpy(
+            MKERNEL_CUDACHECK(cudaMemcpy(
                 s->fifos[t].device.tail_cache, &new_head, sizeof(uint64_t),
                 cudaMemcpyHostToDevice));
         }

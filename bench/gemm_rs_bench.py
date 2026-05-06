@@ -11,7 +11,7 @@ from pathlib import Path
 
 # Keep the release default, but allow parity tests against the experiment
 # harness, which leaves this unset.
-os.environ.setdefault("OSGC_BIND_RETAINED_HANDLE", "1")
+os.environ.setdefault("MKERNEL_BIND_RETAINED_HANDLE", "1")
 
 import torch
 import torch.distributed as dist
@@ -33,16 +33,13 @@ DEFAULT_SHAPES = [2048, 4096, 8192, 16384, 32768]
 # Note: M=65536 is in published bar chart but requires GEMM_RS_SEND_READY_BITMAP+FUSE_COMPUTE_INTRA
 # which hangs on this hardware. Excluded from default sweep.
 
-# 3-role split with FUSE_COMPUTE_INTRA=1 (SEND_FIRST_READY, no BITMAP — BITMAP+FCI hangs on this HW).
+# Tuned role split for the fused compute/intra/send/reduce path.
 SM_SPLIT = {
     2048:  (112, 0, 10, 10, 2),
     4096:  (116, 0, 8,  8,  4),
-    8192:  (118, 0, 6, 8, 4),  # canonical (best historical: 0.7426 ms at 26556fc)
+    8192:  (118, 0, 6, 8, 4),
     16384: (120, 0, 4,  8,  4),
     32768: (120, 0, 4,  8,  8),
-    # M=65536: per-shape tune from experiments-side pick_role_split + pick_chunk_tiles
-    # (CX7 sweep SLURM 11587 / 11578-83). 124 compute + 2 send + 6 reduce + CT=32
-    # was the canonical config used to produce fused_q5_efa.json[M=65536]=68.47ms.
     65536: (124, 0, 2,  6,  32),
 }
 
@@ -155,12 +152,12 @@ def main():
         ready_chunk.data_.zero_()
 
         # GEMM_RS_INTRA_RS_DIRECT_STAGING=1: staging is a DistBuffer.
-        staging_pgl = mod.DistBuffer(
+        staging_dbuf = mod.DistBuffer(
             (m_local, n), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=False,
         )
-        staging_pgl.data_.zero_()
-        staging_buf = staging_pgl.data_
+        staging_dbuf.data_.zero_()
+        staging_buf = staging_dbuf.data_
 
         os.environ["GEMM_RS_RDMA_CHUNK_TILES_RT"] = str(chunk_tiles)
 
@@ -198,7 +195,7 @@ def main():
         def reset_state():
             workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
             barrier.data_.zero_(); ready_chunk.data_.zero_()
-            staging_pgl.data_.zero_()
+            staging_dbuf.data_.zero_()
 
         def run_once():
             mod.gemm_rs_fused(
@@ -209,7 +206,7 @@ def main():
                 n_comp, n_intra, n_send, n_reduce,
                 use_acquire_poll, reduce_poll_sleep_ns,
                 ready_chunk,
-                staging_pgl,
+                staging_dbuf,
                 num_nodes=NUM_NODES,
             )
 

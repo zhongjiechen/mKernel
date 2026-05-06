@@ -15,14 +15,14 @@
  *
  *   Comp CTAs [num_intra_comm, 132):
  *     GEMM on all M rows. Atomically claim tiles:
- *       - Local-half tile: wait on intra-node barrier, TMA load from A_pgl
- *       - Remote-half tile: wait on arrival_flags, TMA load from A_recv_gl
+ *       - Local-half tile: wait on intra-node barrier, TMA load from A_distributed_tensor
+ *       - Remote-half tile: wait on arrival_flags, TMA load from A_recv_local_tensor
  *
  * The distributed A buffer is DMA-BUF-registered for RDMA (no staging copy).
  */
 
 #include "common/types.cuh"
-#include "dist/dbuf.cuh"
+#include "dist/distributed_buffer.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
 #include "common/cuda_checks.cuh"
 #include "memory/tk_ops_group_group.cuh"
@@ -40,8 +40,8 @@
 
 using namespace kittens;
 
-#ifndef TK_NUM_DEVICES
-#define TK_NUM_DEVICES 8
+#ifndef INTRA_NUM_DEVICES
+#define INTRA_NUM_DEVICES 8
 #endif
 
 namespace ag_gemm_multinode {
@@ -77,15 +77,10 @@ struct comp_task {
 // ============================================================================
 
 struct globals {
-    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_NODES = 2;
-    // run_30: PIPELINE_STAGES 4 → 3. At 4K (num_iters=4) entire inner loop is
-    // pipeline fill/drain; 8K (num_iters=8) has 4 steady + 4 fill/drain. Dropping
-    // depth to 3 saves one iter of fill/drain per tile. 16K (16 iters) / 32K (32
-    // iters) have enough steady-state to absorb the reduced TMA-hiding depth.
-    // Shared-memory budget: max(3 * 48KB, 2 * 48KB + 64KB) = 160KB vs prior 208KB
-    // — 48KB freed (unused). Compile-time knob; uniform across all shapes (no
-    // per-shape hardcoding).
+    // Three stages keep the producer/consumer pipeline deep enough while
+    // leaving more shared memory headroom than a four-stage pipeline.
     static constexpr int PIPELINE_STAGES = 3;
     static constexpr int SUPER_M = 12;
     static constexpr int ROW_BLOCK = 128;
@@ -100,28 +95,28 @@ struct globals {
     static constexpr int NUM_COMM_CHUNKS = config::DYNAMIC_SHARED_MEMORY / sizeof(A_comm_tile);
 
     // Intra-node IPC
-    using A_pgl = dist::dbuf<dist::gl<bf16, 1, 1, -1, -1, A_tile, A_comm_tile>, NUM_DEVICES, true, 0, 1, A_comm_tile>;
-    using barrier_pgl = dist::barrier_dbuf<NUM_DEVICES>;
+    using A_distributed_tensor = dist::distributed_tensor<dist::local_tensor<bf16, 1, 1, -1, -1, A_tile, A_comm_tile>, NUM_DEVICES, true, 0, 1, A_comm_tile>;
+    using barrier_distributed_tensor = dist::barrier_distributed_tensor<NUM_DEVICES>;
 
-    A_pgl A;
-    barrier_pgl barrier;
+    A_distributed_tensor A;
+    barrier_distributed_tensor barrier;
 
-    // Inter-node RDMA + compute. A_gl carries both A_tile (compute loads) and
+    // Inter-node RDMA + compute. A_local_tensor carries both A_tile (compute loads) and
     // A_comm_tile (phase-2 receive fan-out under #8) so TMA descriptors for both
     // are available on recv_buf / A_local without creating separate GL types.
-    using A_gl = dist::gl<bf16, 1, 1, -1, -1, A_tile, A_comm_tile>;
-    using B_gl = dist::gl<bf16, 1, 1, -1, -1, B_tile>;
-    using C_gl = dist::gl<bf16, 1, 1, -1, -1, C_tile>;
+    using A_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, A_tile, A_comm_tile>;
+    using B_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, B_tile>;
+    using C_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, C_tile>;
 
-    A_gl A_local;
-    A_gl A_recv_gl;      // per-rank unicast view of recv_buf (RDMA landing zone)
+    A_local_tensor A_local;
+    A_local_tensor A_recv_local_tensor;      // per-rank unicast view of recv_buf (RDMA landing zone)
     // Plan federated-weaving-ocean #8: multicast-backed A_recv buffer. Each
     // rank r on node N publishes the 1/NUM_DEVICES slice of peer A_half it
-    // received via RDMA into this PGL, so all ranks on node N see the full
+    // received via RDMA into this dbuf, so all ranks on node N see the full
     // peer A_half after phase-2. Compute remote-tile loads read from this.
-    A_pgl A_recv;
-    B_gl B;
-    C_gl C;
+    A_distributed_tensor A_recv;
+    B_local_tensor B;
+    C_local_tensor C;
 
     internode::D2HFifoDeviceBundle d2h_fifos;
     volatile uint32_t*       arrival_flags;
@@ -150,16 +145,15 @@ struct globals {
 // consumer-CTA poll site so PTX scope and inline RX-CQ poll integration stay
 // in one place.
 //
-// Under proxy / IBGDA: just spin on a volatile load (host-mapped memory or
-// HBM remote-NIC writes). Under EFAGDA inline-poll: also poll the local RX
+// Under proxy: just spin on a volatile load (host-mapped memory or HBM
+// remote-NIC writes). Under inline-poll backends: also poll the local RX
 // CQ each iteration; on RX-IMM CQE the helper publishes the imm into
 // arrival_flags via st.release.gpu.global. Reader uses .gpu scope (writer
 // is a local CTA on same GPU L2).
 __device__ __forceinline__ void ag_gemm_wait_arrival_one(const globals& G, int slot_ck) {
     uint32_t v;
     do {
-        asm volatile("ld.volatile.global.u32 %0, [%1];"
-            : "=r"(v) : "l"((uint32_t*)&G.arrival_flags[slot_ck]) : "memory");
+        v = comm::atomic_u32::volatile_load(&G.arrival_flags[slot_ck]);
         if (v == G.epoch) break;
         __nanosleep(100);
     } while (true);
@@ -186,15 +180,7 @@ __device__ __forceinline__ void ag_gemm_wait_arrival(const globals& G, int ck) {
 // Intra-comm SM: IPC multicast gather + signal intra_done per row block
 // ============================================================================
 
-// Gen-3 run_23: shape-adaptive per-rb WR split. rule:
-//   split = max(1, min(CEIL, rb_bytes / 2_MB))
-// Rationale from run_22: sub-WR < 2 MB hits NIC per-WR overhead floor; >= 2 MB
-// amortizes and the extra QP parallelism wins. Ceiling default 4.
-// Shape mapping at default ceiling 4:
-//   rb_bytes=8 MB (32K): split=4 (sub=2 MB)
-//   rb_bytes=4 MB (16K): split=2 (sub=2 MB)
-//   rb_bytes=2 MB (8K):  split=1 (sub=2 MB)
-//   rb_bytes=1 MB (4K):  split=1 (sub=1 MB, below knee but only 1)
+// Split large row-block sends into roughly 2 MB sub-WRs, capped by `ceiling`.
 __device__ __forceinline__ int ag1_compute_wr_split(int rb_bytes, int ceiling) {
     // Default knee at 2 MB. AG1_WR_SPLIT_KNEE_BYTES could override at compile
     // time if tuning is needed.
@@ -357,44 +343,19 @@ void entrypoint(
 
     int total_chunks = (a_half_bytes + CHUNK_BYTES - 1) / CHUNK_BYTES;
 
-    // Split CTAs: intra-comm + compute. Intra-gather CTAs also post the
-    // zero-copy inter-node RDMA WRs (src_view=1, DMA-BUF MR aliasing A.data_)
-    // at kernel entry — no separate inter-comm pool.
-    //
-    // ag_gemm opt #8 (shape-adaptive host tuning, plan federated-weaving-ocean):
-    // at M>=16384 compute is bottleneck → shrink comm pool (32 total, giving
-    // 100 compute CTAs); at M<=8192 comm is bottleneck → 64 total (68 compute).
-    // Job 6085 (32-split) vs 6060 (64-split) at k16 cx7 2x8:
-    //   16K: 6.282 vs 6.375 (-1.5%), 32K: 24.036 vs 24.553 (-2.1%) — 32 wins
-    //   4K:  0.682 vs 0.647 (+5.4%),  8K: 1.913 vs 1.876 (+2.0%) — 64 wins
-    // Opt out by passing explicit --num-comm-sms override (already respected
-    // because entrypoint receives the parsed value; adaptive logic replaces
-    // only the *default* selection downstream).
+    // Split CTAs between intra-comm and compute. Intra-gather CTAs also post
+    // zero-copy inter-node RDMA WRs, so there is no separate inter-comm pool.
     int adaptive_comm_sms = num_comm_sms;
     if (std::getenv("AG1_ADAPTIVE_COMM_SMS") == nullptr ||
         std::atoi(std::getenv("AG1_ADAPTIVE_COMM_SMS")) != 0) {
-        // Gen-3 run_24: stack run_19 cap-split + run_23 adaptive WR split.
-        // 32K keeps cap=16 (run_18 config, already 1.32× with single WR, now
-        // boosted by adaptive split=4). 16K lifts cap to 32 — restores run_17's
-        // 48 intra warp-workers which combined with WR-split=2 should let the
-        // send pipeline saturate 8 QPs. The two wins touch disjoint paths
-        // (CTA count vs WR posting granularity), so we expect them to compound.
         if (M >= 32768) adaptive_comm_sms = std::min(num_comm_sms, 8);
         else if (M >= 16384) adaptive_comm_sms = std::min(num_comm_sms, 32);
         // Small-M: at M<=4K intra-gather has only local_row_blocks=2 rows per
         // rank with col_blocks=2 (K=256/128), so 4 total intra tasks. Under
         // MERGE+EARLY_SEND extra intra CTAs sit idle but steal from compute.
-        // Gen-2 run_16: aggressive cap 48 → 8 (4 intra CTAs, 128 compute).
         else if (M <= 4096) adaptive_comm_sms = std::min(num_comm_sms, 8);
-        // Agent run_06 (best): gentle 8K cap. 256 output tiles / 100 CTAs =
-        // 2.56 tiles/CTA at the unbounded default. Shrinking intra 32→28
-        // frees 4 CTAs to compute (+4% comp) and still leaves 84 intra slots
-        // > 64 col_blocks for stride coverage. Geomean: 0.988x vs 0.970x
-        // (unbounded) and 0.965x (cap=60) at k16 cx7 2x8.
-        //
-        // Gen-2 run_17: tighten 8K cap further. At 8K local_row_blocks=4,
-        // col_blocks=4 → 16 intra tasks; 28 intra CTAs have 12 idle. Try cap=32
-        // (16 intra CTAs, 116 compute) — still covers all 16 tasks 1:1.
+        // At M<=8K, keep enough intra CTAs to cover the small number of
+        // gather tasks while returning idle CTAs to compute.
         else if (M <= 8192) adaptive_comm_sms = std::min(num_comm_sms, 32);
     }
     const int num_intra_comm = (num_intra_comm_override > 0)
@@ -404,40 +365,23 @@ void entrypoint(
     TORCH_CHECK(num_comp_sms > 0, "num_comp_sms must be > 0, got ", num_comp_sms,
                 " (active_sms=", active_sms, " num_intra_comm=", num_intra_comm, ")");
 
-    auto A_local = ::dist::make_gl<globals::A_gl>(
+    auto A_local = ::dist::make_local_tensor<globals::A_local_tensor>(
         (uint64_t)A.data_.data_ptr(), 1, 1, M_half, K);
-    auto A_recv_gl = ::dist::make_gl<globals::A_gl>(
+    auto A_recv_local_tensor = ::dist::make_local_tensor<globals::A_local_tensor>(
         (uint64_t)recv_buf_ptr, 1, 1, M_half, K);
 
-    internode::D2HFifoDeviceBundle fifo_bundle{};
-    if (fifo_capacity < 0) {
-        auto* bundle_ptr =
-            reinterpret_cast<const internode::D2HFifoDeviceBundle*>(fifo_triggers);
-        TORCH_CHECK(bundle_ptr != nullptr, "FIFO bundle pointer is null");
-        fifo_bundle = *bundle_ptr;
-    } else {
-        internode::D2HFifoDevice fd{};
-        fd.triggers   = reinterpret_cast<internode::TransferCmd*>(fifo_triggers);
-        fd.head       = reinterpret_cast<uint64_t*>(fifo_head);
-        fd.tail       = reinterpret_cast<uint64_t*>(fifo_tail);
-        fd.tail_cache = reinterpret_cast<uint64_t*>(fifo_tail_cache);
-        fd.capacity   = fifo_capacity;
-        int nqps = 16;  // Gen-2 Family B: matches create_session_py default
-        if (const char* e = std::getenv("OSGC_EFA_NUM_QPS")) {
-            int v = std::atoi(e);
-            if (v > 0) nqps = v;
-        }
-        fifo_bundle = internode::make_fifo_bundle(fd, nqps, 1);
-    }
+    auto fifo_bundle = internode::resolve_fifo_bundle(
+        fifo_triggers, fifo_head, fifo_tail, fifo_tail_cache, fifo_capacity,
+        16);
 
     globals G{
-        .A = ::dist::dbuf_from_buffer<globals::A_pgl>(A),
-        .barrier = ::dist::dbuf_from_buffer<globals::barrier_pgl>(barrier),
+        .A = ::dist::distributed_tensor_from_buffer<globals::A_distributed_tensor>(A),
+        .barrier = ::dist::distributed_tensor_from_buffer<globals::barrier_distributed_tensor>(barrier),
         .A_local = A_local,
-        .A_recv_gl = A_recv_gl,
-        .A_recv = ::dist::dbuf_from_buffer<globals::A_pgl>(A_recv),
-        .B = ::dist::gl_from_tensor<globals::B_gl>(B),
-        .C = ::dist::gl_from_tensor<globals::C_gl>(C),
+        .A_recv_local_tensor = A_recv_local_tensor,
+        .A_recv = ::dist::distributed_tensor_from_buffer<globals::A_distributed_tensor>(A_recv),
+        .B = ::dist::local_tensor_from_tensor<globals::B_local_tensor>(B),
+        .C = ::dist::local_tensor_from_tensor<globals::C_local_tensor>(C),
         .d2h_fifos = fifo_bundle,
         .arrival_flags = reinterpret_cast<volatile uint32_t*>(arrival_flags_ptr),
         .epoch = (uint32_t)epoch,

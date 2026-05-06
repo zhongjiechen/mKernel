@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse, json, os, sys, time
 from pathlib import Path
 
-os.environ["OSGC_BIND_RETAINED_HANDLE"] = "1"
+os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
 
 import torch
 import torch.distributed as dist
@@ -109,16 +109,16 @@ def main():
         V_local = torch.randn(BATCH, HEADS, seq_per_dev, D, device="cuda",
                               dtype=torch.bfloat16) * scale
 
-        def pgl(shape):
+        def dbuf(shape):
             return mod.DistBuffer(
                 shape, dtype=torch.bfloat16,
                 local_rank=local_rank, local_world_size=local_world_size,
                 multicast=False)
 
-        K0 = pgl((BATCH, HEADS, seq_per_dev, D))
-        K1 = pgl((BATCH, HEADS, seq_per_dev, D))
-        V0 = pgl((BATCH, HEADS, seq_per_dev, D))
-        V1 = pgl((BATCH, HEADS, seq_per_dev, D))
+        K0 = dbuf((BATCH, HEADS, seq_per_dev, D))
+        K1 = dbuf((BATCH, HEADS, seq_per_dev, D))
+        V0 = dbuf((BATCH, HEADS, seq_per_dev, D))
+        V1 = dbuf((BATCH, HEADS, seq_per_dev, D))
 
         L = torch.zeros(BATCH, HEADS, seq_per_dev, device="cuda", dtype=torch.float32)
         L_block = torch.zeros_like(L)

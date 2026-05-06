@@ -575,11 +575,10 @@ __device__ inline void kv_copy_sm(const kv_exchange_globals &G) {
         // Wait for this chunk's arrival from every peer slot.
         if (threadIdx.x == 0) {
             for (int slot = 0; slot < n_peers; ++slot) {
-                uint32_t v;
                 const int flag_idx = slot * single_peer_chunks + chunk_id;
+                uint32_t v;
                 do {
-                    asm volatile("ld.volatile.global.u32 %0, [%1];"
-                                 : "=r"(v) : "l"((uint32_t*)&G.arrival_flags[flag_idx]) : "memory");
+                    v = comm::atomic_u32::volatile_load(&G.arrival_flags[flag_idx]);
                     if (v == G.epoch) break;
                     __nanosleep(100);
                 } while (true);
@@ -678,7 +677,7 @@ void zm_kv_copy_kernel(
 
 // Cross-GPU barrier only. One CTA, one thread does barrier_all.
 __global__ void zm_barrier_only_kernel(
-    const __grid_constant__ globals::barrier_pgl barrier,
+    const __grid_constant__ globals::barrier_distributed_tensor barrier,
     const int dev_idx
 ) {
     if (threadIdx.x == 0) {

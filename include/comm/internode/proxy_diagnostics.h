@@ -71,16 +71,6 @@ struct ProxyDiagnostics {
     int64_t  enqueue_to_seen_raw_sum_ns;
     int64_t  enqueue_to_seen_raw_max_ns;
     int64_t  enqueue_to_seen_raw_min_ns;
-#ifdef Q2_PROBE_PROXY_TAIL
-    // Iter 30 probe: inter-push interval (delta between successive
-    // cmd.enqueue_device_ns timestamps observed at the proxy poll site).
-    // Bucket boundaries in nanoseconds: <5us, 5-15us, 15-50us, 50-150us, >=150us.
-    // Only populated by proxy_efa.h when compiled with Q2_PROBE_PROXY_TAIL.
-    uint64_t ipi_bucket_ns[5];
-    uint64_t ipi_count;
-    uint64_t ipi_sum_ns;
-    uint64_t ipi_max_ns;
-#endif
     uint64_t loop_gap_max_ns;
     uint64_t loop_gap_over_100us;
     uint64_t loop_gap_over_1ms;
@@ -119,12 +109,6 @@ struct ProxyDiagnostics {
         enqueue_to_seen_raw_sum_ns = 0;
         enqueue_to_seen_raw_max_ns = std::numeric_limits<int64_t>::min();
         enqueue_to_seen_raw_min_ns = std::numeric_limits<int64_t>::max();
-#ifdef Q2_PROBE_PROXY_TAIL
-        for (int i = 0; i < 5; ++i) ipi_bucket_ns[i] = 0;
-        ipi_count = 0;
-        ipi_sum_ns = 0;
-        ipi_max_ns = 0;
-#endif
         loop_gap_max_ns = 0;
         loop_gap_over_100us = 0;
         loop_gap_over_1ms = 0;

@@ -125,7 +125,7 @@ def maybe_print_rank_values(label: str, value: float) -> None:
 
 
 def avg_then_max(samples: list[float], label: str = "") -> float:
-    """Experiment-compatible timing: local average, then max over all ranks."""
+    """Benchmark timing: local average, then max over all ranks."""
     local = sum(samples) / len(samples) if samples else float("nan")
     if label:
         maybe_print_rank_values(label, local)
@@ -133,7 +133,7 @@ def avg_then_max(samples: list[float], label: str = "") -> float:
 
 
 def median_then_max(samples: list[float], label: str = "") -> float:
-    """Experiment-compatible timing: local median, then max over all ranks."""
+    """Benchmark timing: local median, then max over all ranks."""
     if not samples:
         return max_across_ranks(float("nan"))
     sorted_samples = sorted(samples)
@@ -288,10 +288,10 @@ def write_results_json(
             existing_sizes, existing_ms = [], []
 
     # Build a merged map: existing shapes first, new ones overwrite.
-    # If OSGC_BENCH_BEST_OF_N=1, between-sweep best-of: take min when same
+    # If MKERNEL_BENCH_BEST_OF_N=1, between-sweep best-of: take min when same
     # shape is rewritten. Used by run.sh's BEST_OF_N=k loop to absorb
     # cluster-noise variance. Reset by deleting the JSON before the loop.
-    best_of = os.environ.get("OSGC_BENCH_BEST_OF_N", "0") == "1"
+    best_of = os.environ.get("MKERNEL_BENCH_BEST_OF_N", "0") == "1"
     merged: dict = {}
     for s, ms in zip(existing_sizes, existing_ms):
         merged[s] = ms

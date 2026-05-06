@@ -72,7 +72,7 @@ inline std::string normalize_pci_bdf(const char* bdf) {
 
 inline std::vector<std::string> parse_efa_domain_map_env() {
     std::vector<std::string> names;
-    const char* env = std::getenv("OSGC_EFA_DOMAIN_MAP");
+    const char* env = std::getenv("MKERNEL_EFA_DOMAIN_MAP");
     if (!env || !env[0]) return names;
 
     std::stringstream ss(env);
@@ -394,7 +394,7 @@ inline ibv_qp* create_srd_qp(ibv_pd* pd, ibv_cq* send_cq, ibv_context* ctx,
                              int sq_depth = 512, int* actual_sq_depth_out = nullptr) {
     ibv_qp_init_attr_ex qp_attr_ex{};
     efadv_qp_init_attr efa_attr{};
-    const int env_sq_depth = parse_positive_env_int("OSGC_EFA_SQ_DEPTH", sq_depth);
+    const int env_sq_depth = parse_positive_env_int("MKERNEL_EFA_SQ_DEPTH", sq_depth);
     const int provider_max_sq_wr = query_efa_max_sq_wr(ctx);
     int requested_sq_depth = env_sq_depth;
     if (provider_max_sq_wr > 0) {

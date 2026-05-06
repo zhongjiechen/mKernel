@@ -6,7 +6,7 @@
 // ============================================================================
 // Session management
 // ============================================================================
-#include "comm/internode/session_select.h"
+#include "comm/internode/session_py.cuh"
 
 static internode::Session* g_session = nullptr;
 static std::vector<std::string> g_peer_ips_storage;
@@ -22,31 +22,19 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int64_t pre_tokens_buf_size,
                        std::vector<std::string> peer_ips = {},
                        std::vector<int> peer_tcp_ports = {}) {
-    if (g_session) { internode::destroy_session(g_session); g_session = nullptr; }
-    internode::SessionConfig cfg{};
-    cfg.rank = rank;
-    cfg.peer_ip = peer_ip.c_str();
-    cfg.tcp_port = tcp_port;
-    if (!peer_ips.empty()) {
-        g_peer_ips_storage   = std::move(peer_ips);
-        g_peer_ports_storage = std::move(peer_tcp_ports);
-        if (g_peer_ports_storage.empty()) {
-            g_peer_ports_storage.assign(g_peer_ips_storage.size(), tcp_port);
-        }
-        g_peer_ips_cstr.resize(g_peer_ips_storage.size());
-        for (size_t i = 0; i < g_peer_ips_storage.size(); ++i) {
-            g_peer_ips_cstr[i] = g_peer_ips_storage[i].c_str();
-        }
-        cfg.num_peers      = (int)g_peer_ips_storage.size();
-        cfg.peer_ips       = g_peer_ips_cstr.data();
-        cfg.peer_tcp_ports = g_peer_ports_storage.data();
-    }
-// Zero-copy send: register pre_tokens (DistBuffer, VMM) as the
+    internode::py::destroy_session(g_session);
+    internode::SessionConfig cfg = internode::py::make_base_config(
+        rank, peer_ip.c_str(), tcp_port,
+        send_buf_ptr, send_buf_size, recv_buf_size,
+        num_tiles, fifo_capacity, device_id);
+    internode::py::apply_peer_ips(
+        cfg, peer_ips, peer_tcp_ports, tcp_port,
+        g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
+    // Zero-copy send: register pre_tokens (DistBuffer, VMM) as the
     // session's only data MR via register_gpu_buffer(), which transparently
     // uses cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr on VMM ranges.
-    // The kernel emits cmd.src_view=0 — proxy hot path is byte-identical to
-    // a regular send, only the source address changes. send_buf_ptr/size are
-    // kept in the signature for backwards compatibility but unused.
+    // The kernel emits cmd.src_view=0; only the source address changes.
+    // send_buf_ptr/size are kept in the signature for compatibility but unused.
     if (pre_tokens_buf_ptr == 0 || pre_tokens_buf_size == 0) {
         fprintf(stderr, "create_session_py: dispatch_gemm zero-copy requires pre_tokens_buf ptr+size\n");
         std::exit(EXIT_FAILURE);
@@ -62,43 +50,33 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     if (external_recv_buf_ptr != 0) {
         cfg.external_recv_buf = reinterpret_cast<void*>(external_recv_buf_ptr);
     }
-    cfg.num_tiles = num_tiles;
-    cfg.fifo_capacity = fifo_capacity;
-    cfg.device_id = device_id;
     // Tier 1.2 (DeepEP-style sliding window): cap inflight WRs to keep queue
     // pressure low. Sweep on EFA: 32 ≈ 64 < 256 < 1024 at 131k tokens.
     // Benefit is small (~1-2%) on top of CHUNK_BYTES=512 KB but consistent.
     cfg.max_inflight = 32;
-    if (const char* env_mi = std::getenv("OSGC_MAX_INFLIGHT")) {
+    if (const char* env_mi = std::getenv("MKERNEL_MAX_INFLIGHT")) {
         cfg.max_inflight = std::atoi(env_mi);
     }
     // Round 24 (dispatch_gemm cross-kernel port from gemm_ar round 13 / ag_gemm round 23):
     // multi-QP lets the proxy post WRs in parallel.
     cfg.num_qps = 4;
-    if (const char* env_num_qps = std::getenv("OSGC_EFA_NUM_QPS")) {
+    if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
         cfg.num_qps = std::atoi(env_num_qps);
     }
     // Allow override of CPU proxy thread count (default = max(1,num_rails)=2).
     // More threads parallelize ibv_post_send across QP slices.
-    if (const char* env_np = std::getenv("OSGC_NUM_PROXY_THREADS")) {
+    if (const char* env_np = std::getenv("MKERNEL_NUM_PROXY_THREADS")) {
         cfg.num_proxy_threads = std::atoi(env_np);
     }
     g_session = internode::create_session(cfg);
 }
-void destroy_session_py() { if (g_session) { internode::destroy_session(g_session); g_session = nullptr; } }
-void set_epoch_py(int epoch) { if (g_session) internode::set_epoch(g_session, (uint32_t)epoch); }
+void destroy_session_py() { internode::py::destroy_session(g_session); }
+void set_epoch_py(int epoch) { internode::py::set_epoch(g_session, epoch); }
 std::tuple<int64_t, int64_t, int64_t, int64_t, int> get_fifo_handles_py() {
-    auto h = internode::get_fifo_device_handle(g_session);
-    if (h.num_fifos > 1) {
-        return {(int64_t)(&g_session->fifo_bundle), 0, 0, 0, -h.num_fifos};
-    }
-    auto fd = h.fifos[0];
-    return std::make_tuple(
-        (int64_t)fd.triggers, (int64_t)fd.head, (int64_t)fd.tail,
-        (int64_t)fd.tail_cache, fd.capacity);
+    return internode::py::get_fifo_handles(g_session);
 }
-int64_t get_arrival_flags_ptr_py() { return (int64_t)internode::get_arrival_device_ptr(g_session); }
-int64_t get_recv_buf_ptr_py() { return (int64_t)internode::get_recv_buf_ptr(g_session); }
+int64_t get_arrival_flags_ptr_py() { return internode::py::get_arrival_flags_ptr(g_session); }
+int64_t get_recv_buf_ptr_py() { return internode::py::get_recv_buf_ptr(g_session); }
 
 #include <torch/csrc/utils/pybind.h>
 

@@ -67,7 +67,7 @@ struct ProxyConfig {
     // batch is still single-QP (the existing batching invariant) — multiple
     // fifos just give multiple QP slices the proxy thread cycles through.
     // session_efa.h sets num_fifos = qps_per_proxy (one fifo per QP) when the
-    // OSGC_FIFO_PER_QP env is set; otherwise num_fifos = 1 and `fifo` is used.
+    // MKERNEL_FIFO_PER_QP env is set; otherwise num_fifos = 1 and `fifo` is used.
     D2HFifoHost** fifos     = nullptr;
     int           num_fifos = 1;
 
@@ -117,9 +117,18 @@ struct ProxyConfig {
     uint64_t      remote_flags_addr;
     uint32_t      remote_flags_rkey;
 
-    // Queue-layout fields for Q2_ARRIVAL_QUEUE. remote_queue_stride is the
-    // number of 4-byte slots per logical queue on the peer; each logical queue
-    // is laid out contiguously so slot k of queue q lives at
+    // Arrival-queue layout selector. When true, the proxy uses the queue
+    // layout (each WR claims a unique slot in a per-logical-queue ring; the
+    // payload encodes pack_arrival_work(first_tile, num_tiles)). When false,
+    // the proxy uses the flat layout (one flag-slot per tile_id, payload =
+    // epoch). Wired from SessionConfig.use_arrival_queue. Today only gemm_ar
+    // sets this to true.
+    bool          use_arrival_queue    = false;
+
+    // Queue-layout fields (only consulted when use_arrival_queue == true).
+    // remote_queue_stride is the number of 4-byte slots per logical queue on
+    // the peer; each logical queue is laid out contiguously so slot k of
+    // queue q lives at
     //   remote_flags_addr + (q * remote_queue_stride + k) * 4
     // remote_tail_addr / remote_tail_rkey point to per-queue tail counters
     // (one uint32 per logical queue) if enable_remote_tail is set.
@@ -141,20 +150,8 @@ struct ProxyConfig {
     int           device_id = 0;
     bool          pin_proxy = true;
 
-    // R1 Commit 1: gate for the adaptive BATCH_SIZE / ACCUMULATE_SPINS
-    // controller inside Proxy::run(). Default false → byte-identical to the
-    // pre-R1 static post/poll loop. session_efa.h wires Q2_PROXY_PIPELINE
-    // into this field.
+    // Enables the adaptive post/poll controller inside Proxy::run().
     bool          pipeline_enabled = false;
-
-#ifdef Q2_PROBE_PROXY_TAIL
-    // Iter 30 probe: host_monotonic_ns - gpu_globaltimer_ns calibration used
-    // to convert kernel-stamped `cmd.enqueue_device_ns` into host-monotonic
-    // domain for enqueue_to_seen delta computation. Only populated when the
-    // probe flag is on; the canonical build does not pass -DQ2_PROBE_PROXY_TAIL
-    // and this field is absent.
-    int64_t       gpu_to_host_offset_ns = 0;
-#endif
 
     // Multi-peer routing. When num_peers > 1, the hot path resolves
     // peer_slot = peer_slot_by_rank[cmd.dst_rank] and indexes into per_peer
@@ -291,20 +288,6 @@ public:
         diag_batch_completion_max_ns_ = 0;
         signaled_post_ns_.clear();
         completion_ns_.clear();
-#ifdef Q2_PROBE_PROXY_TAIL
-        // Iter 30 probe: reset per-epoch producer-rate counters.
-        diag_enqueue_to_seen_count_ = 0;
-        diag_enqueue_to_seen_sum_ns_ = 0;
-        diag_enqueue_to_seen_max_ns_ =
-            std::numeric_limits<int64_t>::min();
-        diag_enqueue_to_seen_min_ns_ =
-            std::numeric_limits<int64_t>::max();
-        prev_enqueue_device_ns_ = 0;
-        for (int i = 0; i < 5; ++i) ipi_bucket_counts_[i] = 0;
-        ipi_count_ = 0;
-        ipi_sum_ns_ = 0;
-        ipi_max_ns_ = 0;
-#endif
     }
 
     /**
@@ -406,19 +389,6 @@ public:
         d.batch_completion_count = diag_batch_completion_count_;
         d.batch_completion_sum_ns = diag_batch_completion_sum_ns_;
         d.batch_completion_max_ns = diag_batch_completion_max_ns_;
-#ifdef Q2_PROBE_PROXY_TAIL
-        // Iter 30 probe: expose producer-rate counters through the standard
-        // ProxyDiagnostics struct. Fields outside this ifdef are already
-        // populated above; fields below only exist when the probe flag is on.
-        d.enqueue_to_seen_count = diag_enqueue_to_seen_count_;
-        d.enqueue_to_seen_raw_sum_ns = diag_enqueue_to_seen_sum_ns_;
-        d.enqueue_to_seen_raw_max_ns = diag_enqueue_to_seen_max_ns_;
-        d.enqueue_to_seen_raw_min_ns = diag_enqueue_to_seen_min_ns_;
-        for (int i = 0; i < 5; ++i) d.ipi_bucket_ns[i] = ipi_bucket_counts_[i];
-        d.ipi_count = ipi_count_;
-        d.ipi_sum_ns = ipi_sum_ns_;
-        d.ipi_max_ns = ipi_max_ns_;
-#endif
         return d;
     }
 
@@ -520,93 +490,14 @@ private:
     std::vector<uint64_t> signaled_post_ns_;
     std::vector<uint64_t> completion_ns_;
 
-#ifdef Q2_PROBE_PROXY_TAIL
-    // Iter 30 probe: producer-rate diagnostics.
-    //   enqueue_to_seen_* = delta between the GPU-side
-    //     `cmd.enqueue_device_ns` (stamped at the kernel's FIFO push) and the
-    //     host-monotonic timestamp at the proxy poll site. Measures how long
-    //     a command sits between "GPU wrote the slot" and "proxy picked it up".
-    //   ipi_bucket_counts_ = histogram of the inter-push interval seen by the
-    //     proxy, i.e. the gap between successive cmd.enqueue_device_ns
-    //     timestamps as they arrive. Buckets: <5us, 5-15us, 15-50us, 50-150us,
-    //     >=150us. Populated only when Q2_PROBE_PROXY_TAIL is defined.
-    uint64_t diag_enqueue_to_seen_count_ = 0;
-    int64_t  diag_enqueue_to_seen_sum_ns_ = 0;
-    int64_t  diag_enqueue_to_seen_max_ns_ =
-        std::numeric_limits<int64_t>::min();
-    int64_t  diag_enqueue_to_seen_min_ns_ =
-        std::numeric_limits<int64_t>::max();
-    uint64_t prev_enqueue_device_ns_ = 0;
-    uint64_t ipi_bucket_counts_[5] = {0, 0, 0, 0, 0};
-    uint64_t ipi_count_ = 0;
-    uint64_t ipi_sum_ns_ = 0;
-    uint64_t ipi_max_ns_ = 0;
-#endif
-
     static uint64_t now_ns() {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
     }
 
-#ifdef Q2_PROBE_PROXY_TAIL
-    /**
-     * Iter 30 probe: account a single polled TransferCmd against the
-     * producer-rate counters. Computes:
-     *   enqueue_to_seen_delta = (host_seen_ns - cmd.enqueue_device_ns
-     *                             - cfg_.gpu_to_host_offset_ns)
-     *     clamped at 0. Accumulates count/sum/max/min into the proxy-local
-     *     diag_enqueue_to_seen_* scalars (copied into ProxyDiagnostics at
-     *     destruct time).
-     *   inter_push_interval = cmd.enqueue_device_ns - prev_enqueue_device_ns_
-     *     when both are non-zero and monotonically increasing. Bucketed into
-     *     the 5-wide ipi_bucket_counts_ histogram (<5µs, 5-15µs, 15-50µs,
-     *     50-150µs, >=150µs). Also feeds count/sum/max for a full summary.
-     *
-     * Does NOT touch any FIFO ordering state — it only reads cmd fields and
-     * writes to proxy-private scalars. Safe to call from both FIFO poll
-     * sites (primary collect + accumulate-spin) and any future poll site.
-     */
-    void account_polled_cmd_for_probe_(const TransferCmd& cmd) {
-        if (cmd.enqueue_device_ns == 0) return;
-        const uint64_t host_seen_ns = now_ns();
-        int64_t delta_ns = (int64_t)host_seen_ns -
-                           (int64_t)cmd.enqueue_device_ns -
-                           cfg_.gpu_to_host_offset_ns;
-        if (delta_ns < 0) delta_ns = 0;
-        diag_enqueue_to_seen_count_++;
-        diag_enqueue_to_seen_sum_ns_ += delta_ns;
-        if (delta_ns > diag_enqueue_to_seen_max_ns_) {
-            diag_enqueue_to_seen_max_ns_ = delta_ns;
-        }
-        if (delta_ns < diag_enqueue_to_seen_min_ns_) {
-            diag_enqueue_to_seen_min_ns_ = delta_ns;
-        }
-
-        // Inter-push interval histogram — skip the first cmd of each epoch
-        // (prev == 0), and any out-of-order case where GPU timestamps came
-        // back non-monotonic (unlikely but defensive).
-        if (prev_enqueue_device_ns_ != 0 &&
-            cmd.enqueue_device_ns > prev_enqueue_device_ns_) {
-            const uint64_t ipi_ns =
-                cmd.enqueue_device_ns - prev_enqueue_device_ns_;
-            ipi_count_++;
-            ipi_sum_ns_ += ipi_ns;
-            if (ipi_ns > ipi_max_ns_) ipi_max_ns_ = ipi_ns;
-            int bucket;
-            if (ipi_ns < 5000ULL)        bucket = 0;   // <5 µs
-            else if (ipi_ns < 15000ULL)  bucket = 1;   // 5-15 µs
-            else if (ipi_ns < 50000ULL)  bucket = 2;   // 15-50 µs
-            else if (ipi_ns < 150000ULL) bucket = 3;   // 50-150 µs
-            else                         bucket = 4;   // >=150 µs
-            ipi_bucket_counts_[bucket]++;
-        }
-        prev_enqueue_device_ns_ = cmd.enqueue_device_ns;
-    }
-#endif
-
     static NotifyMode detect_notify_mode() {
-        const char* env = std::getenv("OSGC_EFA_VERBS_NOTIFY_MODE");
+        const char* env = std::getenv("MKERNEL_EFA_VERBS_NOTIFY_MODE");
         if (!env || !env[0]) return NotifyMode::WriteImm;
         if (std::strcmp(env, "remote_flag") == 0) return NotifyMode::RemoteFlag;
         return NotifyMode::WriteImm;
@@ -691,20 +582,19 @@ private:
     void post_remote_flag_batch(ibv_qp_ex* qpx, uint32_t dst_qpn,
                                 const PerPeerProxyData& eff,
                                 const TransferCmd* batch, int count) {
-#ifndef Q2_ARRIVAL_QUEUE
-        // Flat layout: every command's flag slot is (tile_id * 4) from the base
-        // of the peer's mapped arrival flags. One shared epoch value suffices.
-        *cfg_.flag_staging->host_ptr = cfg_.epoch;
-#else
-        // Q2_ARRIVAL_QUEUE layout: each command gets its own staged 4-byte
-        // payload packed via pack_arrival_work(first_tile, run_tiles), with a
-        // unique slot claimed via staging_cursor_ so SGE pointers stay live
-        // until the NIC has DMA'd them. The optional tail-publish WR claims
-        // its own staging slot the same way.
+        // Pre-batch setup. The two arrival-flag layouts diverge here:
+        //   - Flat: stamp the shared epoch payload into host_ptr[0]; every
+        //     flag WR sources its 4 bytes from there.
+        //   - Queue: derive total_logical_queues for the runtime modulo
+        //     used inside the per-cmd loop.
         constexpr uint32_t kTileBytes = 128u * 256u * 2u;
-        const uint32_t total_logical_queues =
-            (uint32_t)(cfg_.global_num_qps * cfg_.logical_queues_per_qp);
-#endif
+        uint32_t total_logical_queues = 0;
+        if (cfg_.use_arrival_queue) {
+            total_logical_queues =
+                (uint32_t)(cfg_.global_num_qps * cfg_.logical_queues_per_qp);
+        } else {
+            *cfg_.flag_staging->host_ptr = cfg_.epoch;
+        }
         for (int i = 0; i < count; i++) {
             const TransferCmd& cmd = batch[i];
             const bool is_last = (i == count - 1);
@@ -732,79 +622,80 @@ private:
                     cmd.bytes);
             }
 
-#ifndef Q2_ARRIVAL_QUEUE
-            // Flag WR: write the shared epoch into remote_flags[tile_id].
-            // The payload (cfg_.epoch) is constant across the whole epoch and
-            // was written into host_ptr[0] once at the top of this function,
-            // so all in-flight WRs may safely share the same SGE source slot.
-            qpx->wr_id = 1;
-            qpx->comp_mask = 0;
-            qpx->wr_flags = IBV_SEND_SIGNALED;
-            ibv_wr_rdma_write(qpx,
-                eff.remote_flags_rkey,
-                eff.remote_flags_addr + cmd.tile_id * sizeof(uint32_t));
-            ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
-            ibv_wr_set_sge(qpx,
-                cfg_.flag_staging->mr->lkey,
-                (uint64_t)cfg_.flag_staging->host_ptr,
-                sizeof(uint32_t));
-            (void)is_last; // silence unused in this branch
-#else
-            // Queue layout: derive logical queue from lane, grab next slot,
-            // stage the packed (tile_id, run_tiles) payload, and write it to
-            // remote_flags_addr + (q*stride + slot)*4. Each WR that carries a
-            // distinct payload claims its own slot in the staging ring via
-            // staging_cursor_, so the proxy never overwrites a slot whose WR
-            // is still pending NIC DMA — see the staging_cursor_ comment in
-            // the private members. Optionally chain a tail publish so the
-            // kernel drainer can learn how many arrivals are in its queue
-            // without scanning stale words.
-            const uint32_t run_tiles = (cmd.bytes + kTileBytes - 1u) / kTileBytes;
-            const uint32_t flag_slot =
-                (staging_cursor_++) % (uint32_t)cfg_.flag_staging->count;
-            cfg_.flag_staging->host_ptr[flag_slot] =
-                pack_arrival_work((uint32_t)cmd.tile_id, run_tiles);
-            const uint32_t logical_q = (total_logical_queues > 0)
-                ? (cmd.lane_id % total_logical_queues) : 0u;
-            const uint32_t q_slot = sender_seq_[logical_q]++;
-            const uint64_t flag_remote_addr = eff.remote_flags_addr +
-                (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) *
-                sizeof(uint32_t);
-
-            // If a tail chain follows, the flag WR is still signaled (SRD
-            // requirement) but carries wr_id=0 so accounting happens on the
-            // tail completion instead. Otherwise, the flag WR is the last WR
-            // for this command and carries wr_id=1.
-            const bool has_tail = cfg_.enable_remote_tail &&
-                                  eff.remote_tail_addr != 0;
-            qpx->wr_id = has_tail ? 0 : 1;
-            qpx->comp_mask = 0;
-            qpx->wr_flags = IBV_SEND_SIGNALED;
-            ibv_wr_rdma_write(qpx, eff.remote_flags_rkey, flag_remote_addr);
-            ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
-            ibv_wr_set_sge(qpx,
-                cfg_.flag_staging->mr->lkey,
-                (uint64_t)(cfg_.flag_staging->host_ptr + flag_slot),
-                sizeof(uint32_t));
-
-            if (has_tail) {
-                const uint32_t tail_slot =
-                    (staging_cursor_++) % (uint32_t)cfg_.flag_staging->count;
-                cfg_.flag_staging->host_ptr[tail_slot] = q_slot + 1u;
+            if (!cfg_.use_arrival_queue) {
+                // Flat layout: write the shared epoch into remote_flags[tile_id].
+                // Payload (cfg_.epoch) is constant across the batch and was
+                // written into host_ptr[0] at the top of this function, so all
+                // in-flight WRs may safely share the same SGE source slot.
                 qpx->wr_id = 1;
                 qpx->comp_mask = 0;
                 qpx->wr_flags = IBV_SEND_SIGNALED;
                 ibv_wr_rdma_write(qpx,
-                    eff.remote_tail_rkey,
-                    eff.remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t));
+                    eff.remote_flags_rkey,
+                    eff.remote_flags_addr + cmd.tile_id * sizeof(uint32_t));
                 ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
                 ibv_wr_set_sge(qpx,
                     cfg_.flag_staging->mr->lkey,
-                    (uint64_t)(cfg_.flag_staging->host_ptr + tail_slot),
+                    (uint64_t)cfg_.flag_staging->host_ptr,
                     sizeof(uint32_t));
+                (void)is_last;  // silence unused in this branch
+            } else {
+                // Queue layout: derive logical queue from lane, grab next slot,
+                // stage the packed (tile_id, run_tiles) payload, and write it
+                // to remote_flags_addr + (q*stride + slot)*4. Each WR that
+                // carries a distinct payload claims its own slot in the
+                // staging ring via staging_cursor_, so the proxy never
+                // overwrites a slot whose WR is still pending NIC DMA — see
+                // the staging_cursor_ comment in the private members.
+                // Optionally chain a tail publish so the kernel drainer can
+                // learn how many arrivals are in its queue without scanning
+                // stale words.
+                const uint32_t run_tiles = (cmd.bytes + kTileBytes - 1u) / kTileBytes;
+                const uint32_t flag_slot =
+                    (staging_cursor_++) % (uint32_t)cfg_.flag_staging->count;
+                cfg_.flag_staging->host_ptr[flag_slot] =
+                    pack_arrival_work((uint32_t)cmd.tile_id, run_tiles);
+                const uint32_t logical_q = (total_logical_queues > 0)
+                    ? (cmd.lane_id % total_logical_queues) : 0u;
+                const uint32_t q_slot = sender_seq_[logical_q]++;
+                const uint64_t flag_remote_addr = eff.remote_flags_addr +
+                    (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) *
+                    sizeof(uint32_t);
+
+                // If a tail chain follows, the flag WR is still signaled (SRD
+                // requirement) but carries wr_id=0 so accounting happens on
+                // the tail completion instead. Otherwise, the flag WR is the
+                // last WR for this command and carries wr_id=1.
+                const bool has_tail = cfg_.enable_remote_tail &&
+                                      eff.remote_tail_addr != 0;
+                qpx->wr_id = has_tail ? 0 : 1;
+                qpx->comp_mask = 0;
+                qpx->wr_flags = IBV_SEND_SIGNALED;
+                ibv_wr_rdma_write(qpx, eff.remote_flags_rkey, flag_remote_addr);
+                ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
+                ibv_wr_set_sge(qpx,
+                    cfg_.flag_staging->mr->lkey,
+                    (uint64_t)(cfg_.flag_staging->host_ptr + flag_slot),
+                    sizeof(uint32_t));
+
+                if (has_tail) {
+                    const uint32_t tail_slot =
+                        (staging_cursor_++) % (uint32_t)cfg_.flag_staging->count;
+                    cfg_.flag_staging->host_ptr[tail_slot] = q_slot + 1u;
+                    qpx->wr_id = 1;
+                    qpx->comp_mask = 0;
+                    qpx->wr_flags = IBV_SEND_SIGNALED;
+                    ibv_wr_rdma_write(qpx,
+                        eff.remote_tail_rkey,
+                        eff.remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t));
+                    ibv_wr_set_ud_addr(qpx, eff.dst_ah, dst_qpn, rdma::QKEY);
+                    ibv_wr_set_sge(qpx,
+                        cfg_.flag_staging->mr->lkey,
+                        (uint64_t)(cfg_.flag_staging->host_ptr + tail_slot),
+                        sizeof(uint32_t));
+                }
+                (void)is_last;  // kept for parity with the flat branch
             }
-            (void)is_last; // kept for parity with the flat branch
-#endif
         }
     }
 
@@ -813,7 +704,7 @@ private:
      * local QP (round-robin), collects up to BATCH_SIZE commands, posts them
      * as a single ibv_wr_complete on that QP, then polls the shared CQ.
      *
-     * The notification mode is selected by OSGC_EFA_VERBS_NOTIFY_MODE:
+     * The notification mode is selected by MKERNEL_EFA_VERBS_NOTIFY_MODE:
      *   - write_imm   : data writes carry tile ids via immediate data
      *   - remote_flag : chain data write + remote flag write
      */
@@ -916,12 +807,6 @@ private:
                        pre_inflight + count < effective_max_inflight_) {
                     TransferCmd cmd{};
                     if (!fifo()->poll(&cmd)) break;
-#ifdef Q2_PROBE_PROXY_TAIL
-                    // Iter 30 probe: record enqueue→seen and inter-push
-                    // interval. Instrumentation-only; does not affect the
-                    // batch-collection flow below.
-                    account_polled_cmd_for_probe_(cmd);
-#endif
                     if (cmd.cmd_type == CmdType::BARRIER_NOTIFY) {
                         // Cross-node barrier on SRD requires draining prior
                         // sibling-QP WRITEs before BARRIER leaves the wire.
@@ -984,11 +869,6 @@ private:
                             continue;
                         }
                         misses = 0;
-#ifdef Q2_PROBE_PROXY_TAIL
-                        // Iter 30 probe: same producer-rate accounting as the
-                        // primary collect site above. Instrumentation-only.
-                        account_polled_cmd_for_probe_(cmd);
-#endif
                         if (cmd.cmd_type == CmdType::BARRIER_NOTIFY) {
                             // Mid-batch BARRIER: stash and break so the in-
                             // progress batch flushes via the existing post

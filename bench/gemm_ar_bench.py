@@ -8,13 +8,13 @@ from __future__ import annotations
 import argparse, json, os, sys, time
 from pathlib import Path
 
-os.environ["OSGC_BIND_RETAINED_HANDLE"] = "1"
+os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
 os.environ.setdefault("GEMM_AR_ARRIVAL_QUEUE", "1")
 os.environ.setdefault("GEMM_AR_DISABLE_SEND_COALESCE", "1")
 os.environ.setdefault("GEMM_AR_INTER_SEND_SMS", "4")
 os.environ.setdefault("GEMM_AR_NUM_INTRA_COMM_SMS", "12")
 os.environ.setdefault("GEMM_AR_STEADY_STATE_BENCH", "1")
-os.environ.setdefault("OSGC_COMMIT_EPOCH_SKIP_ARRIVAL_RESET", "1")
+os.environ.setdefault("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET", "1")
 
 import torch
 import torch.distributed as dist
@@ -228,9 +228,9 @@ def main():
         A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
         B = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
 
-        C_pgl = mod.DistBuffer((M, N), dtype=torch.bfloat16,
+        C_dbuf = mod.DistBuffer((M, N), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
-        C_pgl.data_.zero_()
+        C_dbuf.data_.zero_()
 
         barrier = mod.DistBuffer((2, 1024, 1024), dtype=torch.int,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
@@ -250,8 +250,8 @@ def main():
         dist.barrier()
         fifo_cap = 2048
         while fifo_cap < recv_buf_tiles * 2: fifo_cap *= 2
-        clocal_ptr = int(C_pgl.data_.data_ptr())
-        clocal_bytes = int(C_pgl.data_.numel() * C_pgl.data_.element_size())
+        clocal_ptr = int(C_dbuf.data_.data_ptr())
+        clocal_bytes = int(C_dbuf.data_.numel() * C_dbuf.data_.element_size())
         row_stride_bytes = N * 2
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
@@ -310,7 +310,7 @@ def main():
 
         # Warmup. Under steady_state, only first iter does barrier/arrival reset.
         for wi in range(args.warmup):
-            C_pgl.data_.zero_(); C_final.data_.zero_(); ar_done.zero_()
+            C_dbuf.data_.zero_(); C_final.data_.zero_(); ar_done.zero_()
             if not steady_state or wi == 0:
                 barrier.data_.zero_()
                 mod.reset_arrival_flags()
@@ -318,7 +318,7 @@ def main():
             mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.05)
             mod.gemm_ar_multinode(
-                A, B, C_pgl, barrier, C_final,
+                A, B, C_dbuf, barrier, C_final,
                 staging_buf.data_ptr(), recv_ptr,
                 fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
                 arrival_ptr, epoch, node_idx,
@@ -339,7 +339,7 @@ def main():
 
         samples_pairs = []
         for _ in range(args.iters):
-            C_pgl.data_.zero_(); C_final.data_.zero_(); ar_done.zero_()
+            C_dbuf.data_.zero_(); C_final.data_.zero_(); ar_done.zero_()
             if not steady_state:
                 barrier.data_.zero_()
                 mod.reset_arrival_flags()
@@ -351,7 +351,7 @@ def main():
             e = torch.cuda.Event(enable_timing=True)
             s.record()
             mod.gemm_ar_multinode(
-                A, B, C_pgl, barrier, C_final,
+                A, B, C_dbuf, barrier, C_final,
                 staging_buf.data_ptr(), recv_ptr,
                 fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
                 arrival_ptr, epoch, node_idx,

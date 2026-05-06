@@ -1,14 +1,14 @@
 /**
  * @file
- * @brief dist::dbuf — unified intra-node + inter-node distributed buffer descriptor.
+ * @brief dist::distributed_tensor — intra-node + inter-node distributed tensor descriptor.
  *
- * Standalone replacement for `kittens::pgl<>`. Owns:
- *   - per-device `dist::gl` array (intra-node fan-out)
+ * Distributed multi-GPU tensor descriptor. Owns:
+ *   - per-device `dist::local_tensor` array (intra-node fan-out)
  *   - optional multicast pointer + multicast TMA descriptor cache
  *   - per-channel inter-node state (channels[], arrived[], single-producer
  *     single-consumer send ring)
  *
- * No `kittens::pgl` inheritance or duck tag. TK TMA helpers accept it
+ * No external inheritance or duck tag. TMA helpers accept it
  * structurally through `get_tma`, shape/stride accessors, and multicast
  * address access.
  *
@@ -33,7 +33,9 @@
 
 #pragma once
 
-#include "gl.cuh"
+#include "local_tensor.cuh"
+#include "../comm/atomic_u32.cuh"
+#include "../comm/multimem.cuh"
 
 #include <cstdint>
 #include <utility>
@@ -76,8 +78,8 @@ struct SendJob {
 /// Per-channel state. One channel = one QP = one comm CTA.
 template<int NUM_NODES>
 struct Channel {
-    /* ----- RDMA peer info (used by IBGDA/EFAGDA backends; proxy backend
-     *       relies on the embedded fifo instead) ----- */
+    /* ----- RDMA peer info (reserved for direct GPU networking paths; the
+     *       current proxy backend relies on the embedded FIFO instead) ----- */
     uint64_t remote_addr[NUM_NODES];
     uint32_t rkey       [NUM_NODES];
     uint32_t qp_handle;
@@ -92,7 +94,7 @@ struct Channel {
      *   `internode::q2_select_fifo_for_lane(*bundle, lane_id)` internally.
      *
      *   We store the bundle as `void*` to avoid pulling internode headers
-     *   into dbuf.cuh; backend_proxy.cuh casts it back to the real type.
+     *   into this header; backend_proxy.cuh casts it back to the real type.
      */
     void*     fifo_bundle;
 
@@ -196,27 +198,28 @@ struct tma_dict<ST, Rest...> {
 } // namespace detail_mc
 
 
-/* ----------   dbuf  ---------- */
+/* ----------   distributed_tensor  ---------- */
 
 /**
- * @brief Distributed buffer descriptor.
+ * @brief Distributed tensor descriptor.
  *
- * @tparam GL              `dist::gl<>` — per-device global layout type.
+ * @tparam LocalTensor     `dist::local_tensor<>` — per-device tensor descriptor.
  * @tparam LOCAL_SIZE      number of GPUs in this node.
  * @tparam MULTICAST       bind a CUDA multicast VA + TMA descriptors.
  * @tparam NUM_CHANNELS    inter-node channels (= QPs = comm CTAs); 0 = intra-only.
  * @tparam NUM_NODES       peer node count for inter-node sends; 1 = no inter-node.
  * @tparam TMA_Types       `kittens::st<>` tile metadata for multicast TMA descs.
  */
-template<typename GL,
+template<typename LocalTensor,
          int  LOCAL_SIZE   = 8,
          bool MULTICAST    = true,
          int  NUM_CHANNELS = 0,
          int  NUM_NODES    = 1,
          typename... TMA_Types>
-struct dbuf {
-    using GL_t = GL;
-    using T    = typename GL::dtype;
+struct distributed_tensor {
+    using local_tensor_t = LocalTensor;
+    using GL_t = LocalTensor;
+    using T    = typename LocalTensor::dtype;
     using dtype = T;
 
     static constexpr int  num_devices  = LOCAL_SIZE;
@@ -226,18 +229,18 @@ struct dbuf {
 
     /* ---- Intra-node state ---- */
     T*  mc_ptr;                       // multicast VA (nullptr if !MULTICAST)
-    GL  gls[LOCAL_SIZE];               // per-device layouts
+    LocalTensor  gls[LOCAL_SIZE];       // per-device local tensor views
     detail_mc::tma_dict<TMA_Types...> tma_descs;   // multicast TMA descs
 
     /* ---- Inter-node state ---- */
     ChannelArray<NUM_CHANNELS, NUM_NODES> channels;
 
-    /* ---- Pgl-compatible accessors ---- */
-    __host__ __device__ inline const GL& operator[](int idx) const { return gls[idx]; }
+    /* ---- Distributed-buffer accessors ---- */
+    __host__ __device__ inline const LocalTensor& operator[](int idx) const { return gls[idx]; }
 
-    __device__ inline T* mc_ptr_at(const kittens::coord<kittens::ducks::default_type>& idx) const {
+    __device__ inline T* mc_ptr_at(const coord& idx) const {
         static_assert(MULTICAST, "Multicast not enabled for this dbuf.");
-        const GL& g = gls[0];
+        const LocalTensor& g = gls[0];
         return &mc_ptr[((idx.b * (uint64_t)g.depth() + idx.d) * g.rows() + idx.r) * g.cols() + idx.c];
     }
 
@@ -256,28 +259,28 @@ struct dbuf {
 
     /* ---- Constructors ---- */
     template<size_t... I>
-    __host__ inline dbuf(std::index_sequence<I...>,
-                         T** data,
-                         detail::arg_t<GL::__b__> b,
-                         detail::arg_t<GL::__d__> d,
-                         detail::arg_t<GL::__r__> r,
-                         detail::arg_t<GL::__c__> c)
+    __host__ inline distributed_tensor(std::index_sequence<I...>,
+                                       T** data,
+                                       detail::arg_t<LocalTensor::__b__> b,
+                                       detail::arg_t<LocalTensor::__d__> d,
+                                       detail::arg_t<LocalTensor::__r__> r,
+                                       detail::arg_t<LocalTensor::__c__> c)
         : mc_ptr(nullptr),
-          gls{ GL(data[I], b, d, r, c)... },
+          gls{ LocalTensor(data[I], b, d, r, c)... },
           tma_descs() {
         static_assert(!MULTICAST, "Multicast pointer required.");
     }
 
     template<size_t... I>
-    __host__ inline dbuf(std::index_sequence<I...>,
-                         T*  mc,
-                         T** data,
-                         detail::arg_t<GL::__b__> b,
-                         detail::arg_t<GL::__d__> d,
-                         detail::arg_t<GL::__r__> r,
-                         detail::arg_t<GL::__c__> c)
+    __host__ inline distributed_tensor(std::index_sequence<I...>,
+                                       T*  mc,
+                                       T** data,
+                                       detail::arg_t<LocalTensor::__b__> b,
+                                       detail::arg_t<LocalTensor::__d__> d,
+                                       detail::arg_t<LocalTensor::__r__> r,
+                                       detail::arg_t<LocalTensor::__c__> c)
         : mc_ptr(mc),
-          gls{ GL(data[I], b, d, r, c)... },
+          gls{ LocalTensor(data[I], b, d, r, c)... },
           tma_descs(mc,
                     static_cast<int>(static_cast<size_t>(gls[0].batch_internal)),
                     static_cast<int>(static_cast<size_t>(gls[0].depth_internal)),
@@ -286,19 +289,19 @@ struct dbuf {
         static_assert(MULTICAST, "Multicast disabled — don't pass mc_ptr.");
     }
 
-    __host__ inline dbuf(T** data,
-                         detail::arg_t<GL::__b__> b,
-                         detail::arg_t<GL::__d__> d,
-                         detail::arg_t<GL::__r__> r,
-                         detail::arg_t<GL::__c__> c)
-        : dbuf(std::make_index_sequence<LOCAL_SIZE>{}, data, b, d, r, c) {}
+    __host__ inline distributed_tensor(T** data,
+                                       detail::arg_t<LocalTensor::__b__> b,
+                                       detail::arg_t<LocalTensor::__d__> d,
+                                       detail::arg_t<LocalTensor::__r__> r,
+                                       detail::arg_t<LocalTensor::__c__> c)
+        : distributed_tensor(std::make_index_sequence<LOCAL_SIZE>{}, data, b, d, r, c) {}
 
-    __host__ inline dbuf(T* mc, T** data,
-                         detail::arg_t<GL::__b__> b,
-                         detail::arg_t<GL::__d__> d,
-                         detail::arg_t<GL::__r__> r,
-                         detail::arg_t<GL::__c__> c)
-        : dbuf(std::make_index_sequence<LOCAL_SIZE>{}, mc, data, b, d, r, c) {}
+    __host__ inline distributed_tensor(T* mc, T** data,
+                                       detail::arg_t<LocalTensor::__b__> b,
+                                       detail::arg_t<LocalTensor::__d__> d,
+                                       detail::arg_t<LocalTensor::__r__> r,
+                                       detail::arg_t<LocalTensor::__c__> c)
+        : distributed_tensor(std::make_index_sequence<LOCAL_SIZE>{}, mc, data, b, d, r, c) {}
 
     /* ---- Inter-node compute-CTA API ---- */
 
@@ -312,7 +315,7 @@ struct dbuf {
         const TileFlag* f = &channels[c].arrived[t];
         uint32_t v;
         do {
-            asm volatile("ld.acquire.gpu.b32 %0, [%1];" : "=r"(v) : "l"(&f->v));
+            v = comm::atomic_u32::acquire_load_gpu(&f->v);
         } while (v < expected_iter);
     }
 
@@ -342,128 +345,147 @@ struct dbuf {
 /* ----------   Convenience aliases  ---------- */
 
 template<int LOCAL_SIZE>
-using barrier_dbuf = dbuf<gl<int, -1, -1, -1, -1>, LOCAL_SIZE, true>;
+using barrier_distributed_tensor =
+    distributed_tensor<local_tensor<int, -1, -1, -1, -1>, LOCAL_SIZE, true>;
+
+template<int LOCAL_SIZE>
+using barrier_dbuf = barrier_distributed_tensor<LOCAL_SIZE>;
 
 /* ----------   Cross-device barrier ops (multicast int dbuf)  ---------- */
 
 template<int LOCAL_SIZE>
 __device__ static inline void signal(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx, int dst_dev_idx, int val
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx, int dst_dev_idx, int val
 ) {
-    asm volatile("red.release.sys.global.add.s32 [%0], %1;"
-                 :: "l"(&barrier[dst_dev_idx][idx]), "r"(val) : "memory");
+    comm::atomic_u32::release_add_sys(&barrier[dst_dev_idx][idx], val);
 }
 
 template<int LOCAL_SIZE>
 __device__ static inline void signal_all(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx, int val
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx, int val
 ) {
-    asm volatile("multimem.red.release.sys.global.add.s32 [%0], %1;"
-                 :: "l"(barrier.mc_ptr_at(idx)), "r"(val) : "memory");
+    comm::multimem<int>::red<comm::reduce_op::ADD>(
+        reinterpret_cast<int*>(barrier.mc_ptr_at(idx)), val);
 }
 
 template<int LOCAL_SIZE>
 __device__ static inline void wait(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx,
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx,
     int dev_idx, int expected
 ) {
     int val;
     do {
-        asm volatile("ld.relaxed.sys.global.s32 %0, [%1];"
-                     : "=r"(val) : "l"(&barrier[dev_idx][idx]) : "memory");
+        val = comm::atomic_u32::relaxed_load_s32_sys(&barrier[dev_idx][idx]);
     } while (val != expected);
 }
 
 template<int LOCAL_SIZE>
 __device__ static inline void barrier_all(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx, int dev_idx
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx, int dev_idx
 ) {
     signal_all<LOCAL_SIZE>(barrier, idx, 1);
     wait<LOCAL_SIZE>(barrier, idx, dev_idx, LOCAL_SIZE);
-    asm volatile("red.release.sys.global.add.s32 [%0], %1;"
-                 :: "l"(&barrier[dev_idx][idx]), "r"(-LOCAL_SIZE) : "memory");
+    comm::atomic_u32::release_add_sys(&barrier[dev_idx][idx], -LOCAL_SIZE);
 }
 
 template<int LOCAL_SIZE>
 __device__ static inline void wait_acquire(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx,
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx,
     int dev_idx, int expected
 ) {
     int val;
     do {
-        asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
-                     : "=r"(val) : "l"(&barrier[dev_idx][idx]) : "memory");
+        val = comm::atomic_u32::acquire_load_s32_sys(&barrier[dev_idx][idx]);
     } while (val != expected);
 }
 
 template<int LOCAL_SIZE>
 __device__ static inline void wait_mc(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx, int expected
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx, int expected
 ) {
     int val;
     do {
-        asm volatile("multimem.ld_reduce.acquire.sys.global.max.s32 %0, [%1];"
-                     : "=r"(val) : "l"(barrier.mc_ptr_at(idx)) : "memory");
+        comm::multimem<int>::ld_reduce<comm::reduce_op::MAX, comm::memory_model::STRONG>(
+            val, reinterpret_cast<const int*>(barrier.mc_ptr_at(idx)));
     } while (val != expected);
 }
 
 template<int LOCAL_SIZE>
 __device__ static inline bool is_ready(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx,
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx,
     int dev_idx, int expected
 ) {
     int val;
-    asm volatile("ld.relaxed.sys.global.s32 %0, [%1];"
-                 : "=r"(val) : "l"(&barrier[dev_idx][idx]) : "memory");
+    val = comm::atomic_u32::relaxed_load_s32_sys(&barrier[dev_idx][idx]);
     return val == expected;
 }
 
 template<int LOCAL_SIZE>
 __device__ static inline bool is_ready_mc(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx, int expected
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx, int expected
 ) {
     int val;
-    asm volatile("multimem.ld_reduce.acquire.sys.global.max.s32 %0, [%1];"
-                 : "=r"(val) : "l"(barrier.mc_ptr_at(idx)) : "memory");
+    comm::multimem<int>::ld_reduce<comm::reduce_op::MAX, comm::memory_model::STRONG>(
+        val, reinterpret_cast<const int*>(barrier.mc_ptr_at(idx)));
     return val == expected;
 }
 
 template<int LOCAL_SIZE>
 __device__ static inline void clear_slot_mc(
-    const barrier_dbuf<LOCAL_SIZE>& barrier,
-    const kittens::coord<kittens::ducks::default_type>& idx
+    const barrier_distributed_tensor<LOCAL_SIZE>& barrier,
+    const coord& idx
 ) {
-    asm volatile("multimem.st.release.sys.global.s32 [%0], %1;"
-                 :: "l"(barrier.mc_ptr_at(idx)), "r"(0) : "memory");
+    comm::multimem<int>::st<comm::memory_model::STRONG>(
+        reinterpret_cast<int*>(barrier.mc_ptr_at(idx)), 0);
 }
 
 /* ----------   Construction helpers  ---------- */
 
-template<typename DBUF>
-__host__ inline DBUF make_dbuf(uint64_t* data, int b, int d, int r, int c) {
-    return DBUF(reinterpret_cast<typename DBUF::T**>(data),
-                detail::make_arg<DBUF::GL_t::__b__>(b),
-                detail::make_arg<DBUF::GL_t::__d__>(d),
-                detail::make_arg<DBUF::GL_t::__r__>(r),
-                detail::make_arg<DBUF::GL_t::__c__>(c));
+template<typename DistributedTensor>
+__host__ inline DistributedTensor make_distributed_tensor(uint64_t* data, int b, int d, int r, int c) {
+    return DistributedTensor(reinterpret_cast<typename DistributedTensor::T**>(data),
+                             detail::make_arg<DistributedTensor::GL_t::__b__>(b),
+                             detail::make_arg<DistributedTensor::GL_t::__d__>(d),
+                             detail::make_arg<DistributedTensor::GL_t::__r__>(r),
+                             detail::make_arg<DistributedTensor::GL_t::__c__>(c));
 }
 
-template<typename DBUF>
-__host__ inline DBUF make_dbuf(uint64_t mc, uint64_t* data, int b, int d, int r, int c) {
-    return DBUF(reinterpret_cast<typename DBUF::T*>(mc),
-                reinterpret_cast<typename DBUF::T**>(data),
-                detail::make_arg<DBUF::GL_t::__b__>(b),
-                detail::make_arg<DBUF::GL_t::__d__>(d),
-                detail::make_arg<DBUF::GL_t::__r__>(r),
-                detail::make_arg<DBUF::GL_t::__c__>(c));
+template<typename DistributedTensor>
+__host__ inline DistributedTensor make_distributed_tensor(
+    uint64_t mc, uint64_t* data, int b, int d, int r, int c
+) {
+    return DistributedTensor(reinterpret_cast<typename DistributedTensor::T*>(mc),
+                             reinterpret_cast<typename DistributedTensor::T**>(data),
+                             detail::make_arg<DistributedTensor::GL_t::__b__>(b),
+                             detail::make_arg<DistributedTensor::GL_t::__d__>(d),
+                             detail::make_arg<DistributedTensor::GL_t::__r__>(r),
+                             detail::make_arg<DistributedTensor::GL_t::__c__>(c));
+}
+
+template<typename LocalTensor,
+         int  LOCAL_SIZE   = 8,
+         bool MULTICAST    = true,
+         int  NUM_CHANNELS = 0,
+         int  NUM_NODES    = 1,
+         typename... TMA_Types>
+using dbuf = distributed_tensor<LocalTensor, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>;
+
+template<typename DistributedTensor>
+__host__ inline DistributedTensor make_dbuf(uint64_t* data, int b, int d, int r, int c) {
+    return make_distributed_tensor<DistributedTensor>(data, b, d, r, c);
+}
+
+template<typename DistributedTensor>
+__host__ inline DistributedTensor make_dbuf(uint64_t mc, uint64_t* data, int b, int d, int r, int c) {
+    return make_distributed_tensor<DistributedTensor>(mc, data, b, d, r, c);
 }
 
 } // namespace dist

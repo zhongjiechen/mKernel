@@ -9,6 +9,8 @@
  */
 #pragma once
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -25,6 +27,11 @@ static constexpr CUmemAllocationHandleType kHandleType = CU_MEM_HANDLE_TYPE_POSI
 
 using Handle = CUmemGenericAllocationHandle;
 
+__host__ inline bool mc_debug_enabled() {
+    const char *v = std::getenv("MKERNEL_MC_DEBUG");
+    return v && v[0] == '1';
+}
+
 __host__ inline void alloc(
     Handle *handle,
     size_t *allocated_size,
@@ -37,25 +44,35 @@ __host__ inline void alloc(
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
 
     size_t granularity = 0;
-    OSGC_CUCHECK(cuMemGetAllocationGranularity(
+    MKERNEL_CUCHECK(cuMemGetAllocationGranularity(
         &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
     *allocated_size = ((size + granularity - 1) / granularity) * granularity;
+    if (mc_debug_enabled()) {
+        std::fprintf(
+            stderr,
+            "comm::vmm::alloc: dev=%d req_size=%zu alloc_size=%zu granularity=%zu handleType=0x%x allocType=%d locType=%d\n",
+            device_id, size, *allocated_size, granularity,
+            static_cast<unsigned int>(prop.requestedHandleTypes),
+            static_cast<int>(prop.type),
+            static_cast<int>(prop.location.type)
+        );
+    }
 
-    OSGC_CUCHECK(cuMemCreate(handle, *allocated_size, &prop, 0));
+    MKERNEL_CUCHECK(cuMemCreate(handle, *allocated_size, &prop, 0));
 }
 
 __host__ inline void map(void **ptr, const Handle &handle, size_t size) {
     CUdeviceptr device_ptr = 0;
-    OSGC_CUCHECK(cuMemAddressReserve(&device_ptr, size, 0, 0, 0));
-    OSGC_CUCHECK(cuMemMap(device_ptr, size, 0, handle, 0));
+    MKERNEL_CUCHECK(cuMemAddressReserve(&device_ptr, size, 0, 0, 0));
+    MKERNEL_CUCHECK(cuMemMap(device_ptr, size, 0, handle, 0));
     *ptr = reinterpret_cast<void *>(device_ptr);
 }
 
 // Required for multicast access patterns: same virtual address on all processes.
 __host__ inline void map_at(void **ptr, void *requested_addr, const Handle &handle, size_t size) {
     CUdeviceptr device_ptr = reinterpret_cast<CUdeviceptr>(requested_addr);
-    OSGC_CUCHECK(cuMemAddressReserve(&device_ptr, size, 0, device_ptr, 0));
-    OSGC_CUCHECK(cuMemMap(device_ptr, size, 0, handle, 0));
+    MKERNEL_CUCHECK(cuMemAddressReserve(&device_ptr, size, 0, device_ptr, 0));
+    MKERNEL_CUCHECK(cuMemMap(device_ptr, size, 0, handle, 0));
     *ptr = reinterpret_cast<void *>(device_ptr);
 }
 
@@ -66,20 +83,20 @@ __host__ inline void set_access(void *ptr, size_t size, int num_devices) {
         descs[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         descs[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     }
-    OSGC_CUCHECK(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(ptr), size, descs.data(), num_devices));
+    MKERNEL_CUCHECK(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(ptr), size, descs.data(), num_devices));
 }
 
 __host__ inline void retain_handle(Handle *handle, void *ptr) {
-    OSGC_CUCHECK(cuMemRetainAllocationHandle(handle, ptr));
+    MKERNEL_CUCHECK(cuMemRetainAllocationHandle(handle, ptr));
 }
 
 __host__ inline void unmap(void *ptr, size_t size) {
-    OSGC_CUCHECK(cuMemUnmap(reinterpret_cast<CUdeviceptr>(ptr), size));
-    OSGC_CUCHECK(cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size));
+    MKERNEL_CUCHECK(cuMemUnmap(reinterpret_cast<CUdeviceptr>(ptr), size));
+    MKERNEL_CUCHECK(cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size));
 }
 
 __host__ inline void release(Handle &handle) {
-    OSGC_CUCHECK(cuMemRelease(handle));
+    MKERNEL_CUCHECK(cuMemRelease(handle));
 }
 
 __host__ inline void alloc_map_set_access(
@@ -97,10 +114,10 @@ __host__ inline void alloc_map_set_access(
 
 __host__ inline void multicast_check(int device_id) {
     CUdevice device;
-    OSGC_CUCHECK(cuDeviceGet(&device, device_id));
+    MKERNEL_CUCHECK(cuDeviceGet(&device, device_id));
 
     int multicast_supported = 0;
-    OSGC_CUCHECK(cuDeviceGetAttribute(
+    MKERNEL_CUCHECK(cuDeviceGetAttribute(
         &multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, device));
 
     if (!multicast_supported) {
@@ -122,25 +139,85 @@ __host__ inline void multicast_create_handle(
     prop.handleTypes = kHandleType;
 
     size_t granularity = 0;
-    OSGC_CUCHECK(cuMulticastGetGranularity(
+    MKERNEL_CUCHECK(cuMulticastGetGranularity(
         &granularity, &prop, CU_MULTICAST_GRANULARITY_RECOMMENDED));
     *allocated_size = ((size + granularity - 1) / granularity) * granularity;
     prop.size = *allocated_size;
+    if (mc_debug_enabled()) {
+        size_t min_granularity = 0;
+        CUresult r = cuMulticastGetGranularity(
+            &min_granularity, &prop, CU_MULTICAST_GRANULARITY_MINIMUM);
+        if (r != CUDA_SUCCESS) min_granularity = 0;
+        std::fprintf(
+            stderr,
+            "comm::vmm::multicast_create_handle: numDevices=%d req_size=%zu alloc_size=%zu gran_rec=%zu gran_min=%zu handleType=0x%x\n",
+            num_devices, size, *allocated_size, granularity, min_granularity,
+            static_cast<unsigned int>(prop.handleTypes)
+        );
+    }
 
-    OSGC_CUCHECK(cuMulticastCreate(handle, &prop));
+    MKERNEL_CUCHECK(cuMulticastCreate(handle, &prop));
 }
 
 __host__ inline void multicast_bind_device(const Handle &handle, int device_id) {
     CUdevice device;
-    OSGC_CUCHECK(cuDeviceGet(&device, device_id));
-    OSGC_CUCHECK(cuMulticastAddDevice(handle, device));
+    MKERNEL_CUCHECK(cuDeviceGet(&device, device_id));
+    MKERNEL_CUCHECK(cuMulticastAddDevice(handle, device));
 }
 
 __host__ inline void multicast_bind_memory(
     const Handle &multicast_handle,
     const Handle &memory_handle,
     size_t size) {
-    OSGC_CUCHECK(cuMulticastBindMem(multicast_handle, 0, memory_handle, 0, size, 0));
+    if (mc_debug_enabled()) {
+        CUmemAllocationProp p = {};
+        CUresult pr = cuMemGetAllocationPropertiesFromHandle(&p, memory_handle);
+        if (pr == CUDA_SUCCESS) {
+            std::fprintf(
+                stderr,
+                "comm::vmm::multicast_bind_memory: memory_handle=0x%llx size=%zu allocType=%d reqHandleTypes=0x%x location(type=%d,id=%d)\n",
+                static_cast<unsigned long long>(memory_handle),
+                size,
+                static_cast<int>(p.type),
+                static_cast<unsigned int>(p.requestedHandleTypes),
+                static_cast<int>(p.location.type),
+                static_cast<int>(p.location.id)
+            );
+        } else {
+            const char *n = nullptr;
+            const char *s = nullptr;
+            cuGetErrorName(pr, &n);
+            cuGetErrorString(pr, &s);
+            std::fprintf(
+                stderr,
+                "comm::vmm::multicast_bind_memory: cuMemGetAllocationPropertiesFromHandle failed for memory_handle=0x%llx err=%s (%s)\n",
+                static_cast<unsigned long long>(memory_handle),
+                n ? n : "unknown",
+                s ? s : "unknown"
+            );
+        }
+    }
+
+    CUresult mc_bind_result = cuMulticastBindMem(multicast_handle, 0, memory_handle, 0, size, 0);
+    if (mc_bind_result != CUDA_SUCCESS) {
+        const char *err_str = nullptr;
+        const char *err_name = nullptr;
+        cuGetErrorString(mc_bind_result, &err_str);
+        cuGetErrorName(mc_bind_result, &err_name);
+        int dev = -1;
+        cudaGetDevice(&dev);
+        std::fprintf(
+            stderr,
+            "cuMulticastBindMem failed: dev=%d multicast_handle=0x%llx memory_handle=0x%llx size=%zu err=%s (%s)\n",
+            dev,
+            static_cast<unsigned long long>(multicast_handle),
+            static_cast<unsigned long long>(memory_handle),
+            size,
+            err_name ? err_name : "unknown",
+            err_str ? err_str : "unknown"
+        );
+        std::abort();
+    }
 }
 
 __host__ inline void multicast_bind_address(
@@ -155,8 +232,8 @@ __host__ inline void multicast_bind_address(
 
 __host__ inline void multicast_unbind_device(const Handle &handle, size_t size, int device_id) {
     CUdevice device;
-    OSGC_CUCHECK(cuDeviceGet(&device, device_id));
-    OSGC_CUCHECK(cuMulticastUnbind(handle, device, 0, size));
+    MKERNEL_CUCHECK(cuDeviceGet(&device, device_id));
+    MKERNEL_CUCHECK(cuMulticastUnbind(handle, device, 0, size));
 }
 
 } // namespace comm::vmm

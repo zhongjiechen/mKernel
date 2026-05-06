@@ -18,12 +18,10 @@
 #include "rdma_transport.h"
 #include "rdma_gpu_mr.cuh"
 #include "d2h_fifo.cuh"
+#include "../device_clock.cuh"
 #include "arrival.cuh"
 #include "proxy.h"
 #include "ready_queue.cuh"
-#if defined(INTERNODE_BACKEND_IBGDA)
-#include "ibgda_attach.h"
-#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,11 +44,9 @@ inline uint64_t q2_host_now_ns() {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-__global__ inline void q2_read_globaltimer_kernel(unsigned long long* out) {
+static __global__ void q2_read_globaltimer_kernel(unsigned long long* out) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        unsigned long long t;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-        out[0] = t;
+        out[0] = comm::globaltimer();
     }
 }
 
@@ -59,19 +55,19 @@ inline int64_t calibrate_gpu_to_host_offset_ns(int samples = 32) {
     unsigned long long* dev_out = nullptr;
     unsigned long long host_out = 0;
     cudaStream_t stream = nullptr;
-    OSGC_CUDACHECK(cudaMalloc(&dev_out, sizeof(unsigned long long)));
-    OSGC_CUDACHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    MKERNEL_CUDACHECK(cudaMalloc(&dev_out, sizeof(unsigned long long)));
+    MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     uint64_t best_window_ns = std::numeric_limits<uint64_t>::max();
     int64_t best_offset_ns = 0;
     for (int i = 0; i < samples; ++i) {
         const uint64_t host_before_ns = q2_host_now_ns();
         q2_read_globaltimer_kernel<<<1, 1, 0, stream>>>(dev_out);
-        OSGC_CUDACHECK(cudaGetLastError());
-        OSGC_CUDACHECK(cudaMemcpyAsync(
+        MKERNEL_CUDACHECK(cudaGetLastError());
+        MKERNEL_CUDACHECK(cudaMemcpyAsync(
             &host_out, dev_out, sizeof(unsigned long long),
             cudaMemcpyDeviceToHost, stream));
-        OSGC_CUDACHECK(cudaStreamSynchronize(stream));
+        MKERNEL_CUDACHECK(cudaStreamSynchronize(stream));
         const uint64_t host_after_ns = q2_host_now_ns();
         const uint64_t window_ns = host_after_ns - host_before_ns;
         if (window_ns < best_window_ns) {
@@ -81,8 +77,8 @@ inline int64_t calibrate_gpu_to_host_offset_ns(int samples = 32) {
         }
     }
 
-    OSGC_CUDACHECK(cudaStreamDestroy(stream));
-    OSGC_CUDACHECK(cudaFree(dev_out));
+    MKERNEL_CUDACHECK(cudaStreamDestroy(stream));
+    MKERNEL_CUDACHECK(cudaFree(dev_out));
     return best_offset_ns;
 }
 
@@ -190,7 +186,7 @@ struct SessionConfig {
     // Optional second buffer to register as a DMA-BUF MR (for direct-from-
     // C_local sends that bypass the staging copy). Required when
     // direct_dmabuf_enabled is true. Must point to a VMM-backed allocation
-    // (TKParallelTensor::data_). Registration uses ibv_reg_dmabuf_mr only —
+    // (DistBuffer::data_). Registration uses ibv_reg_dmabuf_mr only —
     // no nvidia_peermem / ibv_reg_mr fallback.
     void*       clocal_gpu_buf = nullptr;
     size_t      clocal_gpu_buf_size = 0;
@@ -201,6 +197,7 @@ struct SessionConfig {
     size_t      row_stride_bytes = 0;
 
     size_t      recv_buf_size;       // size of receive buffer to allocate on GPU
+    void*       external_recv_buf = nullptr; // optional caller-owned RDMA target
     int         num_tiles;           // number of arrival flag slots
     int         fifo_capacity;       // D2H FIFO capacity (default 1024, must be power of 2)
     int         device_id;           // CUDA device index
@@ -210,6 +207,9 @@ struct SessionConfig {
     int         num_qps;             // number of QPs to create (0 or 1 = single QP, max 24)
     int         logical_queues_per_qp = 1; // software queues mapped onto each QP
     int         num_proxy_threads = 1;     // host proxy threads / FIFO channels
+    bool        use_write_imm = false;
+    int         ready_queue_cap = 0;
+    bool        use_arrival_queue = false;
 
     const char* nic_name;            // IB device name (e.g., "mlx5_4"); NULL = auto-select based on device_id
 
@@ -241,21 +241,17 @@ struct Session {
     // Local data buffer MR (registered over caller's existing GPU buffer)
     ibv_mr*       local_data_mr;
 
-    // Optional DMA-BUF MR over the C_local (TKParallelTensor data_) buffer.
+    // Optional DMA-BUF MR over the C_local (DistBuffer data_) buffer.
     // Non-null only when SessionConfig::direct_dmabuf_enabled was set and the
     // strict DMA-BUF registration succeeded.
     ibv_mr*       clocal_data_mr = nullptr;
 
     // Receive buffer (allocated on GPU, RDMA-registered for remote writes)
     gpu_mr::GpuRdmaBuffer recv_buf;
+    bool          recv_buf_external = false;
 
-    // D2H command FIFOs (IBVERBS backend) — one per proxy thread / FIFO channel.
-    // Under IBGDA these slots are unused (kept in the struct for binary/layout
-    // stability; the device handles live in fifo_bundle, populated by the
-    // ibgda runtime instead of create_d2h_fifo).
-#if !defined(INTERNODE_BACKEND_IBGDA)
+    // D2H command FIFOs — one per proxy thread / FIFO channel.
     D2HFifoPair   fifos[kMaxProxyThreads];
-#endif
     D2HFifoDeviceBundle fifo_bundle;
     int           num_proxy_threads;
 
@@ -264,13 +260,8 @@ struct Session {
     FlagStaging   flag_stagings[kMaxProxyThreads];
     StageBarrierFlags stage_barrier;
 
-    // CPU proxy threads (IBVERBS). Under IBGDA there is no CPU proxy; a
-    // lightweight CQ reaper thread lives inside `ibgda_rt` instead.
-#if !defined(INTERNODE_BACKEND_IBGDA)
+    // CPU proxy threads.
     Proxy*        proxies[kMaxProxyThreads];
-#else
-    IbgdaRuntime* ibgda_rt = nullptr;
-#endif
 
     // Remote connection info (populated after TCP exchange)
     ConnectionInfo remote_info;
@@ -324,9 +315,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     // Zero-init extra QP/CQ arrays
     memset(s->extra_qps, 0, sizeof(s->extra_qps));
     memset(s->proxy_cqs, 0, sizeof(s->proxy_cqs));
-#if !defined(INTERNODE_BACKEND_IBGDA)
     memset(s->proxies, 0, sizeof(s->proxies));
-#endif
     memset(s->flag_stagings, 0, sizeof(s->flag_stagings));
 
     // --- 1. RDMA resources (QP 0 / CQ 0) ---
@@ -374,28 +363,8 @@ inline Session* create_session(const SessionConfig& cfg) {
         fprintf(stderr, "session: q2 dmabuf: max_send_sge=%d row_stride=%zu\n",
                 qp_max_send_sge, cfg.row_stride_bytes);
     }
-    // SQ depth: IBVERBS proxy batches WRs via ibv_post_send so 2048 is plenty.
-    // IBGDA has no per-WQE CQE tracking on the hot path, so the SQ must hold
-    // one full iteration's WQEs: 2 per tile (data + flag), divided across QPs.
+    // SQ depth: proxy batches WRs via ibv_post_send so 2048 is plenty.
     int qp_max_send_wr = 2048;
-#if defined(INTERNODE_BACKEND_IBGDA)
-    {
-        // Reserve 25% slack above the worst-case tile count per QP.
-        const int tiles_total = std::max(1, cfg.num_tiles);
-        const int per_qp = (tiles_total + s->num_qps - 1) / s->num_qps;
-        const int needed = per_qp * 2 + per_qp / 4 + 64;
-        // libmlx5 rounds up to the nearest power of two internally; clamp to
-        // device max_qp_wr to avoid create_qp failures.
-        ibv_device_attr da{};
-        int max_wr = 32768;  // hopeful cap on mlx5
-        if (ibv_query_device(s->ctx, &da) == 0 && da.max_qp_wr > 0) {
-            max_wr = da.max_qp_wr;
-        }
-        qp_max_send_wr = std::min(max_wr, std::max(qp_max_send_wr, needed));
-        fprintf(stderr, "session: IBGDA SQ depth per QP=%d (tiles=%d num_qps=%d)\n",
-                qp_max_send_wr, tiles_total, s->num_qps);
-    }
-#endif
     s->qp  = rdma::create_rc_qp(s->pd, s->cq, qp_max_send_wr, qp_max_send_sge);
     rdma::modify_qp_init(s->qp);
 
@@ -407,12 +376,8 @@ inline Session* create_session(const SessionConfig& cfg) {
     }
 
     // --- 2. Register local GPU buffer ---
-    // Try DMA-BUF first (works with cudaMalloc and VMM-backed TKParallelTensor,
-    // required when Option A routes the staging buffer through a VMM alloc),
-    // fall back to nvidia_peermem for cudaMalloc ptrs. Matches session_efa.h.
-    // Historical note: raw ibv_reg_mr here fails with "Bad address" when given
-    // a VMM pointer, which broke Q5_INTRA_RS_DIRECT_STAGING on CX7 until this
-    // call was routed through gpu_mr::register_gpu_buffer (2026-04-23).
+    // Try DMA-BUF first for VMM-backed buffers, then fall back to nvidia_peermem
+    // for cudaMalloc pointers. Raw ibv_reg_mr does not work for VMM pointers.
     s->local_data_mr = gpu_mr::register_gpu_buffer(
         s->pd, cfg.local_gpu_buf, cfg.local_gpu_buf_size,
         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
@@ -451,11 +416,22 @@ inline Session* create_session(const SessionConfig& cfg) {
     }
 
     // --- 3. Allocate + register receive buffer ---
-    s->recv_buf = gpu_mr::alloc_and_register(
-        s->pd, cfg.recv_buf_size, cfg.device_id);
+    if (cfg.external_recv_buf != nullptr) {
+        s->recv_buf.gpu_ptr = cfg.external_recv_buf;
+        s->recv_buf.size = cfg.recv_buf_size;
+        s->recv_buf.mr = gpu_mr::register_gpu_buffer(
+            s->pd, s->recv_buf.gpu_ptr, s->recv_buf.size);
+        s->recv_buf_external = true;
+    } else {
+        s->recv_buf = gpu_mr::alloc_and_register(
+            s->pd, cfg.recv_buf_size, cfg.device_id);
+    }
+    if (!s->recv_buf.mr) {
+        fprintf(stderr, "session: register receive buffer failed: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
     // --- 4. D2H FIFO ---
-#if !defined(INTERNODE_BACKEND_IBGDA)
     int fifo_cap = cfg.fifo_capacity > 0 ? cfg.fifo_capacity : 1024;
     s->fifo_bundle = D2HFifoDeviceBundle{};
     s->fifo_bundle.num_fifos = s->num_proxy_threads;
@@ -466,15 +442,6 @@ inline Session* create_session(const SessionConfig& cfg) {
         s->fifos[t] = create_d2h_fifo(fifo_cap);
         s->fifo_bundle.fifos[t] = s->fifos[t].device;
     }
-#else
-    // IBGDA: D2H FIFO does not exist. The bundle is sized one slot per QP;
-    // each slot is filled by the IBGDA runtime after QP transitions (step 9').
-    s->fifo_bundle = D2HFifoDeviceBundle{};
-    s->fifo_bundle.num_fifos = s->num_qps;
-    s->fifo_bundle.global_num_qps = s->num_qps;
-    s->fifo_bundle.logical_queues_per_qp = logical_queues_per_qp;
-    s->fifo_bundle.qps_per_fifo = 1;
-#endif
 
     // --- 5. Arrival flags ---
     s->arrival = create_arrival_flags(total_arrival_slots, total_logical_queues);
@@ -484,8 +451,7 @@ inline Session* create_session(const SessionConfig& cfg) {
                                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
                                   | IBV_ACCESS_RELAXED_ORDERING);
 
-    // --- 6. Per-proxy flag staging (IBVERBS only) ---
-#if !defined(INTERNODE_BACKEND_IBGDA)
+    // --- 6. Per-proxy flag staging ---
     for (int t = 0; t < s->num_proxy_threads; t++) {
         // +2 extra slots reserved for strided-direct single-cmd posts
         // (flag and tail scratch, read via IBV_SEND_INLINE).
@@ -495,7 +461,6 @@ inline Session* create_session(const SessionConfig& cfg) {
             s->flag_stagings[t].count * sizeof(uint32_t),
             IBV_ACCESS_LOCAL_WRITE);
     }
-#endif
 
     // --- 6b. Stage barrier flags ---
     s->stage_barrier = create_stage_barrier_flags(kStageBarrierSlots);
@@ -557,10 +522,8 @@ inline Session* create_session(const SessionConfig& cfg) {
         rdma::modify_qp_rts(s->extra_qps[i - 1], local_info.extra_psns[i - 1]);
     }
 
-#if !defined(INTERNODE_BACKEND_IBGDA)
-    // --- 9. Proxy thread (IBVERBS only) ---
+    // --- 9. Proxy threads ---
     const int64_t gpu_to_host_offset_ns = calibrate_gpu_to_host_offset_ns(64);
-    ProxyConfig pcfg{};
     for (int t = 0; t < s->num_proxy_threads; t++) {
         const int qp_base = t * qps_per_proxy;
         const int local_qps = std::min(qps_per_proxy, s->num_qps - qp_base);
@@ -594,6 +557,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         pcfg.remote_flags_rkey = s->remote_info.flags_rkey;
         pcfg.remote_tail_addr = s->remote_info.tail_addr;
         pcfg.remote_tail_rkey = s->remote_info.tail_rkey;
+        pcfg.use_arrival_queue   = cfg.use_arrival_queue;
         pcfg.remote_queue_stride = (uint32_t)logical_queue_stride;
         pcfg.logical_queues_per_qp = logical_queues_per_qp;
         pcfg.enable_remote_tail = (std::getenv("Q2_SENDER_PUBLISHED_TAIL") != nullptr
@@ -609,46 +573,6 @@ inline Session* create_session(const SessionConfig& cfg) {
         s->proxies[t] = new Proxy(pcfg);
         s->proxies[t]->start();
     }
-#else
-    // --- 9'. IBGDA runtime: attach each QP, upload peer table, start reaper ---
-    {
-        s->ibgda_rt = new IbgdaRuntime{};
-        s->ibgda_rt->num_qps = s->num_qps;
-        s->ibgda_rt->qps     = new IbgdaQpState[s->num_qps];
-        // Attach QP 0 on its CQ, QPs 1..N-1 on the primary CQ too
-        // (each gets its own dbrec/SQ/BF regardless of CQ sharing).
-        auto qp_of = [&](int i) -> ibv_qp* {
-            return (i == 0) ? s->qp : s->extra_qps[i - 1];
-        };
-        auto cq_of = [&](int i) -> ibv_cq* {
-            // Match IBVERBS proxy routing: ceil(num_qps / num_proxy_threads)
-            // QPs per CQ, one CQ per proxy thread.
-            int owner = std::min(s->num_proxy_threads - 1, i / qps_per_proxy);
-            return s->proxy_cqs[owner];
-        };
-        for (int i = 0; i < s->num_qps; ++i) {
-            ibv_qp* qp = qp_of(i);
-            ibv_cq* cq = cq_of(i);
-            if (ibgda_attach_qp(s->ibgda_rt->qps[i], qp, cq, s->pd) != 0) {
-                fprintf(stderr, "session: ibgda_attach_qp %d failed — aborting\n", i);
-                exit(EXIT_FAILURE);
-            }
-        }
-        // Peer table on device.
-        s->ibgda_rt->d_peers = ibgda_upload_peer_table(s->remote_info, cfg.rank);
-        s->ibgda_rt->num_peers = kIbgdaMaxPeers;
-        // Populate fifo_bundle.fifos[i] for each QP.
-        const uint64_t local_base = (uint64_t)cfg.local_gpu_buf;
-        const uint32_t lkey_data  = s->local_data_mr->lkey;
-        for (int i = 0; i < s->num_qps; ++i) {
-            ibgda_fill_device_handle(s->fifo_bundle.fifos[i],
-                                     s->ibgda_rt->qps[i],
-                                     local_base, lkey_data,
-                                     s->ibgda_rt->d_peers);
-        }
-        ibgda_runtime_init_done(*s->ibgda_rt);  // no reaper thread
-    }
-#endif
 
     if (cfg.rank == 0) {
         fprintf(stderr, "internode::Session created (rank=%d, peer=%s:%d)\n",
@@ -664,7 +588,6 @@ inline Session* create_session(const SessionConfig& cfg) {
  * no new FIFO pushes will arrive.
  */
 inline void drain_proxy(Session* s) {
-#if !defined(INTERNODE_BACKEND_IBGDA)
     uint64_t fifo_heads[kMaxProxyThreads]{};
     for (int t = 0; t < s->num_proxy_threads; t++) {
         cudaMemcpy(&fifo_heads[t], s->fifos[t].device.head, sizeof(uint64_t), cudaMemcpyDeviceToHost);
@@ -683,23 +606,6 @@ inline void drain_proxy(Session* s) {
             break;
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
-#else
-    // IBGDA: host polls each CQ once to flush pending completions and surface
-    // any WQE errors. No per-WQE counter — SQ is sized so push() never
-    // overruns within an iteration.
-    if (!s->ibgda_rt) return;
-    // Read each QP's pi; use as the expected CQE count so we block until all
-    // outstanding signaled WQEs retire.
-    std::vector<uint64_t> need(s->ibgda_rt->num_qps, 0);
-    for (int i = 0; i < s->ibgda_rt->num_qps; ++i) {
-        IbgdaQpState& q = s->ibgda_rt->qps[i];
-        if (!q.d_pi_counter) continue;
-        uint64_t pi = 0;
-        cudaMemcpy(&pi, q.d_pi_counter, sizeof(pi), cudaMemcpyDeviceToHost);
-        need[i] = pi;
-    }
-    ibgda_drain_cqs_host(*s->ibgda_rt, need.data(), /*max_spin_ms=*/5000);
-#endif
 }
 
 /**
@@ -708,7 +614,6 @@ inline void drain_proxy(Session* s) {
 inline void destroy_session(Session* s) {
     if (!s) return;
 
-#if !defined(INTERNODE_BACKEND_IBGDA)
     // Ensure proxy has processed all FIFO commands and RDMA writes before shutdown.
     // Without this, the remote node may never receive some tile arrivals.
     if (s->proxies[0]) {
@@ -721,23 +626,6 @@ inline void destroy_session(Session* s) {
             s->proxies[t] = nullptr;
         }
     }
-#else
-    // IBGDA: drain all CQEs, then tear down attachments (no reaper thread).
-    if (s->ibgda_rt) {
-        cudaDeviceSynchronize();
-        std::vector<uint64_t> need(s->ibgda_rt->num_qps, 0);
-        for (int i = 0; i < s->ibgda_rt->num_qps; ++i) {
-            IbgdaQpState& q = s->ibgda_rt->qps[i];
-            if (!q.d_pi_counter) continue;
-            uint64_t pi = 0;
-            cudaMemcpy(&pi, q.d_pi_counter, sizeof(pi), cudaMemcpyDeviceToHost);
-            need[i] = pi;
-        }
-        ibgda_drain_cqs_host(*s->ibgda_rt, need.data(), /*max_spin_ms=*/5000);
-        ibgda_runtime_teardown(*s->ibgda_rt);
-        delete s->ibgda_rt; s->ibgda_rt = nullptr;
-    }
-#endif
 
     // Deregister MRs
     if (s->arrival.mr)     rdma::dereg_mr(s->arrival.mr);
@@ -749,12 +637,15 @@ inline void destroy_session(Session* s) {
     if (s->local_data_mr)  rdma::dereg_mr(s->local_data_mr);
 
     // Free buffers
-    gpu_mr::free_buffer(s->recv_buf);
-#if !defined(INTERNODE_BACKEND_IBGDA)
+    if (s->recv_buf_external) {
+        if (s->recv_buf.mr) rdma::dereg_mr(s->recv_buf.mr);
+        s->recv_buf = gpu_mr::GpuRdmaBuffer{};
+    } else {
+        gpu_mr::free_buffer(s->recv_buf);
+    }
     for (int t = 0; t < s->num_proxy_threads; t++) {
         destroy_d2h_fifo(s->fifos[t]);
     }
-#endif
     destroy_arrival_flags(s->arrival);
     for (int t = 0; t < s->num_proxy_threads; t++) {
         destroy_flag_staging(s->flag_stagings[t]);
@@ -830,7 +721,6 @@ inline void prepare_epoch(Session* s) {
     // Wait for GPU to finish any pending work — no new FIFO pushes after this.
     cudaDeviceSynchronize();
 
-#if !defined(INTERNODE_BACKEND_IBGDA)
     // Wait for proxy to consume all FIFO commands and drain all RDMA writes.
     drain_proxy(s);
 
@@ -855,21 +745,6 @@ inline void prepare_epoch(Session* s) {
     for (int t = 0; t < s->num_proxy_threads; t++) {
         s->proxies[t]->reset_timestamps();
     }
-#else
-    // IBGDA: host polls each CQ once to flush pending completions. No per-WQE
-    // counter; SQ is sized so push() never overruns within an iteration.
-    if (s->ibgda_rt) {
-        std::vector<uint64_t> need(s->ibgda_rt->num_qps, 0);
-        for (int i = 0; i < s->ibgda_rt->num_qps; ++i) {
-            IbgdaQpState& q = s->ibgda_rt->qps[i];
-            if (!q.d_pi_counter) continue;
-            uint64_t pi = 0;
-            cudaMemcpy(&pi, q.d_pi_counter, sizeof(pi), cudaMemcpyDeviceToHost);
-            need[i] = pi;
-        }
-        ibgda_drain_cqs_host(*s->ibgda_rt, need.data(), /*max_spin_ms=*/5000);
-    }
-#endif
 }
 
 /**
@@ -882,11 +757,9 @@ inline void prepare_epoch(Session* s) {
 inline void commit_epoch(Session* s, uint32_t epoch) {
     // Update epoch on session and proxy
     s->epoch = epoch;
-#if !defined(INTERNODE_BACKEND_IBGDA)
     for (int t = 0; t < s->num_proxy_threads; t++) {
         s->proxies[t]->set_epoch(epoch);
     }
-#endif
 
     // Reset arrival flags.
     // NOTE: we intentionally do NOT reset stage_barrier here. The slot is
@@ -909,11 +782,10 @@ inline void commit_epoch(Session* s, uint32_t epoch) {
     // on the GPU at iter-end BEFORE the cross-node barrier (see Q2 kernels'
     // q2_iter_end_reset_arrival_flags), or call reset_arrival_flags()
     // explicitly in a regime where no in-flight peer writes can race.
-    if (std::getenv("OSGC_COMMIT_EPOCH_SKIP_ARRIVAL_RESET") == nullptr) {
+    if (std::getenv("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET") == nullptr) {
         reset_arrival_flags(s->arrival);
     }
 
-#if !defined(INTERNODE_BACKEND_IBGDA)
     // Reset FIFO: zero head (device mem), zero tail (host mem), clear trigger slots
     for (int t = 0; t < s->num_proxy_threads; t++) {
         cudaMemset(s->fifos[t].device.head, 0, sizeof(uint64_t));
@@ -930,13 +802,6 @@ inline void commit_epoch(Session* s, uint32_t epoch) {
     for (int t = 0; t < s->num_proxy_threads; t++) {
         s->proxies[t]->resume();
     }
-#else
-    // IBGDA: nothing FIFO-like to reset. The per-QP pi/ci counters should
-    // already match (prepare_epoch drained to ci == pi). Leave them —
-    // monotonic counters wrap naturally at 2^64.
-    (void)s;
-    cudaDeviceSynchronize();
-#endif
 }
 
 /**
@@ -955,7 +820,6 @@ inline void stage_barrier(Session* s, int slot, uint32_t token) {
         exit(EXIT_FAILURE);
     }
 
-#if !defined(INTERNODE_BACKEND_IBGDA)
     cudaDeviceSynchronize();
     drain_proxy(s);
     for (int t = 0; t < s->num_proxy_threads; t++) {
@@ -984,97 +848,6 @@ inline void stage_barrier(Session* s, int slot, uint32_t token) {
     fprintf(stderr, "stage_barrier timeout: slot=%d token=%u observed=%u\n",
             slot, token, s->stage_barrier.host_ptr[slot]);
     exit(EXIT_FAILURE);
-#else
-    // IBGDA: drain any GPU-side WQEs, then use host-side ibv_post_send on QP 0
-    // to publish the barrier token. The SQ is quiescent after
-    // cudaDeviceSynchronize + reaper catches up, so ibv_post_send on the
-    // shared QP is safe. After the send completes we poll our arrival slot.
-    // NOTE: libmlx5 will advance its internal SQ PI by 1 here, which means
-    // on the next GPU push, our d_pi_counter and libmlx5's PI disagree.
-    // To keep them in sync we bump d_pi_counter and dbrec_ring_cursor by 1
-    // after the post — so device arithmetic "slot = pi++" still matches.
-    cudaDeviceSynchronize();
-    if (s->ibgda_rt) {
-        std::vector<uint64_t> need(s->ibgda_rt->num_qps, 0);
-        for (int i = 0; i < s->ibgda_rt->num_qps; ++i) {
-            IbgdaQpState& q = s->ibgda_rt->qps[i];
-            if (!q.d_pi_counter) continue;
-            uint64_t pi = 0;
-            cudaMemcpy(&pi, q.d_pi_counter, sizeof(pi), cudaMemcpyDeviceToHost);
-            need[i] = pi;
-        }
-        ibgda_drain_cqs_host(*s->ibgda_rt, need.data(), /*max_spin_ms=*/5000);
-    }
-    // Build a host-side 4-byte RDMA_WRITE of `token` into the peer's
-    // stage_barrier slot using ibv_post_send on QP 0.
-    static uint32_t token_scratch;
-    token_scratch = token;
-    // Register a tiny MR for the token if we haven't already (leaked at
-    // session teardown — acceptable for barrier-rate operations).
-    static ibv_mr* token_mr = nullptr;
-    static Session* token_mr_session = nullptr;
-    if (token_mr_session != s) {
-        if (token_mr) ibv_dereg_mr(token_mr);
-        token_mr = ibv_reg_mr(s->pd, &token_scratch, sizeof(token_scratch),
-                              IBV_ACCESS_LOCAL_WRITE);
-        token_mr_session = s;
-        if (!token_mr) {
-            fprintf(stderr, "stage_barrier(IBGDA): ibv_reg_mr failed: %s\n",
-                    strerror(errno));
-            exit(EXIT_FAILURE);
-        }
-    }
-    ibv_sge sge{};
-    sge.addr   = (uintptr_t)&token_scratch;
-    sge.length = sizeof(token_scratch);
-    sge.lkey   = token_mr->lkey;
-    ibv_send_wr wr{}, *bad = nullptr;
-    wr.opcode             = IBV_WR_RDMA_WRITE;
-    wr.send_flags         = IBV_SEND_SIGNALED;
-    wr.sg_list            = &sge;
-    wr.num_sge            = 1;
-    wr.wr.rdma.remote_addr = s->remote_info.barrier_addr + slot * sizeof(uint32_t);
-    wr.wr.rdma.rkey        = s->remote_info.barrier_rkey;
-    if (ibv_post_send(s->qp, &wr, &bad) != 0) {
-        fprintf(stderr, "stage_barrier(IBGDA): ibv_post_send failed: %s\n",
-                strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-    // Poll CQ for our completion (take ownership of just this one CQE).
-    ibv_wc wc{};
-    for (int spin = 0; spin < 500000; ++spin) {
-        int n = ibv_poll_cq(s->cq, 1, &wc);
-        if (n == 1) {
-            if (wc.status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "stage_barrier(IBGDA): CQE status=%d\n",
-                        (int)wc.status);
-                exit(EXIT_FAILURE);
-            }
-            // Account for the host-posted SQ slot in our device counters
-            // so the GPU's next push() computes the correct pi. (No ci
-            // counter under the reaper-less design; retired_shadow for the
-            // drain tracking is already bumped by ibv_poll_cq above.)
-            if (s->ibgda_rt && s->ibgda_rt->num_qps > 0) {
-                IbgdaQpState& q = s->ibgda_rt->qps[0];
-                uint64_t pi = 0;
-                cudaMemcpy(&pi, q.d_pi_counter, sizeof(pi), cudaMemcpyDeviceToHost);
-                pi += 1;
-                cudaMemcpy(q.d_pi_counter, &pi, sizeof(pi), cudaMemcpyHostToDevice);
-                cudaMemcpy(q.d_dbrec_ring_cursor, &pi, sizeof(pi), cudaMemcpyHostToDevice);
-                q.retired_shadow += 1;
-            }
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(2));
-    }
-    for (int i = 0; i < 50000; i++) {
-        if (s->stage_barrier.host_ptr[slot] == token) return;
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
-    fprintf(stderr, "stage_barrier(IBGDA) timeout: slot=%d token=%u observed=%u\n",
-            slot, token, s->stage_barrier.host_ptr[slot]);
-    exit(EXIT_FAILURE);
-#endif
 }
 
 /**
@@ -1087,37 +860,28 @@ inline void set_epoch(Session* s, uint32_t epoch) {
 
 /** Get proxy first-message latency timestamps for diagnostics. */
 inline ProxyTimestamps get_proxy_timestamps(const Session* s) {
-#if !defined(INTERNODE_BACKEND_IBGDA)
     return s->proxies[0]->get_timestamps();
-#else
-    (void)s;
-    return ProxyTimestamps{};
-#endif
 }
 
 inline std::vector<ProxyDiagnostics> get_proxy_diagnostics(const Session* s) {
     std::vector<ProxyDiagnostics> out;
     if (!s) return out;
-#if !defined(INTERNODE_BACKEND_IBGDA)
     out.reserve((size_t)s->num_proxy_threads);
     for (int t = 0; t < s->num_proxy_threads; t++) {
         if (s->proxies[t] == nullptr) continue;
         out.push_back(s->proxies[t]->get_diagnostics());
     }
-#endif
     return out;
 }
 
 inline std::vector<ProxyTimeline> get_proxy_timelines(const Session* s) {
     std::vector<ProxyTimeline> out;
     if (!s) return out;
-#if !defined(INTERNODE_BACKEND_IBGDA)
     out.reserve((size_t)s->num_proxy_threads);
     for (int t = 0; t < s->num_proxy_threads; t++) {
         if (s->proxies[t] == nullptr) continue;
         out.push_back(s->proxies[t]->get_timeline());
     }
-#endif
     return out;
 }
 
