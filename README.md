@@ -7,9 +7,9 @@
 
 ## Highlights
 
-- **Multi-GPU + multi-node, in one kernel.** Intra-node NVLink and inter-node live inside the same kernel — the GEMM, the intra-collective, and the inter-node transfer are interleaved at tile granularity, not stitched at the host.
-- **Fine-grained intra-kernel overlapping.** Compute and communication overlap *within* a single kernel at tile/chunk granularity — producer CTAs release tiles via on-chip flags the moment they're ready, and consumer CTAs (intra-comm / inter-send / inter-reduce) pick them up immediately.
-- **Persistent kernel with SM specialization.** All 132 SMs on each H200 are claimed at launch and stay resident; CTAs self-assign roles, such as compute / intra-comm / inter-send / inter-reduce. 
+- **Multi-GPU + multi-node, in one kernel.** Intra-node NVLink and inter-node live inside the same kernel.
+- **Fine-grained intra-kernel overlapping.** Compute and communication overlap at tile/chunk granularity, covering both intra-node and inter-node communication
+- **Persistent kernel with SM specialization.** CTAs self-assign roles, such as compute / intra-comm / inter-send / inter-reduce. 
 - **GPU-driven networking, built from scratch.** Libibverbs with GPU-initiated communication. No NCCL/NVSHMEM dependency. 
 
 ## Roadmap
