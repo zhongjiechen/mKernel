@@ -95,11 +95,7 @@ __device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 7; }
  */
 __device__ __forceinline__ int laneid() { return threadIdx.x & 0x1f; }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 constexpr int MAX_SHARED_MEMORY = 227 * 1024;
-#elif defined(KITTENS_AMPERE)
-constexpr int MAX_SHARED_MEMORY = 164 * 1024;
-#endif
 
 /**
  * @brief Query the number of SMs on a device.
@@ -219,11 +215,7 @@ __device__ inline float2 packed_shfl_sync<float2>(uint32_t mask, const float2 &f
 #define KITTENS_ALIGN_AS(n) alignas(n)
 #endif
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 #define KITTENS_DEFAULT_ALIGN KITTENS_ALIGN_AS(128)
-#else
-#define KITTENS_DEFAULT_ALIGN KITTENS_ALIGN_AS(16)
-#endif
 
 /**
  * @brief Perform a ceiling division operation.
@@ -245,11 +237,7 @@ struct KITTENS_DEFAULT_ALIGN alignment_dummy { int dummy; };
  * @brief Very simple allocator for dynamic shared memory. Advances pointer and tracks alignments.
  * @tparam default_alignment The default alignment this allocator will enforce. If <=0 (default -1) it will not align.
  */
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 template<int default_alignment=1024> 
-#else
-template<int default_alignment=16> 
-#endif
 struct shared_allocator {
     int *ptr;
 
@@ -317,7 +305,6 @@ public:
     }
 };
 
-#if (defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL))
 /**
  * @brief A wrapper for an allocator that enforces sufficient alignment to be used for TMA loads and stores.
  */
@@ -339,7 +326,6 @@ __device__ static inline int cluster_ctarank() {
     asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(ctarank));
     return ctarank;
 }
-#endif
 
 template<int half>
 __device__ static inline int get_phasebit(uint32_t bitfield, int ring_id) {

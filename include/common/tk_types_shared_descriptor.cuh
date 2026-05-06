@@ -5,7 +5,6 @@
 
 #pragma once
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 
 #include "tk_common_common.cuh"
 #include "tk_types_shared_st.cuh"
@@ -29,13 +28,7 @@ __device__ static inline uint64_t matrix_descriptor_raw(
     uint32_t stride_dim_offset,
     uint32_t swizzle_mode
 ) {
-#ifdef KITTENS_BLACKWELL
-    // see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-shared-memory-descriptor
-    return matrix_descriptor_encode(reinterpret_cast<uint64_t>(addr)) | 
-           (1llu << 46) | // needed for blackwell shared memory descriptors
-#else
     return matrix_descriptor_encode(reinterpret_cast<uint64_t>(addr)) |
-#endif
            matrix_descriptor_encode((uint64_t)leading_dim_offset) << 16 |
            matrix_descriptor_encode((uint64_t)stride_dim_offset) << 32 |
            (uint64_t)swizzle_mode << 62;
@@ -122,4 +115,3 @@ template<typename T> using get_st = typename st_getter<T>::type;
 
 } // namespace kittens
 
-#endif

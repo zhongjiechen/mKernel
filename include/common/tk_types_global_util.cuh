@@ -36,7 +36,6 @@ namespace detail {
 template<typename T> concept tile = ducks::st::all<T> || ducks::rt::all<T>;
 template<typename T> concept vec  = ducks::sv::all<T> || ducks::rv::all<T>;
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 namespace tma {
 
 __host__ static inline std::string format_tma_error(
@@ -109,7 +108,6 @@ __host__ static inline std::string format_tma_error(
 }
 
 } // namespace tma
-#endif // defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 } // namespace detail
 
 namespace ducks {

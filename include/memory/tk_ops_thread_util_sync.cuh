@@ -75,7 +75,6 @@ template<int num_warps> __device__ static inline void arrive(barrier<num_warps> 
     asm volatile("bar.arrive %0, %1;\n" :: "r"(bar.barrier_id), "n"(num_warps*WARP_THREADS) : "memory");
 }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 /**
 * @brief Arrives at a semaphore.
 *
@@ -93,7 +92,6 @@ __device__ static inline void arrive(semaphore& sem, uint32_t count) {
         : "memory"
     );
 }
-#endif
 
 /**
 * @brief Waits for the requested semaphore phase.
@@ -105,7 +103,6 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
     void const* const ptr = &sem;
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr)); 
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
     asm volatile (
         "{\n"
         ".reg .pred                P1;\n"
@@ -118,24 +115,8 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
         :: "r"(mbar_ptr),
         "r"(kPhaseBit)
     );
-#else
-    asm volatile (
-        "{\n"
-        ".reg .pred                P1;\n"
-        "LAB_WAIT:\n"
-        "mbarrier.test_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-        "@P1                       bra.uni DONE;\n"
-        "nanosleep.u32 5;\n" // wait a few nanoseconds on pre-Hopper architectures to save instruction issue slots
-        "bra.uni                   LAB_WAIT;\n"
-        "DONE:\n"
-        "}\n"
-        :: "r"(mbar_ptr),
-        "r"(kPhaseBit)
-    );
-#endif
 }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 __device__ static inline bool try_wait(semaphore &sem, int kPhaseBit) {
     void const* const ptr = &sem;
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr)); 
@@ -154,13 +135,11 @@ __device__ static inline bool try_wait(semaphore &sem, int kPhaseBit) {
 
     return static_cast<bool>(success);
 }
-#endif
 
 __device__ static inline void careful_wait(semaphore& sem, int kPhaseBit) {
     void const* const ptr = &sem;
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
     asm volatile (
         "{\n"
         ".reg .b64                 start_clock, current_clock;\n"
@@ -180,21 +159,6 @@ __device__ static inline void careful_wait(semaphore& sem, int kPhaseBit) {
         :: "r"(mbar_ptr),
         "r"(kPhaseBit)
     );
-#else
-    asm volatile (
-        "{\n"
-        ".reg .pred                P1;\n"
-        "LAB_WAIT:\n"
-        "mbarrier.test_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-        "@P1                       bra.uni DONE;\n"
-        "nanosleep.u32 5;\n" // wait a few nanoseconds on pre-Hopper architectures to save instruction issue slots
-        "bra.uni                   LAB_WAIT;\n"
-        "DONE:\n"
-        "}\n"
-        :: "r"(mbar_ptr),
-        "r"(kPhaseBit)
-    );
-#endif
 }
 
 /**
@@ -255,22 +219,5 @@ template<typename T, typename... Args> inline constexpr uint32_t size_bytes<T, A
 
 /* ----------   TCGEN05 synchronization  ---------- */
 
-#if defined(KITTENS_BLACKWELL)
-
-__device__ static inline void tensor_before_thread_sync() {
-    asm volatile("tcgen05.fence::before_thread_sync;\n");
-}
-__device__ static inline void tensor_after_thread_sync() {
-    asm volatile("tcgen05.fence::after_thread_sync;\n");
-}
-
-__device__ inline static void tensor_load_wait() {
-   asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
-__device__ inline static void tensor_store_wait() {
-   asm volatile("tcgen05.wait::st.sync.aligned;"); 
-}
-
-#endif
 
 } // namespace kittens

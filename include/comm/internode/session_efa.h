@@ -36,64 +36,7 @@
 #include "proxy_diagnostics.h"
 
 
-#ifdef Q2_PROBE_PROXY_TAIL
-#include <limits>
-#endif
-
 namespace internode {
-
-#ifdef Q2_PROBE_PROXY_TAIL
-// Iter 30 probe: local helpers to calibrate the GPU %globaltimer → host
-// CLOCK_MONOTONIC offset once per session. Same math as session.h:54-83 but
-// defined inside the EFA session header (session.h is not included on the
-// EFA path; proxy.h's CX7 backend owns the canonical copy). Gated entirely
-// behind Q2_PROBE_PROXY_TAIL so canonical builds are byte-identical.
-inline uint64_t q2_probe_host_now_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-__global__ inline void q2_probe_read_globaltimer_kernel(unsigned long long* out) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        unsigned long long t;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-        out[0] = t;
-    }
-}
-
-inline int64_t calibrate_gpu_to_host_offset_ns(int samples = 32) {
-    if (samples <= 0) samples = 1;
-    unsigned long long* dev_out = nullptr;
-    unsigned long long host_out = 0;
-    cudaStream_t stream = nullptr;
-    OSGC_CUDACHECK(cudaMalloc(&dev_out, sizeof(unsigned long long)));
-    OSGC_CUDACHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-    uint64_t best_window_ns = std::numeric_limits<uint64_t>::max();
-    int64_t best_offset_ns = 0;
-    for (int i = 0; i < samples; ++i) {
-        const uint64_t host_before_ns = q2_probe_host_now_ns();
-        q2_probe_read_globaltimer_kernel<<<1, 1, 0, stream>>>(dev_out);
-        OSGC_CUDACHECK(cudaGetLastError());
-        OSGC_CUDACHECK(cudaMemcpyAsync(
-            &host_out, dev_out, sizeof(unsigned long long),
-            cudaMemcpyDeviceToHost, stream));
-        OSGC_CUDACHECK(cudaStreamSynchronize(stream));
-        const uint64_t host_after_ns = q2_probe_host_now_ns();
-        const uint64_t window_ns = host_after_ns - host_before_ns;
-        if (window_ns < best_window_ns) {
-            best_window_ns = window_ns;
-            const uint64_t host_mid_ns = host_before_ns + window_ns / 2ULL;
-            best_offset_ns = (int64_t)host_mid_ns - (int64_t)host_out;
-        }
-    }
-
-    OSGC_CUDACHECK(cudaStreamDestroy(stream));
-    OSGC_CUDACHECK(cudaFree(dev_out));
-    return best_offset_ns;
-}
-#endif
 
 // Match CX7: two stage-barrier slots per session.
 static constexpr int kEfaStageBarrierSlots = 2;
@@ -550,15 +493,6 @@ inline Session* create_session(const SessionConfig& cfg) {
         s->rails[r].dst_ah = rdma::create_ah(s->rails[r].pd, remote_gid);
     }
 
-#ifdef Q2_PROBE_PROXY_TAIL
-    // Iter 30 probe: calibrate the GPU %globaltimer → host CLOCK_MONOTONIC
-    // offset once per session. Used by proxy_efa.h's account_polled_cmd_for_probe_
-    // helper to convert the kernel's `cmd.enqueue_device_ns` (GPU domain)
-    // into the host domain for enqueue→seen delta computation. Matches the
-    // CX7 backend pattern (session.h:414, pcfg.gpu_to_host_offset_ns line 451).
-    const int64_t gpu_to_host_offset_ns = calibrate_gpu_to_host_offset_ns(64);
-#endif
-
     // --- 9. Spawn proxy threads. Each proxy handles QPs on its assigned rail.
     for (int t = 0; t < num_proxy_threads; t++) {
         const int qp_base = t * qps_per_proxy;
@@ -640,6 +574,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         pcfg.remote_flags_addr = s->remote_info.flags_addr;
         pcfg.remote_flags_rkey = remote_flags_rkey;
 
+        pcfg.use_arrival_queue   = cfg.use_arrival_queue;
         pcfg.remote_queue_stride = (uint32_t)logical_queue_stride;
         pcfg.remote_tail_addr    = s->remote_info.tail_addr;
         pcfg.remote_tail_rkey    = remote_tail_rkey;
@@ -672,13 +607,6 @@ inline Session* create_session(const SessionConfig& cfg) {
         pcfg.sq_depth     = s->sq_depth;
         pcfg.device_id    = cfg.device_id;
         pcfg.pin_proxy    = cfg.pin_proxy;
-
-#ifdef Q2_PROBE_PROXY_TAIL
-        // Iter 30 probe: pass the pre-calibrated GPU→host offset to each proxy
-        // so account_polled_cmd_for_probe_ can compute enqueue_to_seen deltas
-        // in the host clock domain.
-        pcfg.gpu_to_host_offset_ns = gpu_to_host_offset_ns;
-#endif
 
         s->proxies[t] = new Proxy(pcfg);
         s->proxies[t]->start();

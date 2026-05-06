@@ -570,6 +570,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         pcfg.remote_flags_rkey = s->remote_info.flags_rkey;
         pcfg.remote_tail_addr = s->remote_info.tail_addr;
         pcfg.remote_tail_rkey = s->remote_info.tail_rkey;
+        pcfg.use_arrival_queue   = cfg.use_arrival_queue;
         pcfg.remote_queue_stride = (uint32_t)logical_queue_stride;
         pcfg.logical_queues_per_qp = logical_queues_per_qp;
         pcfg.enable_remote_tail = (std::getenv("Q2_SENDER_PUBLISHED_TAIL") != nullptr
