@@ -242,9 +242,14 @@ def main():
 
         staging_buf = torch.empty(staging_bytes // 2, device="cuda", dtype=torch.bfloat16)
 
+        # Per-peer sizing (1× at N == 2, identical to legacy).
+        n_peers = NUM_NODES - 1
+        recv_buf_bytes = n_peers * staging_bytes
+        recv_buf_tiles = n_peers * total_tiles
+
         dist.barrier()
         fifo_cap = 2048
-        while fifo_cap < total_tiles * 2: fifo_cap *= 2
+        while fifo_cap < recv_buf_tiles * 2: fifo_cap *= 2
         clocal_ptr = int(C_pgl.data_.data_ptr())
         clocal_bytes = int(C_pgl.data_.numel() * C_pgl.data_.element_size())
         row_stride_bytes = N * 2
@@ -252,7 +257,7 @@ def main():
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             staging_buf.data_ptr(), staging_bytes,
-            staging_bytes, total_tiles, fifo_cap, local_rank,
+            recv_buf_bytes, recv_buf_tiles, fifo_cap, local_rank,
             clocal_ptr, clocal_bytes, row_stride_bytes,
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),

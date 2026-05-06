@@ -72,20 +72,30 @@ __device__ inline void fused_inter_send_sm(const fused_globals &G) {
 
 __device__ inline void fused_inter_copy_sm(const fused_globals &G) {
     int copy_id = blockIdx.x - G.num_send_sms;
+    // Multi-peer: arrival_flags is laid out [peer_slot * total_chunks + chunk_id].
+    // For each chunk, wait for all (N-1) peers to deposit their copy. At
+    // N == 2 the loop runs once with slot == 0 — same flag offset and same
+    // wait pattern as the legacy code. Per-peer copy_ready / peer_tokens
+    // merging across slots is the per-kernel testbed-side step.
+    const int n_peers = G.num_nodes - 1;
+    const int single_peer_chunks = G.total_chunks;
     for (int chunk_id = copy_id; chunk_id < G.total_chunks; chunk_id += G.num_copy_sms) {
         if (threadIdx.x == 0) {
-            uint32_t v;
-            do {
-                // Proxy path: ld.acquire.sys.global is the synchronization
-                // edge — pairs with proxy's st.release.sys, no separate
-                // __threadfence_system needed (DeepEP-style).
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
-                             : "=r"(v)
-                             : "l"((uint32_t*)&G.arrival_flags[chunk_id])
-                             : "memory");
-                if (v == G.epoch) break;
-                __nanosleep(100);
-            } while (true);
+            for (int slot = 0; slot < n_peers; ++slot) {
+                uint32_t v;
+                const int flag_idx = slot * single_peer_chunks + chunk_id;
+                do {
+                    // Proxy path: ld.acquire.sys.global is the synchronization
+                    // edge — pairs with proxy's st.release.sys, no separate
+                    // __threadfence_system needed (DeepEP-style).
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                                 : "=r"(v)
+                                 : "l"((uint32_t*)&G.arrival_flags[flag_idx])
+                                 : "memory");
+                    if (v == G.epoch) break;
+                    __nanosleep(100);
+                } while (true);
+            }
         }
         __syncthreads();
 

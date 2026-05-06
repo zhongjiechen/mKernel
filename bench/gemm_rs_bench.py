@@ -165,8 +165,11 @@ def main():
         os.environ["GEMM_RS_RDMA_CHUNK_TILES_RT"] = str(chunk_tiles)
 
         staging_bytes = m_local * n * 2  # bf16
-        recv_bytes = staging_bytes
-        total_inter_tiles = (m_local // ROW_BLOCK) * (n // COL_BLOCK)
+        # Per-peer sizing (1× at N == 2, identical to legacy).
+        n_peers = NUM_NODES - 1
+        recv_bytes = n_peers * staging_bytes
+        per_peer_inter_tiles = (m_local // ROW_BLOCK) * (n // COL_BLOCK)
+        total_inter_tiles = n_peers * per_peer_inter_tiles
         fifo_cap = 2048
         while fifo_cap < total_inter_tiles * 2:
             fifo_cap *= 2

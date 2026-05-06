@@ -155,14 +155,30 @@ struct globals {
 // CQ each iteration; on RX-IMM CQE the helper publishes the imm into
 // arrival_flags via st.release.gpu.global. Reader uses .gpu scope (writer
 // is a local CTA on same GPU L2).
-__device__ __forceinline__ void ag_gemm_wait_arrival(const globals& G, int ck) {
+__device__ __forceinline__ void ag_gemm_wait_arrival_one(const globals& G, int slot_ck) {
     uint32_t v;
     do {
         asm volatile("ld.volatile.global.u32 %0, [%1];"
-            : "=r"(v) : "l"((uint32_t*)&G.arrival_flags[ck]) : "memory");
+            : "=r"(v) : "l"((uint32_t*)&G.arrival_flags[slot_ck]) : "memory");
         if (v == G.epoch) break;
         __nanosleep(100);
     } while (true);
+}
+
+// Wait for chunk `ck` to arrive from EVERY peer slot. The arrival_flags array
+// is laid out [peer_slot * total_chunks + ck]; at N == 2 the loop runs once
+// with slot == 0, indexing arrival_flags[ck] exactly as the legacy single-
+// peer code did. At N > 2 it waits on (N-1) flags before returning.
+//
+// The caller is still responsible for actually consuming each peer's data —
+// today it reads only A_recv (slot 0). Per-peer data merging is the
+// per-kernel testbed-side step that follows from this wait being multi-
+// peer-correct.
+__device__ __forceinline__ void ag_gemm_wait_arrival(const globals& G, int ck) {
+    const int n_peers = G.num_nodes - 1;
+    for (int slot = 0; slot < n_peers; ++slot) {
+        ag_gemm_wait_arrival_one(G, slot * G.total_chunks + ck);
+    }
 }
 
 

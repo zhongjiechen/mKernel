@@ -564,16 +564,26 @@ __device__ inline void kv_copy_sm(const kv_exchange_globals &G) {
     int copy_id = blockIdx.x - G.num_send_sms;
     int total_chunks = G.total_chunks_K + G.total_chunks_V;
 
+    // Multi-peer: arrival_flags is laid out [peer_slot * total_chunks + chunk_id].
+    // For each chunk, wait for all (N-1) peers' KV writes. At N == 2 the loop
+    // runs once with slot == 0 — same flag offset / same wait pattern as today.
+    // Per-peer K_recv/V_recv merging into the ring's intra-node loop is the
+    // per-kernel testbed-side step.
+    const int n_peers = G.num_nodes - 1;
+    const int single_peer_chunks = total_chunks;
     for (int chunk_id = copy_id; chunk_id < total_chunks; chunk_id += G.num_copy_sms) {
-        // Wait for this chunk's arrival
+        // Wait for this chunk's arrival from every peer slot.
         if (threadIdx.x == 0) {
-            uint32_t v;
-            do {
-                asm volatile("ld.volatile.global.u32 %0, [%1];"
-                             : "=r"(v) : "l"((uint32_t*)&G.arrival_flags[chunk_id]) : "memory");
-                if (v == G.epoch) break;
-                __nanosleep(100);
-            } while (true);
+            for (int slot = 0; slot < n_peers; ++slot) {
+                uint32_t v;
+                const int flag_idx = slot * single_peer_chunks + chunk_id;
+                do {
+                    asm volatile("ld.volatile.global.u32 %0, [%1];"
+                                 : "=r"(v) : "l"((uint32_t*)&G.arrival_flags[flag_idx]) : "memory");
+                    if (v == G.epoch) break;
+                    __nanosleep(100);
+                } while (true);
+            }
         }
         __syncthreads();
         __threadfence_system();

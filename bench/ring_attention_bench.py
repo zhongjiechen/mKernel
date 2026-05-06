@@ -137,17 +137,22 @@ def main():
         send_buf_ptr = send_buf.data_ptr()
         total_chunks = (kv_buf_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
 
+        # Per-peer sizing (1× at N == 2, identical to legacy).
+        n_peers = NUM_NODES - 1
+        recv_buf_chunks = n_peers * total_chunks
+        recv_buf_bytes = n_peers * kv_buf_bytes
+
         dist.barrier()
         fifo_cap = 2048
-        while fifo_cap < total_chunks * 2: fifo_cap *= 2
+        while fifo_cap < recv_buf_chunks * 2: fifo_cap *= 2
 
         # Zero-copy send: K0 and V0 are registered as DMA-BUF MRs. Proxy
         # posts single-SGE WRs straight from the VMM tensors — no pack.
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
-            send_buf_ptr, kv_buf_bytes, kv_buf_bytes,
-            total_chunks, fifo_cap, local_rank,
+            send_buf_ptr, kv_buf_bytes, recv_buf_bytes,
+            recv_buf_chunks, fifo_cap, local_rank,
             int(K0.data_.data_ptr()), k_bytes,
             int(V0.data_.data_ptr()), v_bytes,
             peer_ips=peer_ips,

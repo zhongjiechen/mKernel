@@ -137,9 +137,17 @@ def main():
         a_half_bytes = M_half * K * 2
         total_chunks = (a_half_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
 
+        # Per-peer recv_buf / arrival flag scaling. At N == 2 the multiplier
+        # is 1 — single-peer-sized, identical to the legacy allocation. At
+        # N > 2 the receiver gets one slot of size a_half_bytes + total_chunks
+        # arrival flag entries per sender.
+        n_peers = NUM_NODES - 1
+        recv_buf_bytes = n_peers * a_half_bytes
+        recv_buf_chunks = n_peers * total_chunks
+
         dist.barrier()
         fifo_cap = 2048
-        while fifo_cap < total_chunks * 2: fifo_cap *= 2
+        while fifo_cap < recv_buf_chunks * 2: fifo_cap *= 2
         a_tk_ptr = int(a_tk.data_.data_ptr())
         print(f"[ag_gemm] node{node_idx}/lr{local_rank} pre create_session peer={peer_ip}:{tcp_port}", flush=True)
         # Both MR0 (local_gpu_buf, src_view=0) and MR1 (clocal_gpu_buf, src_view=1)
@@ -148,8 +156,8 @@ def main():
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
-            a_tk_ptr, a_half_bytes, a_half_bytes,
-            total_chunks, fifo_cap, local_rank,
+            a_tk_ptr, a_half_bytes, recv_buf_bytes,
+            recv_buf_chunks, fifo_cap, local_rank,
             clocal_buf_ptr=a_tk_ptr, clocal_buf_size=a_half_bytes,
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),

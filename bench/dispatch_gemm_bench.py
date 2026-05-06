@@ -250,9 +250,14 @@ def main():
         send_buf = torch.empty((num_local_tokens, H),
                                 device="cuda", dtype=torch.bfloat16)
 
+        # Per-peer sizing. At N == 2 the multiplier is 1 — same buffer /
+        # arrival-flag sizing as the legacy single-peer setup.
+        n_peers = NUM_NODES - 1
+        recv_buf_chunks = n_peers * total_chunks
+
         dist.barrier()
         fifo_cap = 2048
-        while fifo_cap < total_chunks * 2:
+        while fifo_cap < recv_buf_chunks * 2:
             fifo_cap *= 2
 
         # ZERO_COPY baked on: peer_tokens IS the RDMA destination.
@@ -265,7 +270,7 @@ def main():
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             send_buf.data_ptr(), pre_tokens_bytes,
-            pre_tokens_bytes, total_chunks, fifo_cap, local_rank,
+            n_peers * pre_tokens_bytes, recv_buf_chunks, fifo_cap, local_rank,
             external_recv_buf_ptr,
             int(pre_tokens.data_.data_ptr()),
             pre_tokens_bytes,
