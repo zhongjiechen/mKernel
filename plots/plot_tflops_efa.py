@@ -4,7 +4,7 @@
 Reads release/bench/results/<topic>_{efa,nccl}.json and release/bench/cx7_reference.json,
 emits release/plots/<topic>_efa.png plus a 5-panel overview chart.
 
-Per INSTRUCTION.md §8: 3 series only (NCCL, Ours, cx7-as-line). Drop EFAGDA,
+Per INSTRUCTION.md §8: 3 series only (NCCL, Ours, cx7-as-line). Drop
 Triton-distributed, Flux, Mercury, error bars, correctness checkmark row.
 """
 from __future__ import annotations
@@ -78,7 +78,7 @@ WORLD = 16
 #
 #   ag_gemm ag_gemm     (K=M, N=M/16) -- src/ag_gemm.cu:
 #     FLOPs   = M^3 / 8
-#     B_intra = 15 M^2 / 8   (compute reads 15/16 of full A from local PGL +
+#     B_intra = 15 M^2 / 8   (compute reads 15/16 of full A from local dbuf +
 #                             A_recv_gl over NVLink IPC; intra-multicast
 #                             gather pipelines into this read)
 #     B_inter = M^2 / 8      (each GPU RDMA-sends its M/16 rows of A to
@@ -112,7 +112,7 @@ WORLD = 16
 #     FLOPs   = 2 * N_tok * TOPK * H * I / W = 1.47e7 * N_tok
 #     B_intra = (N_tok/2) * H * 2 = 7168 * N_tok
 #                  (each GPU owns E/W=16 experts, each gets N_tok*TOPK/E
-#                   = N_tok/32 tokens, so it pulls N_tok/2 tokens via PGL
+#                   = N_tok/32 tokens, so it pulls N_tok/2 tokens via dbuf
 #                   over NVLink during dispatch)
 #     B_inter = (N_tok/W) * H * 2 = 896 * N_tok
 #                  (Phase-1 RDMA push of the whole local pre_tokens buffer

@@ -1,8 +1,7 @@
 """dispatch_gemm MoE Dispatch + Group GEMM bench (release version).
 
-Mirrors experiments/multinode/question3_moe_dispatch_gemm/benchmark_moe_dispatch_multinode.py
-but uses the prebuilt release/build/libdispatch_gemm.so (no JIT) and bakes the
-on-by-default dispatch_gemm env vars to the canonical config from INSTRUCTION.md §2:
+Runs the prebuilt release/build/libdispatch_gemm.so (no JIT) with the default
+dispatch_gemm configuration:
 
     DISPATCH_LOCAL_FIRST=1, DISPATCH_ZERO_COPY=1, DISPATCH_DISPATCH_PIPELINE=1, fused exec mode.
     CHUNK_BYTES=512KB (baked in src/dispatch_gemm.cu).
@@ -22,7 +21,7 @@ from pathlib import Path
 
 # Required for multicast bind on this hardware/setup. Must be set BEFORE
 # importing the prebuilt module since the bind logic reads getenv at C++ time.
-os.environ["OSGC_BIND_RETAINED_HANDLE"] = "1"
+os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
 
 import torch
 import torch.distributed as dist
@@ -152,7 +151,7 @@ def main():
 
     mod = load_module.load(KERNEL_NAME)
     print(f"[dispatch_gemm] node{node_idx}/lr{local_rank} loaded mod, peer_ip={peer_ip} "
-          f"tcp_port={tcp_port} OSGC_BIND={os.environ.get('OSGC_BIND_RETAINED_HANDLE','-')}", flush=True)
+          f"tcp_port={tcp_port} MKERNEL_BIND={os.environ.get('MKERNEL_BIND_RETAINED_HANDLE','-')}", flush=True)
 
     if is_chief:
         print(f"[dispatch_gemm] world={world_size*NUM_NODES} per_node={world_size} "

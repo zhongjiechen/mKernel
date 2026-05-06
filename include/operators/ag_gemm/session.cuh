@@ -5,7 +5,7 @@
 // ============================================================================
 // Session management
 // ============================================================================
-#include "comm/internode/session_select.h"
+#include "comm/internode/session_py.cuh"
 
 static internode::Session* g_session = nullptr;
 
@@ -15,20 +15,11 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int fifo_capacity, int device_id,
                        int64_t clocal_buf_ptr = 0,
                        int64_t clocal_buf_size = 0) {
-    if (g_session) {
-        internode::destroy_session(g_session);
-        g_session = nullptr;
-    }
-    internode::SessionConfig cfg{};
-    cfg.rank = rank;
-    cfg.peer_ip = peer_ip.c_str();
-    cfg.tcp_port = tcp_port;
-    cfg.local_gpu_buf = reinterpret_cast<void*>(send_buf_ptr);
-    cfg.local_gpu_buf_size = (size_t)send_buf_size;
-    cfg.recv_buf_size = (size_t)recv_buf_size;
-    cfg.num_tiles = num_tiles;
-    cfg.fifo_capacity = fifo_capacity;
-    cfg.device_id = device_id;
+    internode::py::destroy_session(g_session);
+    internode::SessionConfig cfg = internode::py::make_base_config(
+        rank, peer_ip.c_str(), tcp_port,
+        send_buf_ptr, send_buf_size, recv_buf_size,
+        num_tiles, fifo_capacity, device_id);
     cfg.max_inflight = 256;
     if (clocal_buf_ptr == 0 || clocal_buf_size == 0) {
         fprintf(stderr, "create_session_py: AG1 direct sends require clocal_buf_ptr/size\n");
@@ -38,45 +29,33 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     cfg.clocal_gpu_buf_size = (size_t)clocal_buf_size;
     cfg.direct_dmabuf_enabled = true;
     cfg.row_stride_bytes = 0;
-    // Gen-2 Family B (run_11..13): bumped default 4 → 16 QPs per NIC. Under
-    // EARLY_SEND all per-row WRs post at t=0 as a burst; more QPs let the
-    // proxy drain the burst in parallel. QP=16 lifted 4K 0.77× → 0.79× and
-    // 8K 1.07× → 1.11× (geomean 1.028 → 1.058). QP=32 showed no further
-    // gain, so 16 is the knee. Still respects OSGC_EFA_NUM_QPS env override.
+    // Early-send posts per-row WRs in a burst, so use multiple QPs by default.
+    // MKERNEL_EFA_NUM_QPS can still override this.
     cfg.num_qps = 16;
-    if (const char* env_num_qps = std::getenv("OSGC_EFA_NUM_QPS")) {
+    if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
         cfg.num_qps = std::atoi(env_num_qps);
     }
     g_session = internode::create_session(cfg);
 }
 
 void destroy_session_py() {
-    if (g_session) { internode::destroy_session(g_session); g_session = nullptr; }
+    internode::py::destroy_session(g_session);
 }
 
 void set_epoch_py(int epoch) {
-    if (g_session) internode::set_epoch(g_session, (uint32_t)epoch);
+    internode::py::set_epoch(g_session, epoch);
 }
 
 std::tuple<int64_t, int64_t, int64_t, int64_t, int> get_fifo_handles_py() {
-    auto h = internode::get_fifo_device_handle(g_session);
-    // GPU-initiated backends (EFAGDA/IBGDA) always carry a bundle; there's
-    // no host-pinned FIFO tuple to flatten. Force the bundle-pointer path.
-    if (h.num_fifos > 1) {
-        return {(int64_t)(&g_session->fifo_bundle), 0, 0, 0, -h.num_fifos};
-    }
-    auto fd = h.fifos[0];
-    return std::make_tuple(
-        (int64_t)fd.triggers, (int64_t)fd.head, (int64_t)fd.tail,
-        (int64_t)fd.tail_cache, fd.capacity);
+    return internode::py::get_fifo_handles(g_session);
 }
 
 int64_t get_arrival_flags_ptr_py() {
-    return (int64_t)internode::get_arrival_device_ptr(g_session);
+    return internode::py::get_arrival_flags_ptr(g_session);
 }
 
 int64_t get_recv_buf_ptr_py() {
-    return (int64_t)internode::get_recv_buf_ptr(g_session);
+    return internode::py::get_recv_buf_ptr(g_session);
 }
 
 #include <torch/csrc/utils/pybind.h>

@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "../atomic_u32.cuh"
 #include "../../common/cuda_checks.cuh"
 
 #include <cuda_runtime.h>
@@ -61,8 +62,8 @@ inline ArrivalFlags create_arrival_flags(int count, int tail_count = 0) {
     // Remote RDMA writes to this via GDR (nvidia_peermem).
     uint32_t* dev_ptr = nullptr;
     const size_t total_words = (size_t)count + (size_t)flags.tail_count;
-    OSGC_CUDACHECK(cudaMalloc(&dev_ptr, total_words * sizeof(uint32_t)));
-    OSGC_CUDACHECK(cudaMemset(dev_ptr, 0, total_words * sizeof(uint32_t)));
+    MKERNEL_CUDACHECK(cudaMalloc(&dev_ptr, total_words * sizeof(uint32_t)));
+    MKERNEL_CUDACHECK(cudaMemset(dev_ptr, 0, total_words * sizeof(uint32_t)));
     flags.device_ptr = dev_ptr;
     flags.host_ptr = (volatile uint32_t*)dev_ptr;  // same pointer (device mem)
     flags.tail_device_ptr = dev_ptr + count;
@@ -82,12 +83,12 @@ inline ArrivalFlags create_mapped_arrival_flags(int count, int tail_count = 0) {
     flags.tail_count = tail_count > 0 ? tail_count : 0;
     flags.mr = nullptr;
     flags.host_mapped = true;
-    OSGC_CUDACHECK(cudaHostAlloc((void**)&flags.host_ptr,
+    MKERNEL_CUDACHECK(cudaHostAlloc((void**)&flags.host_ptr,
                                  ((size_t)count + (size_t)flags.tail_count) * sizeof(uint32_t),
                                  cudaHostAllocMapped));
     memset((void*)flags.host_ptr, 0,
            ((size_t)count + (size_t)flags.tail_count) * sizeof(uint32_t));
-    OSGC_CUDACHECK(cudaHostGetDevicePointer((void**)&flags.device_ptr,
+    MKERNEL_CUDACHECK(cudaHostGetDevicePointer((void**)&flags.device_ptr,
                                             (void*)flags.host_ptr, 0));
     flags.tail_device_ptr = flags.device_ptr + count;
     flags.tail_host_ptr = flags.host_ptr + count;
@@ -102,7 +103,7 @@ inline void reset_arrival_flags(ArrivalFlags& flags) {
     if (flags.host_mapped) {
         memset((void*)flags.host_ptr, 0, total_words * sizeof(uint32_t));
     } else {
-        OSGC_CUDACHECK(cudaMemset((void*)flags.device_ptr, 0, total_words * sizeof(uint32_t)));
+        MKERNEL_CUDACHECK(cudaMemset((void*)flags.device_ptr, 0, total_words * sizeof(uint32_t)));
     }
 }
 
@@ -138,7 +139,7 @@ inline FlagStaging create_flag_staging(int count = 8) {
     FlagStaging s{};
     s.mr = nullptr;
     s.count = count > 0 ? count : 1;
-    OSGC_CUDACHECK(cudaHostAlloc(&s.host_ptr, s.count * sizeof(uint32_t),
+    MKERNEL_CUDACHECK(cudaHostAlloc(&s.host_ptr, s.count * sizeof(uint32_t),
                                   cudaHostAllocDefault));
     memset(s.host_ptr, 0, s.count * sizeof(uint32_t));
     return s;
@@ -165,11 +166,11 @@ inline StageBarrierFlags create_stage_barrier_flags(int count) {
     StageBarrierFlags flags{};
     flags.count = count;
     flags.mr = nullptr;
-    OSGC_CUDACHECK(cudaHostAlloc((void**)&flags.host_ptr,
+    MKERNEL_CUDACHECK(cudaHostAlloc((void**)&flags.host_ptr,
                                  count * sizeof(uint32_t),
                                  cudaHostAllocMapped));
     memset((void*)flags.host_ptr, 0, count * sizeof(uint32_t));
-    OSGC_CUDACHECK(cudaHostGetDevicePointer((void**)&flags.device_ptr,
+    MKERNEL_CUDACHECK(cudaHostGetDevicePointer((void**)&flags.device_ptr,
                                             (void*)flags.host_ptr, 0));
     return flags;
 }
@@ -199,10 +200,7 @@ __device__ __forceinline__ void wait_arrival(
 {
     uint32_t val;
     do {
-        asm volatile("ld.volatile.global.u32 %0, [%1];"
-                     : "=r"(val)
-                     : "l"((uint32_t*)&flags[tile_id])
-                     : "memory");
+        val = comm::atomic_u32::volatile_load(&flags[tile_id]);
         if (val == expected_epoch) break;
         __nanosleep(100);
     } while (true);

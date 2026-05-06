@@ -1,12 +1,12 @@
 /**
  * @file
- * @brief dist::gl — per-device global-memory layout descriptor.
+ * @brief dist::local_tensor — per-device global-memory tensor descriptor.
  *
- * Standalone replacement for `kittens::gl<>`. Owns a raw device pointer,
+ * Local tensor descriptor. Owns a raw device pointer,
  * compile-time-or-runtime shape (B/D/R/C), and a TMA-descriptor cache keyed
  * by (TileType, axis).
  *
- * TK touch points (intentional, scoped):
+ * Compute/TMA touch points (intentional, scoped):
  *   - Tile metadata types (`kittens::st<...>`, `kittens::sv<...>`) are accepted
  *     as `TileTypes...` template args — POD metadata (rows/cols/swizzle/dtype).
  *     `dist::detail::tma_descriptor<ST>` derives the TMA axis from the duck
@@ -15,7 +15,7 @@
  *     `cuTensorMapEncodeTiled` directly. No `kittens::detail::tma::*` call.
  *
  * No inheritance from `kittens::gl`. Layout, accessors, descriptor cache, and
- * encoder are all defined in this header / its sibling.
+ * encoder are all defined in this header / its siblings.
  */
 
 #pragma once
@@ -27,12 +27,24 @@
 #include <stdexcept>
 #include <string>
 
+#include "coord.cuh"
 #include "tma_encode.cuh"                    // dist::detail::create_tensor_map
 #include "../common/tk_types_shared_st.cuh"  // kittens::st<> + ducks::st concept (POD tile metadata)
 #include "../common/tk_types_shared_sv.cuh"  // kittens::sv<> + ducks::sv concept
-#include "../common/tk_types_global_util.cuh" // kittens::coord<> indexing helper
 
 namespace dist {
+
+namespace tma {
+
+template <typename TensorMapT>
+__device__ inline void prefetch_tensormap(const TensorMapT* desc) {
+    asm volatile("{prefetch.tensormap [%0];}"
+                 :
+                 : "l"(reinterpret_cast<uint64_t>(desc))
+                 : "memory");
+}
+
+} // namespace tma
 
 /* ----------   Compile-time / runtime dimension wrappers  ---------- */
 
@@ -111,7 +123,7 @@ struct tma_dict<ST, Rest...> {
  * @tparam TMA_Types   `kittens::st<>` tile metadata types to pre-build descriptors for.
  */
 template<typename _T, int B, int D, int R, int C, typename... TMA_Types>
-struct gl {
+struct local_tensor {
     using dtype = _T;
     using T     = _T;
 
@@ -126,11 +138,11 @@ struct gl {
     detail::tma_dict<TMA_Types...> tma_descs;
 
     /* ----- ctor ----- */
-    __host__ inline gl(T* data,
-                       detail::arg_t<B> b_arg,
-                       detail::arg_t<D> d_arg,
-                       detail::arg_t<R> r_arg,
-                       detail::arg_t<C> c_arg)
+    __host__ inline local_tensor(T* data,
+                                 detail::arg_t<B> b_arg,
+                                 detail::arg_t<D> d_arg,
+                                 detail::arg_t<R> r_arg,
+                                 detail::arg_t<C> c_arg)
         : raw_ptr(data),
           batch_internal(b_arg), depth_internal(d_arg),
           rows_internal(r_arg),  cols_internal(c_arg),
@@ -140,7 +152,7 @@ struct gl {
                     static_cast<int>(static_cast<size_t>(rows_internal)),
                     static_cast<int>(static_cast<size_t>(cols_internal))) {}
 
-    __host__ __device__ inline gl(const gl& o)
+    __host__ __device__ inline local_tensor(const local_tensor& o)
         : raw_ptr(o.raw_ptr),
           batch_internal(o.batch_internal),
           depth_internal(o.depth_internal),
@@ -148,7 +160,7 @@ struct gl {
           cols_internal(o.cols_internal),
           tma_descs(o.tma_descs) {}
 
-    /* ----- shape accessors (TK-compatible API) ----- */
+    /* ----- shape accessors ----- */
     template<int X = B> __device__ __host__ static constexpr std::enable_if_t<(X > 0), int> batch() { return X; }
     template<int X = B> __device__ __host__ std::enable_if_t<(X == -1), int> batch() const { return (int)(size_t)batch_internal; }
     template<int X = D> __device__ __host__ static constexpr std::enable_if_t<(X > 0), int> depth() { return X; }
@@ -175,8 +187,8 @@ struct gl {
         else                          return 1;
     }
 
-    /* ----- linear access (TK-compatible) ----- */
-    __device__ inline T& operator[](const kittens::coord<kittens::ducks::default_type>& idx) const {
+    /* ----- linear access ----- */
+    __device__ inline T& operator[](const coord& idx) const {
         return raw_ptr[(((size_t)idx.b * depth() + idx.d) * rows() + idx.r) * cols() + idx.c];
     }
 
@@ -186,19 +198,27 @@ struct gl {
     }
     template<typename U, int axis = 2> __device__ inline void prefetch_tma() const {
         const CUtensorMap* d = tma_descs.template get<U, axis>();
-        asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(d)) : "memory");
+        tma::prefetch_tensormap(d);
     }
 };
 
 /* ----------   Host construction helper  ---------- */
 
-template<typename GL>
-__host__ inline GL make_gl(uint64_t data, int b, int d, int r, int c) {
-    return GL(reinterpret_cast<typename GL::dtype*>(data),
-              detail::make_arg<GL::__b__>(b),
-              detail::make_arg<GL::__d__>(d),
-              detail::make_arg<GL::__r__>(r),
-              detail::make_arg<GL::__c__>(c));
+template<typename LocalTensor>
+__host__ inline LocalTensor make_local_tensor(uint64_t data, int b, int d, int r, int c) {
+    return LocalTensor(reinterpret_cast<typename LocalTensor::dtype*>(data),
+                       detail::make_arg<LocalTensor::__b__>(b),
+                       detail::make_arg<LocalTensor::__d__>(d),
+                       detail::make_arg<LocalTensor::__r__>(r),
+                       detail::make_arg<LocalTensor::__c__>(c));
+}
+
+template<typename _T, int B, int D, int R, int C, typename... TMA_Types>
+using gl = local_tensor<_T, B, D, R, C, TMA_Types...>;
+
+template<typename LocalTensor>
+__host__ inline LocalTensor make_gl(uint64_t data, int b, int d, int r, int c) {
+    return make_local_tensor<LocalTensor>(data, b, d, r, c);
 }
 
 } // namespace dist

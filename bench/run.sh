@@ -58,14 +58,14 @@ COMMON_ENV=(
     "NCCL_P2P_DISABLE=0"
     "NCCL_SOCKET_IFNAME=enp71s0"
     # gemm_ar (and gemm_rs) need verbs notify mode for proxy publication path.
-    "OSGC_EFA_VERBS_NOTIFY_MODE=remote_flag"
+    "MKERNEL_EFA_VERBS_NOTIFY_MODE=remote_flag"
     # gemm_ar release defaults that are still consumed by the host harness.
     "GEMM_AR_ARRIVAL_QUEUE=1"
     "GEMM_AR_INTER_SEND_SMS=4"
     "GEMM_AR_NUM_INTRA_COMM_SMS=14"
     "GEMM_AR_K_DIV=global_world"
     # NCCL's NVLS multicast claims the multicast capability for its own
-    # collectives; that conflicts with TKParallelTensor's multicast bind
+    # collectives; that conflicts with DistBuffer's multicast bind
     # in the 2-node setup. Disable NCCL multicast so our user-mode bind
     # has the multicast feature exclusively.
     "NCCL_NVLS_ENABLE=0"
@@ -145,15 +145,15 @@ run_one_2node() {
     esac
     local master_port=${MPORT:-$default_master_port}
     local tcp_port_base=${TCP_PORT:-$default_tcp_port}
-    local bind_retained=${OSGC_BIND_RETAINED_HANDLE:-1}
-    local efa_num_qps_env=" OSGC_EFA_NUM_QPS=${OSGC_EFA_NUM_QPS:-8}"
-    if [[ "$kernel" == "gemm_ar" && -z "${OSGC_EFA_NUM_QPS+x}" ]]; then
+    local bind_retained=${MKERNEL_BIND_RETAINED_HANDLE:-1}
+    local efa_num_qps_env=" MKERNEL_EFA_NUM_QPS=${MKERNEL_EFA_NUM_QPS:-8}"
+    if [[ "$kernel" == "gemm_ar" && -z "${MKERNEL_EFA_NUM_QPS+x}" ]]; then
         # Match the gemm_ar source-of-truth experiment harness: leave this unset so
         # the gemm_ar module's session config uses its in-code default of 4 QPs.
         efa_num_qps_env=""
     fi
-    local best_of_env=" OSGC_BENCH_BEST_OF_N=${OSGC_BENCH_BEST_OF_N:-0}"
-    local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port OSGC_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
+    local best_of_env=" MKERNEL_BENCH_BEST_OF_N=${MKERNEL_BENCH_BEST_OF_N:-0}"
+    local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port MKERNEL_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
     local launch_node0="cd '$RELEASE' && $env_str NODE_IDX=0 \
         TCP_PORT=$tcp_port_base \
         '$TORCHRUN' --nproc_per_node=8 --nnodes=$NUM_NODES --node_rank=0 \

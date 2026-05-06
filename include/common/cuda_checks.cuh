@@ -14,7 +14,7 @@
 #include <cuda_runtime.h>
 
 // Adapted from ThunderKittens (MIT): include/common/util.cuh
-#define OSGC_CUCHECK(cmd) do {                                 \
+#define MKERNEL_CUCHECK(cmd) do {                                 \
     CUresult err__ = (cmd);                                    \
     if (err__ != CUDA_SUCCESS) {                               \
         const char *err_str__ = nullptr;                       \
@@ -26,7 +26,7 @@
 } while (0)
 
 // Adapted from ThunderKittens (MIT): include/common/util.cuh
-#define OSGC_CUDACHECK(cmd) do {                                \
+#define MKERNEL_CUDACHECK(cmd) do {                                \
     cudaError_t err__ = (cmd);                                  \
     if (err__ != cudaSuccess) {                                 \
         std::fprintf(stderr, "CUDA runtime error %s:%d '%s'\n", \

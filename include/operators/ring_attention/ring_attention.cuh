@@ -28,7 +28,7 @@
  */
 
 #include "common/types.cuh"
-#include "dist/dbuf.cuh"
+#include "dist/distributed_buffer.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
 #include "memory/tk_ops_group_group.cuh"
 #include "dist/tma.cuh"
@@ -46,8 +46,8 @@
 
 using namespace kittens;
 
-#ifndef TK_NUM_DEVICES
-#define TK_NUM_DEVICES 8
+#ifndef INTRA_NUM_DEVICES
+#define INTRA_NUM_DEVICES 8
 #endif
 
 namespace ring_attn_multinode {
@@ -80,7 +80,7 @@ struct config {
 // ============================================================================
 
 struct globals {
-    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int D = 128;
     static constexpr int QO_BLOCK = 64;
     static constexpr int KV_BLOCK = 128;
@@ -94,23 +94,23 @@ struct globals {
     using L_vec_2x = col_vec<st_fl<2 * QO_BLOCK, D>>;
     using O_tile_2x = st_bf<2 * QO_BLOCK, D>;
 
-    using Q_gl = dist::gl<bf16, -1, -1, -1, D, Q_tile>;
-    using K_pgl = dist::dbuf<dist::gl<bf16, -1, -1, -1, D, K_tile>, NUM_DEVICES, false>;
-    using V_pgl = dist::dbuf<dist::gl<bf16, -1, -1, -1, D, V_tile>, NUM_DEVICES, false>;
-    using L_gl = dist::gl<float, 1, -1, -1, -1, L_vec, L_vec_2x>;
-    using O_gl = dist::gl<bf16, -1, -1, -1, D, O_tile, O_tile_2x>;
-    using barrier_pgl = dist::barrier_dbuf<NUM_DEVICES>;
+    using Q_local_tensor = dist::local_tensor<bf16, -1, -1, -1, D, Q_tile>;
+    using K_distributed_tensor = dist::distributed_tensor<dist::local_tensor<bf16, -1, -1, -1, D, K_tile>, NUM_DEVICES, false>;
+    using V_distributed_tensor = dist::distributed_tensor<dist::local_tensor<bf16, -1, -1, -1, D, V_tile>, NUM_DEVICES, false>;
+    using L_local_tensor = dist::local_tensor<float, 1, -1, -1, -1, L_vec, L_vec_2x>;
+    using O_local_tensor = dist::local_tensor<bf16, -1, -1, -1, D, O_tile, O_tile_2x>;
+    using barrier_distributed_tensor = dist::barrier_distributed_tensor<NUM_DEVICES>;
 
-    Q_gl Q;
-    K_pgl K0;
-    K_pgl K1;
-    V_pgl V0;
-    V_pgl V1;
-    L_gl L_block;
-    L_gl L;
-    O_gl O_block;
-    O_gl O;
-    barrier_pgl barrier;
+    Q_local_tensor Q;
+    K_distributed_tensor K0;
+    K_distributed_tensor K1;
+    V_distributed_tensor V0;
+    V_distributed_tensor V1;
+    L_local_tensor L_block;
+    L_local_tensor L;
+    O_local_tensor O_block;
+    O_local_tensor O;
+    barrier_distributed_tensor barrier;
 
     int ring_stage;
     const int dev_idx;
@@ -153,14 +153,10 @@ struct kv_exchange_globals {
     // The host stages K0_local→send_buf[0:K_bytes], V0_local→send_buf[K_bytes:]
     // before launching this kernel. The kernel pushes FIFO commands referencing
     // local_offset within that send buffer.
-    //
-    // NOTE: easy fix #7 (PLAN_MULTINODE.md) — inline the staging copy via
-    // chunk-per-warp uint4 — was attempted in commit 258befd and reverted in
-    // dd39d9f. Do NOT re-attempt without understanding the prior regression.
     bf16 *K_recv;            // points to recv_buf + 0           (peer K)
     bf16 *V_recv;            // points to recv_buf + K_bytes      (peer V)
-    bf16 *K0_local;          // local slot of K0 PGL — D2D copy destination
-    bf16 *V0_local;          // local slot of V0 PGL
+    bf16 *K0_local;          // local slot of K0 dbuf, D2D copy destination
+    bf16 *V0_local;          // local slot of V0 dbuf
     int   K_bytes;           // K tensor byte size
     int   V_bytes;           // V tensor byte size
     int   total_chunks_K;
@@ -200,7 +196,7 @@ __global__ void zm_kv_send_kernel(
 __global__ void zm_kv_copy_kernel(
     const __grid_constant__ kv_exchange_globals KE);
 __global__ void zm_barrier_only_kernel(
-    const __grid_constant__ globals::barrier_pgl barrier, const int dev_idx);
+    const __grid_constant__ globals::barrier_distributed_tensor barrier, const int dev_idx);
 
 // ============================================================================
 // Host orchestration entrypoint
@@ -249,16 +245,16 @@ inline void entrypoint(
     // Construct intranode globals (used for all attn_partial / attn_comm calls)
     auto make_G = [&](int ring_stage) {
         return globals{
-            .Q = ::dist::gl_from_tensor<typename globals::Q_gl>(Q),
-            .K0 = ::dist::dbuf_from_buffer<typename globals::K_pgl>(K0),
-            .K1 = ::dist::dbuf_from_buffer<typename globals::K_pgl>(K1),
-            .V0 = ::dist::dbuf_from_buffer<typename globals::V_pgl>(V0),
-            .V1 = ::dist::dbuf_from_buffer<typename globals::V_pgl>(V1),
-            .L_block = ::dist::gl_from_tensor<typename globals::L_gl>(L_block),
-            .L = ::dist::gl_from_tensor<typename globals::L_gl>(L),
-            .O_block = ::dist::gl_from_tensor<typename globals::O_gl>(O_block),
-            .O = ::dist::gl_from_tensor<typename globals::O_gl>(O),
-            .barrier = ::dist::dbuf_from_buffer<typename globals::barrier_pgl>(barrier),
+            .Q = ::dist::local_tensor_from_tensor<typename globals::Q_local_tensor>(Q),
+            .K0 = ::dist::distributed_tensor_from_buffer<typename globals::K_distributed_tensor>(K0),
+            .K1 = ::dist::distributed_tensor_from_buffer<typename globals::K_distributed_tensor>(K1),
+            .V0 = ::dist::distributed_tensor_from_buffer<typename globals::V_distributed_tensor>(V0),
+            .V1 = ::dist::distributed_tensor_from_buffer<typename globals::V_distributed_tensor>(V1),
+            .L_block = ::dist::local_tensor_from_tensor<typename globals::L_local_tensor>(L_block),
+            .L = ::dist::local_tensor_from_tensor<typename globals::L_local_tensor>(L),
+            .O_block = ::dist::local_tensor_from_tensor<typename globals::O_local_tensor>(O_block),
+            .O = ::dist::local_tensor_from_tensor<typename globals::O_local_tensor>(O),
+            .barrier = ::dist::distributed_tensor_from_buffer<typename globals::barrier_distributed_tensor>(barrier),
             .ring_stage = ring_stage,
             .dev_idx = dev_idx,
             .num_comm_sms = num_comm_sms,
@@ -270,26 +266,8 @@ inline void entrypoint(
     int total_chunks_K = (K_bytes + CHUNK_BYTES - 1) / CHUNK_BYTES;
     int total_chunks_V = (V_bytes + CHUNK_BYTES - 1) / CHUNK_BYTES;
 
-    internode::D2HFifoDeviceBundle fifo_bundle{};
-    if (fifo_capacity < 0) {
-        auto* bundle_ptr =
-            reinterpret_cast<const internode::D2HFifoDeviceBundle*>(fifo_triggers);
-        TORCH_CHECK(bundle_ptr != nullptr, "FIFO bundle pointer is null");
-        fifo_bundle = *bundle_ptr;
-    } else {
-        internode::D2HFifoDevice fd{};
-        fd.triggers   = reinterpret_cast<internode::TransferCmd*>(fifo_triggers);
-        fd.head       = reinterpret_cast<uint64_t*>(fifo_head);
-        fd.tail       = reinterpret_cast<uint64_t*>(fifo_tail);
-        fd.tail_cache = reinterpret_cast<uint64_t*>(fifo_tail_cache);
-        fd.capacity   = fifo_capacity;
-        int nqps = 4;
-        if (const char* e = std::getenv("OSGC_EFA_NUM_QPS")) {
-            int v = std::atoi(e);
-            if (v > 0) nqps = v;
-        }
-        fifo_bundle = internode::make_fifo_bundle(fd, nqps, 1);
-    }
+    auto fifo_bundle = internode::resolve_fifo_bundle(
+        fifo_triggers, fifo_head, fifo_tail, fifo_tail_cache, fifo_capacity, 4);
 
     int n_send = std::max(1, num_send_sms);
     int n_copy = std::max(1, num_copy_sms);

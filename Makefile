@@ -46,7 +46,7 @@ TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; 
 
 # === Common compile flags ===
 ARCH            := -gencode arch=compute_90a,code=sm_90a
-COMMON_DEFINES  := -DKITTENS_HOPPER -DTK_NUM_DEVICES=8 $(BACKEND_DEFINES)
+COMMON_DEFINES  := -DKITTENS_HOPPER -DINTRA_NUM_DEVICES=8 $(BACKEND_DEFINES)
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH)
 LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
@@ -83,7 +83,7 @@ KERNELS := dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention
 all: $(addprefix $(BUILD)/lib,$(addsuffix .so,$(KERNELS)))
 
 $(BUILD)/lib%.so: $(SRC)/%.cu | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=osgc_release_$* $(DEFS_$*) $(COMMON_INC) \
+	$(NVCC) $(COMMON_FLAGS) $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_$* $(DEFS_$*) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
 $(BUILD):

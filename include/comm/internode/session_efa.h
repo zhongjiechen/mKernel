@@ -154,8 +154,6 @@ struct Session {
     gpu_mr::GpuRdmaBuffer recv_buf;
 
     // D2H command FIFOs (one per proxy thread / FIFO channel).
-    // Under EFAGDA the FIFO + host-side proxy are absent; the same
-    // `fifo_bundle` slot holds the EFA SQ/DB handles instead.
     D2HFifoPair         fifos[kMaxProxyThreads];
     D2HFifoDeviceBundle fifo_bundle;
 
@@ -191,9 +189,9 @@ inline Session* create_session(const SessionConfig& cfg) {
     // --- 0. Clamp knobs and derive session-wide counters.
     int num_rails = cfg.num_rails <= 0 ? 1 : cfg.num_rails;
     if (num_rails > kMaxRails) num_rails = kMaxRails;
-    // Allow OSGC_EFA_NUM_RAILS env override.
+    // Allow MKERNEL_EFA_NUM_RAILS env override.
     {
-        const char* env = std::getenv("OSGC_EFA_NUM_RAILS");
+        const char* env = std::getenv("MKERNEL_EFA_NUM_RAILS");
         if (env && env[0]) {
             int v = std::atoi(env);
             if (v >= 1 && v <= kMaxRails) num_rails = v;
@@ -372,12 +370,12 @@ inline Session* create_session(const SessionConfig& cfg) {
 
     // --- 4. D2H FIFOs.
     // Default: one FIFO per proxy thread (num_fifos = num_proxy_threads).
-    // OSGC_FIFO_PER_QP=1 enables one-fifo-per-QP mode (num_fifos = num_qps),
+    // MKERNEL_FIFO_PER_QP=1 enables one-fifo-per-QP mode (num_fifos = num_qps),
     // which decouples FIFO count from thread count and reduces GPU-side
     // atomicAdd contention on the FIFO head pointer (each QP gets its own
     // head). Each proxy thread then round-robins through its slice of fifos.
     bool fifo_per_qp = false;
-    if (const char* e = std::getenv("OSGC_FIFO_PER_QP")) {
+    if (const char* e = std::getenv("MKERNEL_FIFO_PER_QP")) {
         fifo_per_qp = (std::atoi(e) != 0);
     }
     int num_fifos = fifo_per_qp ? num_qps : num_proxy_threads;
@@ -583,11 +581,7 @@ inline Session* create_session(const SessionConfig& cfg) {
             pcfg.enable_remote_tail =
                 (tail_env != nullptr && tail_env[0] == '1');
         }
-        // R1 Commit 1: plumbing for the adaptive post/poll controller inside
-        // Proxy::run(). Default 0 → byte-identical to the pre-R1 static
-        // BATCH_SIZE/ACCUMULATE_SPINS path. When 1, the controller state
-        // declared in Proxy is still unread until Commit 2/3; setting the
-        // flag today only exercises the plumbing.
+        // Optional proxy post/poll controller.
         {
             const char* pipe_env = std::getenv("Q2_PROXY_PIPELINE");
             pcfg.pipeline_enabled =
@@ -798,7 +792,7 @@ inline ReadyQueueDevice get_ready_queue_device(const Session* /*s*/) {
 /** Set total expected ready-queue entries — no-op on SRD. */
 inline void set_ready_queue_total(Session* /*s*/, uint32_t /*total*/) {}
 
-/** Per-proxy-thread diagnostic counters. (EFAGDA: empty — no proxy threads.) */
+/** Per-proxy-thread diagnostic counters. */
 inline std::vector<ProxyDiagnostics> get_proxy_diagnostics(const Session* s) {
     std::vector<ProxyDiagnostics> out;
     if (!s) return out;
@@ -866,7 +860,7 @@ inline void prepare_epoch(Session* s) {
  * Phase 2 of the epoch transition — mirrors session.h::commit_epoch.
  * Updates epoch, resets arrivals/stage-barrier/FIFOs, resumes all proxies.
  *
- * When OSGC_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1, skips arrival/stage-barrier
+ * When MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1, skips arrival/stage-barrier
  * resets and FIFO reinit. This is safe under Q2_STEADY_STATE_BENCH because:
  *   - arrival flags: kernel resets them on-GPU via q2_iter_end_reset_arrival_flags
  *     before the epilogue barrier, so they're clean by the time the next iter starts.
@@ -886,7 +880,7 @@ inline void commit_epoch(Session* s, uint32_t epoch) {
     // Read every call — Python sets this env var AFTER the first set_epoch(1)
     // call (line 629 of benchmark_gemm_ar_multinode.py), so a static-const
     // cache would latch false and never pick up the later mutation.
-    const char* skip_env = getenv("OSGC_COMMIT_EPOCH_SKIP_ARRIVAL_RESET");
+    const char* skip_env = getenv("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET");
     const bool skip_reset = (skip_env && skip_env[0] == '1');
 
     s->epoch = epoch;
@@ -1082,10 +1076,10 @@ inline void prime_first_launch_transport(Session* s) {
         for (int t = 0; t < s->num_proxy_threads; t++) {
             if (injected[t] == 0) continue;
             const uint64_t new_head = target_heads[t];
-            OSGC_CUDACHECK(cudaMemcpy(
+            MKERNEL_CUDACHECK(cudaMemcpy(
                 s->fifos[t].device.head, &new_head, sizeof(uint64_t),
                 cudaMemcpyHostToDevice));
-            OSGC_CUDACHECK(cudaMemcpy(
+            MKERNEL_CUDACHECK(cudaMemcpy(
                 s->fifos[t].device.tail_cache, &new_head, sizeof(uint64_t),
                 cudaMemcpyHostToDevice));
         }
