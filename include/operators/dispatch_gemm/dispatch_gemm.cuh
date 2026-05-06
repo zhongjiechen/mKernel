@@ -188,6 +188,10 @@ struct fused_globals {
     int pre_tokens_bytes;
     int total_chunks;
     int node_idx;
+    int num_nodes;  // Total node count (>= 2). N == 2 reproduces the
+                    // legacy 2-node code path bit-for-bit. Scaffolding
+                    // for N-node fan-out only; peer_tokens / arrival
+                    // flag layouts not yet generalized.
     int dev_idx;
     int num_local_tokens;
     int num_padded_local_tokens;
@@ -250,7 +254,9 @@ void fused(
     int num_padded_local_tokens,
     int num_send_sms,
     int num_copy_sms,
-    int num_comm_sms_intra
+    int num_comm_sms_intra,
+    int num_nodes = 2  // total node count (>= 2). N == 2 reproduces the
+                       // legacy 2-node behavior bit-for-bit.
 ) {
     const int dev_idx = barrier.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -356,6 +362,7 @@ void fused(
         .pre_tokens_bytes = pre_tokens_bytes,
         .total_chunks = total_chunks,
         .node_idx = node_idx,
+        .num_nodes = num_nodes,
         .dev_idx = dev_idx,
         .num_local_tokens = num_local_tokens,
         .num_padded_local_tokens = num_padded_local_tokens,

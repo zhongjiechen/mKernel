@@ -188,6 +188,10 @@ struct fused_globals {
         int M_local;
         int N;
         int node_idx;
+        int num_nodes;  // total node count (>= 2). N == 2 reproduces the
+                        // legacy 2-node code path bit-for-bit. Scaffolding
+                        // for kernel-side multi-peer iteration only;
+                        // recv_buf / staging are still single-peer-sized.
         unsigned int *sender_done;
         internode::D2HFifoDeviceBundle d2h_fifos;
         volatile uint32_t *arrival_flags;
@@ -470,7 +474,9 @@ void entrypoint_fused(
     // when not in use.
     dist::ParallelBuffer &ready_chunk,
     // Staging DistBuffer used as the chunk-major intra-RS atomic-add target.
-    pybind11::object staging_obj
+    pybind11::object staging_obj,
+    int num_nodes = 2  // Total node count (>= 2). N == 2 reproduces the
+                       // legacy 2-node behavior bit-for-bit.
 ) {
     const int dev_idx = output.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -673,6 +679,7 @@ void entrypoint_fused(
             .M_local = M_local,
             .N = N,
             .node_idx = node_idx,
+            .num_nodes = num_nodes,
             .sender_done = g_sender_done[dev_idx],
             .d2h_fifos = fifo_bundle,
             .arrival_flags = reinterpret_cast<volatile uint32_t*>(arrival_flags_ptr),

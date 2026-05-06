@@ -23,7 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results  # noqa: E402
+from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
 
 KERNEL_NAME = "gemm_ar"
 from common import get_num_nodes  # noqa: E402
@@ -242,17 +242,25 @@ def main():
 
         staging_buf = torch.empty(staging_bytes // 2, device="cuda", dtype=torch.bfloat16)
 
+        # Per-peer sizing (1× at N == 2, identical to legacy).
+        n_peers = NUM_NODES - 1
+        recv_buf_bytes = n_peers * staging_bytes
+        recv_buf_tiles = n_peers * total_tiles
+
         dist.barrier()
         fifo_cap = 2048
-        while fifo_cap < total_tiles * 2: fifo_cap *= 2
+        while fifo_cap < recv_buf_tiles * 2: fifo_cap *= 2
         clocal_ptr = int(C_dbuf.data_.data_ptr())
         clocal_bytes = int(C_dbuf.data_.numel() * C_dbuf.data_.element_size())
         row_stride_bytes = N * 2
+        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             staging_buf.data_ptr(), staging_bytes,
-            staging_bytes, total_tiles, fifo_cap, local_rank,
+            recv_buf_bytes, recv_buf_tiles, fifo_cap, local_rank,
             clocal_ptr, clocal_bytes, row_stride_bytes,
+            peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
         fifo = mod.get_fifo_handles()
         arrival_ptr = mod.get_arrival_flags_ptr()
@@ -323,6 +331,7 @@ def main():
                 num_allocated_remote_queues=num_allocated_remote_queues,
                 cross_node_barrier_ptr=barrier_device_ptr,
                 use_acquire_poll=kernel_use_acquire_poll,
+                num_nodes=NUM_NODES,
             )
             torch.cuda.synchronize()
         # One-shot cross-node align before timed loop (steady_state requires).
@@ -355,6 +364,7 @@ def main():
                 num_allocated_remote_queues=num_allocated_remote_queues,
                 cross_node_barrier_ptr=barrier_device_ptr,
                 use_acquire_poll=kernel_use_acquire_poll,
+                num_nodes=NUM_NODES,
             )
             e.record()
             if not steady_state:

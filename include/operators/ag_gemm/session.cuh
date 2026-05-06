@@ -9,17 +9,29 @@
 
 static internode::Session* g_session = nullptr;
 
+// Stable storage for the multi-peer string/int arrays that SessionConfig
+// references (it stores raw pointers, not values). Lifetime extends until
+// the next create_session_py call replaces the session.
+static std::vector<std::string> g_peer_ips_storage;
+static std::vector<const char*> g_peer_ips_cstr;
+static std::vector<int>         g_peer_ports_storage;
+
 void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int64_t send_buf_ptr, int64_t send_buf_size,
                        int64_t recv_buf_size, int num_tiles,
                        int fifo_capacity, int device_id,
                        int64_t clocal_buf_ptr = 0,
-                       int64_t clocal_buf_size = 0) {
+                       int64_t clocal_buf_size = 0,
+                       std::vector<std::string> peer_ips = {},
+                       std::vector<int> peer_tcp_ports = {}) {
     internode::py::destroy_session(g_session);
     internode::SessionConfig cfg = internode::py::make_base_config(
         rank, peer_ip.c_str(), tcp_port,
         send_buf_ptr, send_buf_size, recv_buf_size,
         num_tiles, fifo_capacity, device_id);
+    internode::py::apply_peer_ips(
+        cfg, peer_ips, peer_tcp_ports, tcp_port,
+        g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
     cfg.max_inflight = 256;
     if (clocal_buf_ptr == 0 || clocal_buf_size == 0) {
         fprintf(stderr, "create_session_py: AG1 direct sends require clocal_buf_ptr/size\n");
@@ -68,7 +80,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("recv_buf_size"), pybind11::arg("num_tiles"),
           pybind11::arg("fifo_capacity"), pybind11::arg("device_id"),
           pybind11::arg("clocal_buf_ptr") = 0,
-          pybind11::arg("clocal_buf_size") = 0);
+          pybind11::arg("clocal_buf_size") = 0,
+          pybind11::arg("peer_ips") = std::vector<std::string>{},
+          pybind11::arg("peer_tcp_ports") = std::vector<int>{});
     m.def("destroy_session", &destroy_session_py);
     m.def("set_epoch", &set_epoch_py);
     m.def("get_fifo_handles", &get_fifo_handles_py);
@@ -92,5 +106,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("a_half_bytes"),
           pybind11::arg("A_recv"),
           pybind11::arg("active_sms") = 132,
-          pybind11::arg("num_intra_comm_override") = 0);
+          pybind11::arg("num_intra_comm_override") = 0,
+          pybind11::arg("num_nodes") = 2);
 }

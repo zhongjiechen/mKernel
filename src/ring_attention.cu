@@ -466,18 +466,29 @@ __device__ inline void kv_stage_and_send_sm(const kv_exchange_globals &G) {
                 remote_off = (uint32_t)(G.K_bytes) + off;
                 src_view = 1;
             }
-            internode::TransferCmd cmd{};
-            cmd.cmd_type = internode::CmdType::WRITE;
-            cmd.dst_rank = (uint8_t)(1 - G.node_idx);
-            cmd.tile_id = (uint16_t)chunk_id;
-            cmd.bytes = bytes;
-            cmd.local_offset = off;
-            cmd.remote_offset = remote_off;
-            cmd.src_view = src_view;
-            cmd.lane_id = (uint16_t)chunk_id;
-            internode::D2HFifoDevice fifo =
-                internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
-            fifo.push(cmd);
+            const int n_peers = G.num_nodes - 1;
+            // Per-peer slot offsets (zero at N == 2). single_peer_bytes is
+            // this rank's K + V combined byte count; single_peer_tiles is
+            // the chunk count for one peer's worth.
+            const int single_peer_bytes = G.K_bytes + G.V_bytes;
+            const int single_peer_tiles = G.total_chunks_K + G.total_chunks_V;
+            for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                const int peer_rank = internode::peer_rank_for_slot(
+                    G.node_idx, G.num_nodes, peer_slot);
+                const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
+                internode::TransferCmd cmd{};
+                cmd.cmd_type = internode::CmdType::WRITE;
+                cmd.dst_rank = (uint8_t)peer_rank;
+                cmd.tile_id = (uint16_t)(sap * single_peer_tiles + chunk_id);
+                cmd.bytes = bytes;
+                cmd.local_offset = off;
+                cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes + remote_off;
+                cmd.src_view = src_view;
+                cmd.lane_id = (uint16_t)chunk_id;
+                internode::D2HFifoDevice fifo =
+                    internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
+                fifo.push(cmd);
+            }
         }
     }
 }
@@ -498,36 +509,51 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
         for (int chunk_id = my_pusher; chunk_id < total_chunks; chunk_id += total_pushers) {
             uint32_t off, bytes;
             bool is_v = (chunk_id >= G.total_chunks_K);
+            const int n_peers = G.num_nodes - 1;
+            // Per-peer slot offsets (zero at N == 2).
+            const int single_peer_bytes = G.K_bytes + G.V_bytes;
+            const int single_peer_tiles = G.total_chunks_K + G.total_chunks_V;
             if (!is_v) {
                 off = (uint32_t)(chunk_id * CHUNK_BYTES);
                 bytes = min(CHUNK_BYTES, G.K_bytes - (int)off);
                 // Local K starts at offset 0 in send_buf, V starts at K_bytes
-                internode::TransferCmd cmd{};
-                cmd.cmd_type = internode::CmdType::WRITE;
-                cmd.dst_rank = (uint8_t)(1 - G.node_idx);
-                cmd.tile_id  = (uint16_t)chunk_id;
-                cmd.bytes    = bytes;
-                cmd.local_offset  = off;
-                cmd.remote_offset = off;
-                cmd.lane_id = (uint16_t)chunk_id;
-                internode::D2HFifoDevice fifo =
-                    internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
-                fifo.push(cmd);
+                for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                    const int peer_rank = internode::peer_rank_for_slot(
+                        G.node_idx, G.num_nodes, peer_slot);
+                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
+                    internode::TransferCmd cmd{};
+                    cmd.cmd_type = internode::CmdType::WRITE;
+                    cmd.dst_rank = (uint8_t)peer_rank;
+                    cmd.tile_id  = (uint16_t)(sap * single_peer_tiles + chunk_id);
+                    cmd.bytes    = bytes;
+                    cmd.local_offset  = off;
+                    cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes + off;
+                    cmd.lane_id = (uint16_t)chunk_id;
+                    internode::D2HFifoDevice fifo =
+                        internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
+                    fifo.push(cmd);
+                }
             } else {
                 int v_chunk = chunk_id - G.total_chunks_K;
                 off = (uint32_t)(v_chunk * CHUNK_BYTES);
                 bytes = min(CHUNK_BYTES, G.V_bytes - (int)off);
-                internode::TransferCmd cmd{};
-                cmd.cmd_type = internode::CmdType::WRITE;
-                cmd.dst_rank = (uint8_t)(1 - G.node_idx);
-                cmd.tile_id  = (uint16_t)chunk_id;
-                cmd.bytes    = bytes;
-                cmd.local_offset  = (uint32_t)(G.K_bytes) + off;
-                cmd.remote_offset = (uint32_t)(G.K_bytes) + off;
-                cmd.lane_id = (uint16_t)chunk_id;
-                internode::D2HFifoDevice fifo =
-                    internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
-                fifo.push(cmd);
+                for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                    const int peer_rank = internode::peer_rank_for_slot(
+                        G.node_idx, G.num_nodes, peer_slot);
+                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
+                    internode::TransferCmd cmd{};
+                    cmd.cmd_type = internode::CmdType::WRITE;
+                    cmd.dst_rank = (uint8_t)peer_rank;
+                    cmd.tile_id  = (uint16_t)(sap * single_peer_tiles + chunk_id);
+                    cmd.bytes    = bytes;
+                    cmd.local_offset  = (uint32_t)(G.K_bytes) + off;
+                    cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes
+                                        + (uint32_t)(G.K_bytes) + off;
+                    cmd.lane_id = (uint16_t)chunk_id;
+                    internode::D2HFifoDevice fifo =
+                        internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
+                    fifo.push(cmd);
+                }
             }
         }
     }
@@ -538,15 +564,25 @@ __device__ inline void kv_copy_sm(const kv_exchange_globals &G) {
     int copy_id = blockIdx.x - G.num_send_sms;
     int total_chunks = G.total_chunks_K + G.total_chunks_V;
 
+    // Multi-peer: arrival_flags is laid out [peer_slot * total_chunks + chunk_id].
+    // For each chunk, wait for all (N-1) peers' KV writes. At N == 2 the loop
+    // runs once with slot == 0 — same flag offset / same wait pattern as today.
+    // Per-peer K_recv/V_recv merging into the ring's intra-node loop is the
+    // per-kernel testbed-side step.
+    const int n_peers = G.num_nodes - 1;
+    const int single_peer_chunks = total_chunks;
     for (int chunk_id = copy_id; chunk_id < total_chunks; chunk_id += G.num_copy_sms) {
-        // Wait for this chunk's arrival
+        // Wait for this chunk's arrival from every peer slot.
         if (threadIdx.x == 0) {
-            uint32_t v;
-            do {
-                v = comm::atomic_u32::volatile_load(&G.arrival_flags[chunk_id]);
-                if (v == G.epoch) break;
-                __nanosleep(100);
-            } while (true);
+            for (int slot = 0; slot < n_peers; ++slot) {
+                const int flag_idx = slot * single_peer_chunks + chunk_id;
+                uint32_t v;
+                do {
+                    v = comm::atomic_u32::volatile_load(&G.arrival_flags[flag_idx]);
+                    if (v == G.epoch) break;
+                    __nanosleep(100);
+                } while (true);
+            }
         }
         __syncthreads();
         __threadfence_system();

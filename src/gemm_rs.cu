@@ -293,18 +293,29 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
 
             const uint32_t chunk_bytes = (uint32_t)((long)cols_this_chunk * TILE_BYTES);
             const uint32_t offset = (uint32_t)((long)chunk_first_tile * TILE_BYTES);
-            internode::TransferCmd cmd{};
-            cmd.cmd_type = internode::CmdType::WRITE;
-            cmd.dst_rank = (uint8_t)(1 - Rt.node_idx);
-            cmd.tile_id  = (uint16_t)chunk_first_tile;
-            cmd.bytes    = chunk_bytes;
-            cmd.local_offset = offset;
-            cmd.remote_offset = offset;
-            cmd.lane_id  = (uint16_t)(rb * chunks_per_row + ci);
-            __threadfence();
-            internode::D2HFifoDevice fifo =
-                internode::gemm_ar_select_fifo_for_lane(Rt.d2h_fifos, (uint32_t)cmd.lane_id);
-            fifo.push(cmd);
+            // Per-peer slot offsets: bit-identical at N == 2 (sap == 0).
+            // single_peer_bytes / tiles = local scratch sized for one peer.
+            const long single_peer_bytes =
+                (long)row_blocks_per_dev * (long)col_blocks * TILE_BYTES;
+            const int  single_peer_tiles = row_blocks_per_dev * col_blocks;
+            const int n_peers = Rt.num_nodes - 1;
+            for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                const int peer_rank = internode::peer_rank_for_slot(
+                    Rt.node_idx, Rt.num_nodes, peer_slot);
+                const int sap = internode::slot_at_peer(Rt.node_idx, peer_rank);
+                internode::TransferCmd cmd{};
+                cmd.cmd_type = internode::CmdType::WRITE;
+                cmd.dst_rank = (uint8_t)peer_rank;
+                cmd.tile_id  = (uint16_t)(sap * single_peer_tiles + chunk_first_tile);
+                cmd.bytes    = chunk_bytes;
+                cmd.local_offset = offset;
+                cmd.remote_offset = (uint32_t)((long)sap * single_peer_bytes) + offset;
+                cmd.lane_id  = (uint16_t)(rb * chunks_per_row + ci);
+                __threadfence();
+                internode::D2HFifoDevice fifo =
+                    internode::gemm_ar_select_fifo_for_lane(Rt.d2h_fifos, (uint32_t)cmd.lane_id);
+                fifo.push(cmd);
+            }
         }
         __syncthreads();
         posted++;

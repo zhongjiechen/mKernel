@@ -9,18 +9,26 @@
 #include "comm/internode/session_py.cuh"
 
 static internode::Session* g_session = nullptr;
+static std::vector<std::string> g_peer_ips_storage;
+static std::vector<const char*> g_peer_ips_cstr;
+static std::vector<int>         g_peer_ports_storage;
 
 void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int64_t send_buf_ptr, int64_t send_buf_size,
                        int64_t recv_buf_size, int num_tiles,
                        int fifo_capacity, int device_id,
                        int64_t output_buf_ptr = 0, int64_t output_buf_size = 0,
-                       int output_n = 0) {
+                       int output_n = 0,
+                       std::vector<std::string> peer_ips = {},
+                       std::vector<int> peer_tcp_ports = {}) {
     internode::py::destroy_session(g_session);
     internode::SessionConfig cfg = internode::py::make_base_config(
         rank, peer_ip.c_str(), tcp_port,
         send_buf_ptr, send_buf_size, recv_buf_size,
         num_tiles, fifo_capacity, device_id);
+    internode::py::apply_peer_ips(
+        cfg, peer_ips, peer_tcp_ports, tcp_port,
+        g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
 
     // GEMM_RS_DIRECT_DMABUF_SEND: register output_local as a DMA-BUF MR on every
     // rail's PD so the send path can skip the pack + gather step. Session
@@ -81,7 +89,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("device_id"),
           pybind11::arg("output_buf_ptr") = 0,
           pybind11::arg("output_buf_size") = 0,
-          pybind11::arg("output_n") = 0);
+          pybind11::arg("output_n") = 0,
+          pybind11::arg("peer_ips") = std::vector<std::string>{},
+          pybind11::arg("peer_tcp_ports") = std::vector<int>{});
     m.def("destroy_session", &destroy_session_py);
     m.def("set_epoch", &set_epoch_py);
     m.def("get_fifo_handles", &get_fifo_handles_py);
@@ -111,5 +121,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("use_acquire_poll") = (int64_t)0,
           pybind11::arg("reduce_poll_sleep_ns") = (int64_t)100,
           pybind11::arg("ready_chunk"),
-          pybind11::arg("staging") = pybind11::none());
+          pybind11::arg("staging") = pybind11::none(),
+          pybind11::arg("num_nodes") = 2);
 }

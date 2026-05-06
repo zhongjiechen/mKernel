@@ -7,7 +7,9 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <tuple>
+#include <vector>
 #include <torch/csrc/utils/pybind.h>
 
 namespace internode::py {
@@ -36,6 +38,36 @@ inline SessionConfig make_base_config(
     cfg.fifo_capacity = fifo_capacity;
     cfg.device_id = device_id;
     return cfg;
+}
+
+// Attach a Python-supplied list of peer IPs (and optional matching ports) to
+// the SessionConfig's multi-peer fields. The C arrays in cfg point at the
+// caller-supplied vector storage; the caller must keep that storage alive
+// until the session is destroyed (typically file-scope statics in each
+// operator shim). When peer_ips is empty, leaves cfg unchanged so the
+// legacy single-peer path (cfg.peer_ip / cfg.tcp_port) is used.
+inline void apply_peer_ips(
+    SessionConfig& cfg,
+    std::vector<std::string>& peer_ips,
+    std::vector<int>& peer_tcp_ports,
+    int default_tcp_port,
+    std::vector<std::string>& storage_ips,
+    std::vector<const char*>& storage_cstr,
+    std::vector<int>& storage_ports
+) {
+    if (peer_ips.empty()) return;
+    storage_ips   = std::move(peer_ips);
+    storage_ports = std::move(peer_tcp_ports);
+    if (storage_ports.empty()) {
+        storage_ports.assign(storage_ips.size(), default_tcp_port);
+    }
+    storage_cstr.resize(storage_ips.size());
+    for (size_t i = 0; i < storage_ips.size(); ++i) {
+        storage_cstr[i] = storage_ips[i].c_str();
+    }
+    cfg.num_peers      = static_cast<int>(storage_ips.size());
+    cfg.peer_ips       = storage_cstr.data();
+    cfg.peer_tcp_ports = storage_ports.data();
 }
 
 inline void destroy_session(Session*& session) {

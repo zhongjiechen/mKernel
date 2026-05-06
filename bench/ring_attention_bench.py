@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results  # noqa: E402
+from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
 
 KERNEL_NAME = "ring_attention"
 from common import get_num_nodes  # noqa: E402
@@ -137,18 +137,26 @@ def main():
         send_buf_ptr = send_buf.data_ptr()
         total_chunks = (kv_buf_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
 
+        # Per-peer sizing (1× at N == 2, identical to legacy).
+        n_peers = NUM_NODES - 1
+        recv_buf_chunks = n_peers * total_chunks
+        recv_buf_bytes = n_peers * kv_buf_bytes
+
         dist.barrier()
         fifo_cap = 2048
-        while fifo_cap < total_chunks * 2: fifo_cap *= 2
+        while fifo_cap < recv_buf_chunks * 2: fifo_cap *= 2
 
         # Zero-copy send: K0 and V0 are registered as DMA-BUF MRs. Proxy
         # posts single-SGE WRs straight from the VMM tensors — no pack.
+        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
-            send_buf_ptr, kv_buf_bytes, kv_buf_bytes,
-            total_chunks, fifo_cap, local_rank,
+            send_buf_ptr, kv_buf_bytes, recv_buf_bytes,
+            recv_buf_chunks, fifo_cap, local_rank,
             int(K0.data_.data_ptr()), k_bytes,
             int(V0.data_.data_ptr()), v_bytes,
+            peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
         fifo = mod.get_fifo_handles()
         arrival_ptr = mod.get_arrival_flags_ptr()
@@ -176,7 +184,7 @@ def main():
                 fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
                 arrival_ptr, ep,
                 node_idx, args.num_comm_sms,
-                args.num_send_sms, args.num_copy_sms,
+                args.num_send_sms, args.num_copy_sms, NUM_NODES,
             )
 
         for _ in range(args.warmup + 1):
@@ -201,7 +209,7 @@ def main():
                 fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
                 arrival_ptr, epoch,
                 node_idx, args.num_comm_sms,
-                args.num_send_sms, args.num_copy_sms,
+                args.num_send_sms, args.num_copy_sms, NUM_NODES,
             )
             e.record(); torch.cuda.synchronize()
             samples.append(s.elapsed_time(e))

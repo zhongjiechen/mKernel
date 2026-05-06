@@ -38,13 +38,26 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 RELEASE=$(dirname "$HERE")
 
 # === Cluster topology ===
+# 2-node defaults preserved. For N > 2 set NODE{i}_IP and NODE{i}_SSH for
+# every i in [0, NUM_NODES). NODE0_SSH defaults to "" because node 0 is the
+# launching host (we run its torchrun locally instead of SSHing to it).
 NODE0_IP=${NODE0_IP:-172.31.1.237}
-NODE1_SSH=${NODE1_SSH:-15.164.130.63}
+NODE0_SSH=${NODE0_SSH:-}
 NODE1_IP=${NODE1_IP:-172.31.11.6}
-if (( NUM_NODES > 2 )); then
-    echo "[run] NUM_NODES=$NUM_NODES > 2: WIP — launcher only knows about NODE0 and NODE1. Aborting." >&2
-    exit 1
-fi
+NODE1_SSH=${NODE1_SSH:-15.164.130.63}
+# Validate that every peer node has its IP + SSH endpoint configured.
+for ((i=0; i<NUM_NODES; i++)); do
+    ip_var="NODE${i}_IP"
+    ssh_var="NODE${i}_SSH"
+    if [[ -z "${!ip_var:-}" ]]; then
+        echo "[run] $ip_var must be set for node $i (NUM_NODES=$NUM_NODES)." >&2
+        exit 1
+    fi
+    if (( i > 0 )) && [[ -z "${!ssh_var:-}" ]]; then
+        echo "[run] $ssh_var must be set for node $i (NUM_NODES=$NUM_NODES)." >&2
+        exit 1
+    fi
+done
 
 # Python venv with torch installed (EFS-shared, both nodes see this path).
 PY=${PY:-/home/ubuntu/efs/yzhou/uccl/.venv/bin/python3}
@@ -86,8 +99,13 @@ fi
 
 cleanup_stale_benches() {
     pkill -9 -f "$STALE_BENCH_PATTERN" 2>/dev/null || true
-    ssh -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$NODE1_SSH" \
-        "pkill -9 -f '$STALE_BENCH_PATTERN' 2>/dev/null || true" 2>/dev/null || true
+    for ((i=1; i<NUM_NODES; i++)); do
+        local ssh_var="NODE${i}_SSH"
+        local ssh_host="${!ssh_var:-}"
+        [[ -z "$ssh_host" ]] && continue
+        ssh -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$ssh_host" \
+            "pkill -9 -f '$STALE_BENCH_PATTERN' 2>/dev/null || true" 2>/dev/null || true
+    done
     sleep "${CLEANUP_SETTLE_SLEEP:-1}"
 }
 
@@ -154,38 +172,62 @@ run_one_2node() {
     fi
     local best_of_env=" MKERNEL_BENCH_BEST_OF_N=${MKERNEL_BENCH_BEST_OF_N:-0}"
     local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port MKERNEL_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
-    local launch_node0="cd '$RELEASE' && $env_str NODE_IDX=0 \
-        TCP_PORT=$tcp_port_base \
-        '$TORCHRUN' --nproc_per_node=8 --nnodes=$NUM_NODES --node_rank=0 \
-            --master_addr=$NODE0_IP --master_port=$master_port \
-            '$script' $extra_args"
-    local launch_node1="cd '$RELEASE' && $env_str NODE_IDX=1 \
-        TCP_PORT=$tcp_port_base \
-        '$TORCHRUN' --nproc_per_node=8 --nnodes=$NUM_NODES --node_rank=1 \
-            --master_addr=$NODE0_IP --master_port=$master_port \
-            '$script' $extra_args"
 
     # Hard timeout (default 5 min per kernel sweep — adjust via TIMEOUT env).
     local TIMEOUT_S=${TIMEOUT:-300}
     echo "==== $kernel ($MODE) timeout=${TIMEOUT_S}s master_port=${master_port} tcp_port=${tcp_port_base} ===="
     cleanup_stale_benches
-    timeout "${TIMEOUT_S}" ssh -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$NODE1_SSH" "bash -c \"$launch_node1\"" \
-        > "/tmp/${kernel}_node1.log" 2>&1 &
-    local NODE1_PID=$!
+
+    # Launch peer nodes (rank 1..NUM_NODES-1) over SSH; node 0 runs locally.
+    declare -a peer_pids=()
+    for ((i=1; i<NUM_NODES; i++)); do
+        local ssh_var="NODE${i}_SSH"
+        local ssh_host="${!ssh_var}"
+        local launch_peer="cd '$RELEASE' && $env_str NODE_IDX=$i \
+            TCP_PORT=$tcp_port_base \
+            '$TORCHRUN' --nproc_per_node=8 --nnodes=$NUM_NODES --node_rank=$i \
+                --master_addr=$NODE0_IP --master_port=$master_port \
+                '$script' $extra_args"
+        timeout "${TIMEOUT_S}" ssh -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+            "$ssh_host" "bash -c \"$launch_peer\"" \
+            > "/tmp/${kernel}_node${i}.log" 2>&1 &
+        peer_pids+=("$!")
+    done
     sleep "${NODE1_LAUNCH_SLEEP:-2}"
+
+    # Launch node 0 locally.
+    local launch_node0="cd '$RELEASE' && $env_str NODE_IDX=0 \
+        TCP_PORT=$tcp_port_base \
+        '$TORCHRUN' --nproc_per_node=8 --nnodes=$NUM_NODES --node_rank=0 \
+            --master_addr=$NODE0_IP --master_port=$master_port \
+            '$script' $extra_args"
     timeout "${TIMEOUT_S}" bash -c "$launch_node0" 2>&1 | tee "/tmp/${kernel}_node0.log"
     local RC0=${PIPESTATUS[0]}
-    wait "$NODE1_PID"
-    local RC1=$?
-    if [[ "$RC0" == "124" || "$RC1" == "124" ]]; then
-        echo "==== $kernel TIMEOUT after ${TIMEOUT_S}s (rc0=$RC0 rc1=$RC1) ===="
-        # Hard kill any stragglers
+
+    # Wait for peer nodes and collect their return codes.
+    local rc_sum=$RC0
+    local timed_out_any=$([[ "$RC0" == "124" ]] && echo 1 || echo 0)
+    local rc_summary="rc0=$RC0"
+    for ((i=1; i<NUM_NODES; i++)); do
+        local pid="${peer_pids[$((i-1))]}"
+        wait "$pid"
+        local rc=$?
+        rc_sum=$((rc_sum + rc))
+        rc_summary="$rc_summary  rc${i}=$rc"
+        [[ "$rc" == "124" ]] && timed_out_any=1
+    done
+    if (( timed_out_any )); then
+        echo "==== $kernel TIMEOUT after ${TIMEOUT_S}s ($rc_summary) ===="
+        # Hard kill any stragglers locally and on every peer.
         pkill -9 -f "${kernel}_bench.py" 2>/dev/null
-        ssh -o BatchMode=yes "$NODE1_SSH" "pkill -9 -f ${kernel}_bench.py" 2>/dev/null || true
+        for ((i=1; i<NUM_NODES; i++)); do
+            local ssh_var="NODE${i}_SSH"
+            ssh -o BatchMode=yes "${!ssh_var}" "pkill -9 -f ${kernel}_bench.py" 2>/dev/null || true
+        done
     fi
     cleanup_stale_benches
-    echo "==== $kernel done (node0 rc=$RC0  node1 rc=$RC1) ===="
-    return $((RC0 + RC1))
+    echo "==== $kernel done ($rc_summary) ===="
+    return $rc_sum
 }
 
 OVERALL=0

@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results  # noqa: E402
+from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
 
 KERNEL_NAME = "gemm_rs"
 from common import get_num_nodes  # noqa: E402
@@ -162,18 +162,24 @@ def main():
         os.environ["GEMM_RS_RDMA_CHUNK_TILES_RT"] = str(chunk_tiles)
 
         staging_bytes = m_local * n * 2  # bf16
-        recv_bytes = staging_bytes
-        total_inter_tiles = (m_local // ROW_BLOCK) * (n // COL_BLOCK)
+        # Per-peer sizing (1× at N == 2, identical to legacy).
+        n_peers = NUM_NODES - 1
+        recv_bytes = n_peers * staging_bytes
+        per_peer_inter_tiles = (m_local // ROW_BLOCK) * (n // COL_BLOCK)
+        total_inter_tiles = n_peers * per_peer_inter_tiles
         fifo_cap = 2048
         while fifo_cap < total_inter_tiles * 2:
             fifo_cap *= 2
 
         dist.barrier()
         print(f"[gemm_rs] node{node_idx}/lr{local_rank} pre create_session peer={peer_ip}:{tcp_port}", flush=True)
+        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             staging_buf.data_ptr(), staging_bytes,
             recv_bytes, total_inter_tiles, fifo_cap, local_rank,
+            peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
         print(f"[gemm_rs] node{node_idx}/lr{local_rank} post create_session", flush=True)
         fifo = mod.get_fifo_handles()
@@ -201,6 +207,7 @@ def main():
                 use_acquire_poll, reduce_poll_sleep_ns,
                 ready_chunk,
                 staging_dbuf,
+                num_nodes=NUM_NODES,
             )
 
         for wi in range(args.warmup):

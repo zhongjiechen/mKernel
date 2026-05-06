@@ -30,7 +30,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results  # noqa: E402
+from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
 
 KERNEL_NAME = "dispatch_gemm"
 
@@ -249,9 +249,14 @@ def main():
         send_buf = torch.empty((num_local_tokens, H),
                                 device="cuda", dtype=torch.bfloat16)
 
+        # Per-peer sizing. At N == 2 the multiplier is 1 — same buffer /
+        # arrival-flag sizing as the legacy single-peer setup.
+        n_peers = NUM_NODES - 1
+        recv_buf_chunks = n_peers * total_chunks
+
         dist.barrier()
         fifo_cap = 2048
-        while fifo_cap < total_chunks * 2:
+        while fifo_cap < recv_buf_chunks * 2:
             fifo_cap *= 2
 
         # ZERO_COPY baked on: peer_tokens IS the RDMA destination.
@@ -260,13 +265,16 @@ def main():
               f"creating session peer={peer_ip}:{tcp_port}", flush=True)
         # Zero-copy send: register pre_tokens as the proxy's data MR. Kernel
         # reads straight from pre_tokens — no send_buf pack required.
+        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             send_buf.data_ptr(), pre_tokens_bytes,
-            pre_tokens_bytes, total_chunks, fifo_cap, local_rank,
+            n_peers * pre_tokens_bytes, recv_buf_chunks, fifo_cap, local_rank,
             external_recv_buf_ptr,
             int(pre_tokens.data_.data_ptr()),
             pre_tokens_bytes,
+            peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
         print(f"[dispatch_gemm] node{node_idx}/lr{local_rank} session created", flush=True)
         fifo = mod.get_fifo_handles()
@@ -291,6 +299,7 @@ def main():
                 arrival_ptr, epoch,
                 node_idx, num_local_tokens, num_padded_local,
                 n_send, n_copy, n_comm,
+                num_nodes=NUM_NODES,
             )
 
         def reset_state():
