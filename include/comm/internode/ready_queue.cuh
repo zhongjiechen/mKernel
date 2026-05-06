@@ -19,8 +19,8 @@
 #include <cstring>
 #include <cuda_runtime.h>
 
-#ifndef OSGC_CUDACHECK
-#define OSGC_CUDACHECK(cmd) do { \
+#ifndef MKERNEL_CUDACHECK
+#define MKERNEL_CUDACHECK(cmd) do { \
     cudaError_t e = cmd; \
     if (e != cudaSuccess) { \
         fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
@@ -84,30 +84,30 @@ inline ReadyQueuePair create_ready_queue(uint32_t capacity) {
 
     // entries: host-mapped so CPU can write and GPU can read
     uint32_t* entries_host = nullptr;
-    OSGC_CUDACHECK(cudaHostAlloc(&entries_host, capacity * sizeof(uint32_t),
+    MKERNEL_CUDACHECK(cudaHostAlloc(&entries_host, capacity * sizeof(uint32_t),
                                   cudaHostAllocMapped));
     memset(entries_host, 0, capacity * sizeof(uint32_t));
     rq.host.entries_host = entries_host;
 
     // Get device pointer alias
     uint32_t* entries_dev = nullptr;
-    OSGC_CUDACHECK(cudaHostGetDevicePointer(&entries_dev, entries_host, 0));
+    MKERNEL_CUDACHECK(cudaHostGetDevicePointer(&entries_dev, entries_host, 0));
     rq.device.entries = reinterpret_cast<volatile uint32_t*>(entries_dev);
 
     // tail: host-mapped pinned memory
     uint32_t* tail_host = nullptr;
-    OSGC_CUDACHECK(cudaHostAlloc(&tail_host, sizeof(uint32_t),
+    MKERNEL_CUDACHECK(cudaHostAlloc(&tail_host, sizeof(uint32_t),
                                   cudaHostAllocMapped));
     *tail_host = 0;
     rq.host.tail_host = tail_host;
 
     uint32_t* tail_dev = nullptr;
-    OSGC_CUDACHECK(cudaHostGetDevicePointer(&tail_dev, tail_host, 0));
+    MKERNEL_CUDACHECK(cudaHostGetDevicePointer(&tail_dev, tail_host, 0));
     rq.device.tail = reinterpret_cast<volatile uint32_t*>(tail_dev);
 
     // head: device memory for fast GPU atomics
-    OSGC_CUDACHECK(cudaMalloc(&rq.device.head, sizeof(uint32_t)));
-    OSGC_CUDACHECK(cudaMemset(rq.device.head, 0, sizeof(uint32_t)));
+    MKERNEL_CUDACHECK(cudaMalloc(&rq.device.head, sizeof(uint32_t)));
+    MKERNEL_CUDACHECK(cudaMemset(rq.device.head, 0, sizeof(uint32_t)));
 
     rq.device.total = 0;
 
@@ -121,7 +121,7 @@ inline void reset_ready_queue(ReadyQueuePair& rq) {
     memset(rq.host.entries_host, 0, rq.host.capacity * sizeof(uint32_t));
     *rq.host.tail_host = 0;
     rq.host.local_tail = 0;
-    OSGC_CUDACHECK(cudaMemset(rq.device.head, 0, sizeof(uint32_t)));
+    MKERNEL_CUDACHECK(cudaMemset(rq.device.head, 0, sizeof(uint32_t)));
     rq.device.total = 0;
 }
 

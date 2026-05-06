@@ -6,7 +6,7 @@
 //
 // Why a header instead of a real library: these are pure inline asm wrappers,
 // so any compilation unit that uses them just needs the inline definition in
-// scope. Putting them under `osgc::atomic_u32::` keeps the call sites
+// scope. Putting them under `comm::atomic_u32::` keeps the call sites
 // self-documenting (you can read off the scope/ordering at the call) and lets
 // us rip the per-kernel duplicates that previously lived as `gemm_ar_*` /
 // `gemm_rs_*` near-identical copies.
@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-namespace osgc {
+namespace comm {
 namespace atomic_u32 {
 
 // ============================================================================
@@ -34,9 +34,14 @@ __device__ inline uint32_t acquire_load_gpu(PtrT* ptr) {
     uint32_t v;
     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
                  : "=r"(v)
-                 : "l"(reinterpret_cast<const uint32_t*>(ptr))
+                 : "l"(reinterpret_cast<const volatile uint32_t*>(ptr))
                  : "memory");
     return v;
+}
+
+template <typename PtrT>
+__device__ inline int32_t acquire_load_s32_gpu(PtrT* ptr) {
+    return static_cast<int32_t>(acquire_load_gpu(ptr));
 }
 
 // System-scope acquire: pairs with `.sys` release OR with NIC writes (e.g. an
@@ -47,9 +52,14 @@ __device__ inline uint32_t acquire_load_sys(PtrT* ptr) {
     uint32_t v;
     asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
                  : "=r"(v)
-                 : "l"(reinterpret_cast<const uint32_t*>(ptr))
+                 : "l"(reinterpret_cast<const volatile uint32_t*>(ptr))
                  : "memory");
     return v;
+}
+
+template <typename PtrT>
+__device__ inline int32_t acquire_load_s32_sys(PtrT* ptr) {
+    return static_cast<int32_t>(acquire_load_sys(ptr));
 }
 
 // ============================================================================
@@ -61,7 +71,7 @@ template <typename PtrT>
 __device__ inline void release_store_gpu(PtrT* ptr, uint32_t v) {
     asm volatile("st.release.gpu.global.u32 [%0], %1;"
                  :
-                 : "l"(reinterpret_cast<uint32_t*>(ptr)), "r"(v)
+                 : "l"(reinterpret_cast<volatile uint32_t*>(ptr)), "r"(v)
                  : "memory");
 }
 
@@ -69,7 +79,23 @@ template <typename PtrT>
 __device__ inline void release_store_sys(PtrT* ptr, uint32_t v) {
     asm volatile("st.release.sys.global.u32 [%0], %1;"
                  :
-                 : "l"(reinterpret_cast<uint32_t*>(ptr)), "r"(v)
+                 : "l"(reinterpret_cast<volatile uint32_t*>(ptr)), "r"(v)
+                 : "memory");
+}
+
+template <typename PtrT>
+__device__ inline void release_add_gpu(PtrT* ptr, int32_t v) {
+    asm volatile("red.release.gpu.global.add.s32 [%0], %1;"
+                 :
+                 : "l"(reinterpret_cast<volatile int32_t*>(ptr)), "r"(v)
+                 : "memory");
+}
+
+template <typename PtrT>
+__device__ inline void release_add_sys(PtrT* ptr, int32_t v) {
+    asm volatile("red.release.sys.global.add.s32 [%0], %1;"
+                 :
+                 : "l"(reinterpret_cast<volatile int32_t*>(ptr)), "r"(v)
                  : "memory");
 }
 
@@ -84,10 +110,40 @@ __device__ inline uint32_t relaxed_load_gpu(PtrT* ptr) {
     uint32_t v;
     asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
                  : "=r"(v)
-                 : "l"(reinterpret_cast<const uint32_t*>(ptr))
+                 : "l"(reinterpret_cast<const volatile uint32_t*>(ptr))
+                 : "memory");
+    return v;
+}
+
+template <typename PtrT>
+__device__ inline int32_t relaxed_load_s32_gpu(PtrT* ptr) {
+    return static_cast<int32_t>(relaxed_load_gpu(ptr));
+}
+
+template <typename PtrT>
+__device__ inline uint32_t relaxed_load_sys(PtrT* ptr) {
+    uint32_t v;
+    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                 : "=r"(v)
+                 : "l"(reinterpret_cast<const volatile uint32_t*>(ptr))
+                 : "memory");
+    return v;
+}
+
+template <typename PtrT>
+__device__ inline int32_t relaxed_load_s32_sys(PtrT* ptr) {
+    return static_cast<int32_t>(relaxed_load_sys(ptr));
+}
+
+template <typename PtrT>
+__device__ inline uint32_t volatile_load(PtrT* ptr) {
+    uint32_t v;
+    asm volatile("ld.volatile.global.u32 %0, [%1];"
+                 : "=r"(v)
+                 : "l"(reinterpret_cast<const volatile uint32_t*>(ptr))
                  : "memory");
     return v;
 }
 
 }  // namespace atomic_u32
-}  // namespace osgc
+}  // namespace comm

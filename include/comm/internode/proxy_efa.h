@@ -50,7 +50,7 @@ struct ProxyConfig {
     // batch is still single-QP (the existing batching invariant) — multiple
     // fifos just give multiple QP slices the proxy thread cycles through.
     // session_efa.h sets num_fifos = qps_per_proxy (one fifo per QP) when the
-    // OSGC_FIFO_PER_QP env is set; otherwise num_fifos = 1 and `fifo` is used.
+    // MKERNEL_FIFO_PER_QP env is set; otherwise num_fifos = 1 and `fifo` is used.
     D2HFifoHost** fifos     = nullptr;
     int           num_fifos = 1;
 
@@ -133,10 +133,7 @@ struct ProxyConfig {
     int           device_id = 0;
     bool          pin_proxy = true;
 
-    // R1 Commit 1: gate for the adaptive BATCH_SIZE / ACCUMULATE_SPINS
-    // controller inside Proxy::run(). Default false → byte-identical to the
-    // pre-R1 static post/poll loop. session_efa.h wires Q2_PROXY_PIPELINE
-    // into this field.
+    // Enables the adaptive post/poll controller inside Proxy::run().
     bool          pipeline_enabled = false;
 };
 
@@ -471,7 +468,7 @@ private:
     }
 
     static NotifyMode detect_notify_mode() {
-        const char* env = std::getenv("OSGC_EFA_VERBS_NOTIFY_MODE");
+        const char* env = std::getenv("MKERNEL_EFA_VERBS_NOTIFY_MODE");
         if (!env || !env[0]) return NotifyMode::WriteImm;
         if (std::strcmp(env, "remote_flag") == 0) return NotifyMode::RemoteFlag;
         return NotifyMode::WriteImm;
@@ -677,7 +674,7 @@ private:
      * local QP (round-robin), collects up to BATCH_SIZE commands, posts them
      * as a single ibv_wr_complete on that QP, then polls the shared CQ.
      *
-     * The notification mode is selected by OSGC_EFA_VERBS_NOTIFY_MODE:
+     * The notification mode is selected by MKERNEL_EFA_VERBS_NOTIFY_MODE:
      *   - write_imm   : data writes carry tile ids via immediate data
      *   - remote_flag : chain data write + remote flag write
      */

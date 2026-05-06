@@ -191,8 +191,8 @@ inline GpuRdmaBuffer alloc_and_register(ibv_pd* pd, size_t bytes,
     cudaGetDevice(&prev_device);
     if (prev_device != device_id) cudaSetDevice(device_id);
 
-    OSGC_CUDACHECK(cudaMalloc(&buf.gpu_ptr, bytes));
-    OSGC_CUDACHECK(cudaMemset(buf.gpu_ptr, 0, bytes));
+    MKERNEL_CUDACHECK(cudaMalloc(&buf.gpu_ptr, bytes));
+    MKERNEL_CUDACHECK(cudaMemset(buf.gpu_ptr, 0, bytes));
     buf.size = bytes;
 
     if (prev_device != device_id) cudaSetDevice(prev_device);

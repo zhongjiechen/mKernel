@@ -5,9 +5,16 @@
 
 #pragma once
 
-#include "../common/tk_common_base_types.cuh"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
-namespace kittens {
+namespace comm {
+
+using bf16 = __nv_bfloat16;
+using bf16_2 = __nv_bfloat162;
+using half = __half;
+using half_2 = __half2;
 
 enum class reduce_op {
     ADD = 0,
@@ -256,6 +263,11 @@ struct multimem<bf16> {
 
 template <>
 struct multimem<bf16_2> {
+    __device__ static inline void ld_reduce_add_weak_bits_no_clobber(uint32_t &dst, const bf16_2 *src) {
+        asm volatile("multimem.ld_reduce.weak.global.add.acc::f32.bf16x2 %0, [%1];"
+            : "=r"(dst) : "l"(src));
+    }
+
     template <reduce_op Op, memory_model M = memory_model::WEAK>
     __device__ static inline void ld_reduce(bf16_2 &dst, const bf16_2 *src) {
         if constexpr (Op == reduce_op::ADD) {
@@ -293,6 +305,14 @@ struct multimem<bf16_2> {
             asm volatile("multimem.st.release.sys.global.bf16x2 [%0], %1;"
                 :: "l"(dst), "r"(*reinterpret_cast<const uint32_t *>(&src)) : "memory");
         }
+    }
+    __device__ static inline void st_weak_bits_no_clobber(bf16_2 *dst, uint32_t src) {
+        asm volatile("multimem.st.weak.global.bf16x2 [%0], %1;"
+            :: "l"(dst), "r"(src));
+    }
+    __device__ static inline void st_global_bits_no_clobber(bf16_2 *dst, uint32_t src) {
+        asm volatile("st.global.u32 [%0], %1;"
+            :: "l"(dst), "r"(src));
     }
     template <reduce_op Op>
     __device__ static inline void red(bf16_2 *dst, const bf16_2 &src) {
@@ -404,4 +424,4 @@ struct multimem<half_2> {
     }
 };
 
-} // namespace kittens
+} // namespace comm

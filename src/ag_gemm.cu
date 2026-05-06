@@ -109,12 +109,12 @@ __device__ inline void intra_comm_sm(const globals& G) {
         //
         // Phase-2 task range mirrors phase-1: same (row_idx, col_idx) grid,
         // just indexing a different (source, dest) pair:
-        //   source: G.A_recv_gl (recv_buf unicast view, with A_comm_tile desc)
-        //   dest:   G.A_recv    (multicast PGL; writes fan out to all 8 ranks)
+        //   source: G.A_recv_local_tensor (recv_buf unicast view, with A_comm_tile desc)
+        //   dest:   G.A_recv    (multicast dbuf; writes fan out to all 8 ranks)
         // Signal plane 2[global_row_idx, col_idx] with count=1 to unblock
         // fused_comp_sm's remote-tile wait.
 
-        const int K_val = G.A_recv_gl.cols();
+        const int K_val = G.A_recv_local_tensor.cols();
         const int chunks_per_inter_rb = max(1,
             (globals::ROW_BLOCK * K_val * (int)sizeof(bf16)) / CHUNK_BYTES);
 
@@ -146,10 +146,8 @@ __device__ inline void intra_comm_sm(const globals& G) {
             // 128-row blocks, so wait for the lower and upper halves.
             const int first_chunk_a = (2 * global_row_idx)     * chunks_per_inter_rb;
             const int first_chunk_b = (2 * global_row_idx + 1) * chunks_per_inter_rb;
-            // Gen-3 run_23: adaptive split — poll matching sub-flags per rb.
-            // Compute same split as sender (from rb_bytes which equals
-            // chunks_per_inter_rb * CHUNK_BYTES for full-rb). Must match
-            // post_merge_wrs_for_intra_row exactly to poll correct flags.
+            // Poll the same sub-flags that the sender publishes for this
+            // row block.
             const int wait_split = 1;
             const int wait_chunks_per_sub = chunks_per_inter_rb;
             for (int sw = 0; sw < wait_split; ++sw) {
@@ -161,7 +159,7 @@ __device__ inline void intra_comm_sm(const globals& G) {
             __threadfence_system();
 
             tma::expect_bytes(inputs_arrived[warp_id], sizeof(globals::A_comm_tile));
-            tma::load_async(A_smem[warp_id], G.A_recv_gl, {global_row_idx, col_idx},
+            tma::load_async(A_smem[warp_id], G.A_recv_local_tensor, {global_row_idx, col_idx},
                             inputs_arrived[warp_id]);
             wait(inputs_arrived[warp_id], get_phasebit<0>(phasebits, warp_id));
             update_phasebit<0>(phasebits, warp_id);
@@ -180,12 +178,9 @@ __device__ inline void intra_comm_sm(const globals& G) {
 // Compute tile decode — shared between producer-load and producer-store warps
 // ============================================================================
 //
-// Plan step #5 (cross-port from ag_gemm_h100_static.cu:209-219): visit tiles
-// in SUPER_M (=12) row-major swizzle for L2 locality. Iterate local tiles
-// first (SUPER_M-swizzled), then remote tiles (SUPER_M-swizzled). Phase-major
-// — not tile-level interleave — because at large M/K the remote tiles wait on
-// multi-ms RDMA, and interleaving caused ~6% regression at 32K (job 6055).
-// Phase-major visits all cheap local tiles first, giving RDMA more runway.
+// Visit local tiles first, then remote tiles, using a SUPER_M row-major swizzle
+// for L2 locality. Keeping local and remote phases separate gives RDMA more
+// time to complete before remote tile consumption.
 //
 // Encoding: total_local_tiles = half_row_blocks*col_blocks.
 //   task_id < total_local_tiles           → local tile at flat=task_id
@@ -313,13 +308,6 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     __threadfence_system();
                 }
 
-                int c_row_idx;
-                if (!is_remote) {
-                    c_row_idx = row_idx + G.node_idx * half_row_blocks;
-                } else {
-                    c_row_idx = row_idx + (1 - G.node_idx) * half_row_blocks;
-                }
-
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                     // #4: per-K-strip wait on plane 0. Each intra col_chunk
                     // covers 2 compute K-strips, so wait when crossing boundary.
@@ -338,7 +326,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     for (int i = 0; i < 2; i++) {
                         if (is_remote) {
                             // #8: remote tiles live in the multicast-backed
-                            // A_recv PGL after phase-2. Read from this rank's
+                            // A_recv dbuf after phase-2. Read from this rank's
                             // unicast view (G.A_recv[dev_idx]).
                             tma::load_async(inputs[stage].A[i], G.A_recv[G.dev_idx],
                                             {shard_rb * 2 + i, red_idx}, inputs_arrived[stage]);
@@ -411,12 +399,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
 // from its arrival number, so no host-side counter init is needed and the
 // counter just grows monotonically (overflow at ~16 M iters at 132 CTAs/iter).
 //
-// Why this exists: previously the host issued a SECOND kernel launch
-// (barrier_reset) after fused_kernel just to clear the flag planes. Folding
-// the reset into fused_kernel's exit eliminates that launch entirely. Bench
-// (M=4096): 0.433 ms canonical → 0.389 ms with fast-path (-10%). The atomic
-// spin slightly beats a volatile load here because it forces L2 coherence on
-// every poll instead of waiting for eventual visibility.
+// Atomic polling forces L2 coherence on each check before the flag-plane reset.
 __device__ inline void grid_sync_at_epoch(const globals& G) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -480,7 +463,7 @@ void ag_gemm_fused_kernel_stub(const __grid_constant__ globals G) {
 void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int dynamic_shared_memory = config::DYNAMIC_SHARED_MEMORY;
-    OSGC_CUDACHECK(cudaFuncSetAttribute(
+    MKERNEL_CUDACHECK(cudaFuncSetAttribute(
         ag_gemm_fused_kernel_stub,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         dynamic_shared_memory));

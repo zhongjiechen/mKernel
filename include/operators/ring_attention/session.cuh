@@ -5,7 +5,7 @@
 // ============================================================================
 // Session management + pybind module
 // ============================================================================
-#include "comm/internode/session_select.h"
+#include "comm/internode/session_py.cuh"
 #include <cuda_runtime.h>
 #include <torch/csrc/utils/pybind.h>
 
@@ -19,11 +19,11 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int64_t k0_buf_size,
                        int64_t v0_buf_ptr,
                        int64_t v0_buf_size) {
-    if (g_session) { internode::destroy_session(g_session); g_session = nullptr; }
-    internode::SessionConfig cfg{};
-    cfg.rank = rank;
-    cfg.peer_ip = peer_ip.c_str();
-    cfg.tcp_port = tcp_port;
+    internode::py::destroy_session(g_session);
+    internode::SessionConfig cfg = internode::py::make_base_config(
+        rank, peer_ip.c_str(), tcp_port,
+        send_buf_ptr, send_buf_size, recv_buf_size,
+        num_tiles, fifo_capacity, device_id);
     // Zero-copy send: K0 (src_view=0) and V0 (src_view=1) registered as
     // DMA-BUF MRs. Proxy posts single-SGE WRs straight from the VMM tensors
     // — no pack copy. send_buf_ptr/size are kept in the signature for
@@ -38,34 +38,23 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     cfg.clocal_gpu_buf = reinterpret_cast<void*>(v0_buf_ptr);
     cfg.clocal_gpu_buf_size = (size_t)v0_buf_size;
     cfg.direct_dmabuf_enabled = true;
-    cfg.recv_buf_size = (size_t)recv_buf_size;
-    cfg.num_tiles = num_tiles;
-    cfg.fifo_capacity = fifo_capacity;
-    cfg.device_id = device_id;
     cfg.max_inflight = 2048;
     // Round 25: default to 4 QPs per endpoint to match the gemm_ar round-13 win
     // (51e19e8). Multi-NIC striping is also enabled by default via the
-    // round-18 cluster default OSGC_EFA_NUM_NICS=2 in session_fi.h.
+    // round-18 cluster default MKERNEL_EFA_NUM_NICS=2 in session_fi.h.
     cfg.num_qps = 4;
-    if (const char* env_num_qps = std::getenv("OSGC_EFA_NUM_QPS")) {
+    if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
         cfg.num_qps = std::atoi(env_num_qps);
     }
     g_session = internode::create_session(cfg);
 }
-void destroy_session_py() { if (g_session) { internode::destroy_session(g_session); g_session = nullptr; } }
-void set_epoch_py(int epoch) { if (g_session) internode::set_epoch(g_session, (uint32_t)epoch); }
+void destroy_session_py() { internode::py::destroy_session(g_session); }
+void set_epoch_py(int epoch) { internode::py::set_epoch(g_session, epoch); }
 std::tuple<int64_t, int64_t, int64_t, int64_t, int> get_fifo_handles_py() {
-    auto h = internode::get_fifo_device_handle(g_session);
-    if (h.num_fifos > 1) {
-        return {(int64_t)(&g_session->fifo_bundle), 0, 0, 0, -h.num_fifos};
-    }
-    auto fd = h.fifos[0];
-    return std::make_tuple(
-        (int64_t)fd.triggers, (int64_t)fd.head, (int64_t)fd.tail,
-        (int64_t)fd.tail_cache, fd.capacity);
+    return internode::py::get_fifo_handles(g_session);
 }
-int64_t get_arrival_flags_ptr_py() { return (int64_t)internode::get_arrival_device_ptr(g_session); }
-int64_t get_recv_buf_ptr_py() { return (int64_t)internode::get_recv_buf_ptr(g_session); }
+int64_t get_arrival_flags_ptr_py() { return internode::py::get_arrival_flags_ptr(g_session); }
+int64_t get_recv_buf_ptr_py() { return internode::py::get_recv_buf_ptr(g_session); }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);

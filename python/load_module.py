@@ -30,7 +30,7 @@ def load(name: str):
             f"{so} does not exist. Run `make {name}` (or `make all`) "
             f"from {ROOT} first."
         )
-    mod_name = f"osgc_release_{name}"
+    mod_name = f"mkernel_release_{name}"
     spec = importlib.util.spec_from_file_location(mod_name, so)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot create import spec for {so}")

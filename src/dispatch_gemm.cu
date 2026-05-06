@@ -68,10 +68,7 @@ __device__ inline void fused_inter_copy_sm(const fused_globals &G) {
                 // Proxy path: ld.acquire.sys.global is the synchronization
                 // edge — pairs with proxy's st.release.sys, no separate
                 // __threadfence_system needed (DeepEP-style).
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
-                             : "=r"(v)
-                             : "l"((uint32_t*)&G.arrival_flags[chunk_id])
-                             : "memory");
+                v = comm::atomic_u32::acquire_load_sys(&G.arrival_flags[chunk_id]);
                 if (v == G.epoch) break;
                 __nanosleep(100);
             } while (true);
@@ -86,8 +83,7 @@ __device__ inline void fused_inter_copy_sm(const fused_globals &G) {
         // writes by the CTA threads in stage-and-copy mode) to system scope,
         // paired with the consumer's ld.acquire.sys.global on copy_ready.
         if (threadIdx.x == 0) {
-            asm volatile("{st.release.sys.global.s32 [%0], %1;}"
-                         :: "l"(&G.copy_ready[G.dev_idx][{chunk_id}]), "r"(1) : "memory");
+            comm::atomic_u32::release_store_sys(&G.copy_ready[G.dev_idx][{chunk_id}], 1u);
         }
         __syncthreads();
     }
@@ -138,10 +134,8 @@ __device__ inline void dispatch_fused(const fused_globals &G, const int sm_idx) 
                     for (int c = first_chunk; c <= last_chunk; c++) {
                         int v;
                         do {
-                            asm volatile("{ld.acquire.sys.global.s32 %0, [%1];}"
-                                         : "=r"(v)
-                                         : "l"(&G.copy_ready[src_dev_idx][{c}])
-                                         : "memory");
+                            v = comm::atomic_u32::acquire_load_s32_sys(
+                                &G.copy_ready[src_dev_idx][{c}]);
                             // Throttle: chunks arrive on a 50us+ timescale
                             // (RDMA bandwidth), so an unthrottled spin only
                             // generates IPC/PCIe traffic without reducing
@@ -181,9 +175,7 @@ __device__ inline void dispatch_fused(const fused_globals &G, const int sm_idx) 
             fused_globals::ROW_BLOCK / fused_globals::TOKENS_PER_BLOCK;
         const int row_block = sm_idx / SLICES_PER_RB_LOCAL;
         const int count = __popc(valid_mask);
-        asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}"
-                     :: "l"(&G.barrier[G.dev_idx][{row_block}]),
-                        "r"(count) : "memory");
+        comm::atomic_u32::release_add_gpu(&G.barrier[G.dev_idx][{row_block}], count);
     }
 }
 
@@ -305,14 +297,12 @@ __device__ inline void group_gemm_fused(const fused_globals &G, const int sm_idx
                             // that 4x with no wall impact (waits are 100s of
                             // ns to us anyway).
                             int bar_val;
-                            asm volatile("{ld.acquire.gpu.global.s32 %0, [%1];}"
-                                         : "=r"(bar_val)
-                                         : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+                            bar_val = comm::atomic_u32::acquire_load_s32_gpu(
+                                &G.barrier[G.dev_idx][{row_idx}]);
                             while (bar_val != fused_globals::ROW_BLOCK) {
                                 __nanosleep(64);
-                                asm volatile("{ld.acquire.gpu.global.s32 %0, [%1];}"
-                                             : "=r"(bar_val)
-                                             : "l"(&G.barrier[G.dev_idx][{row_idx}]) : "memory");
+                                bar_val = comm::atomic_u32::acquire_load_s32_gpu(
+                                    &G.barrier[G.dev_idx][{row_idx}]);
                             }
                         }
                         __syncwarp();
@@ -488,10 +478,8 @@ void fused_kernel(const __grid_constant__ fused_globals G) {
         group_gemm_fused(G, comp_idx, G.num_comp_sms);
     }
 
-    // Opt C: fold barrier-zero cleanup into fused_kernel. Replaces the
-    // post-launch fused_cleanup_kernel<<<1, 256>>>(GC), eliminating its
-    // launch latency and stream-serialization tail (~0.7 ms wall at 131k).
-    // Last-arriving CTA does the zeroing — every CTA otherwise just atomicAdds.
+    // Last-arriving CTA clears per-row-block barriers in-kernel; all other CTAs
+    // only contribute to the cleanup counter.
     __shared__ int is_last_cta;
     __syncthreads();
     if (threadIdx.x == 0) {

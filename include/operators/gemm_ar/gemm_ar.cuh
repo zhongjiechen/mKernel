@@ -18,7 +18,7 @@
  */
 
 #include "common/types.cuh"
-#include "dist/dbuf.cuh"
+#include "dist/distributed_buffer.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
 #include "memory/tk_ops_group_group.cuh"
 #include "dist/tma.cuh"
@@ -37,8 +37,8 @@
 
 using namespace kittens;
 
-#ifndef TK_NUM_DEVICES
-#define TK_NUM_DEVICES 8
+#ifndef INTRA_NUM_DEVICES
+#define INTRA_NUM_DEVICES 8
 #endif
 
 namespace gemm_ar_multinode {
@@ -169,10 +169,8 @@ __device__ inline void slice_super_m_decode(
 }
 
 __host__ __device__ inline int gemm_ar_chunk_tiles(int col_blocks) {
-    // Shape-adaptive: at the largest shape (M=32768 → col_blocks=128) the
-    // per-WR overhead (fence/doorbell + post→CQE tail of ~215µs) dominates,
-    // so coarsen to 32 tiles/WR (~0.7ms saved at M=32768). Smaller shapes
-    // need finer granularity for the receiver pipeline, so stay at 4.
+    // Coarsen large rows to reduce per-WR overhead; keep smaller rows finer
+    // grained for the receiver pipeline.
     int chunk_tiles = (col_blocks >= 128) ? 32 : 4;
     return (chunk_tiles < col_blocks) ? chunk_tiles : col_blocks;
 }
@@ -200,7 +198,7 @@ static constexpr int TILE_BYTES = 128 * 256 * 2;
 // ============================================================================
 
 struct fused_globals {
-    static constexpr int NUM_DEVICES = TK_NUM_DEVICES;
+    static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int PIPELINE_STAGES = 4;
     static constexpr int SUPER_M = 12;
     static constexpr int ROW_BLOCK = 128;
@@ -214,18 +212,18 @@ struct fused_globals {
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
 
     // TMA descriptors
-    using A_gl = dist::gl<bf16, 1, 1, -1, -1, A_tile>;
-    using B_gl = dist::gl<bf16, 1, 1, -1, -1, B_tile>;
-    using C_pgl = dist::dbuf<dist::gl<bf16, 1, 1, -1, -1, C_tile>, NUM_DEVICES, true>;
-    using final_pgl = dist::dbuf<dist::gl<bf16, 1, 1, -1, -1, C_tile>, NUM_DEVICES, true>;
-    using barrier_pgl = dist::barrier_dbuf<NUM_DEVICES>;
+    using A_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, A_tile>;
+    using B_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, B_tile>;
+    using C_distributed_tensor = dist::distributed_tensor<dist::local_tensor<bf16, 1, 1, -1, -1, C_tile>, NUM_DEVICES, true>;
+    using final_distributed_tensor = dist::distributed_tensor<dist::local_tensor<bf16, 1, 1, -1, -1, C_tile>, NUM_DEVICES, true>;
+    using barrier_distributed_tensor = dist::barrier_distributed_tensor<NUM_DEVICES>;
 
     // GEMM inputs
-    A_gl A;
-    B_gl B;
-    C_pgl C;                  // IPC multicast buffer for intra-node all-reduce
-    final_pgl C_final;        // multicast-backed final output replicated intra-node
-    barrier_pgl barrier;      // per-tile barrier for compute→intra-AR handoff
+    A_local_tensor A;
+    B_local_tensor B;
+    C_distributed_tensor C;                  // IPC multicast buffer for intra-node all-reduce
+    final_distributed_tensor C_final;        // multicast-backed final output replicated intra-node
+    barrier_distributed_tensor barrier;      // per-tile barrier for compute→intra-AR handoff
 
     // Inter-node RDMA
     bf16* C_local;            // raw pointer to C.data_ (intra-reduced result)
@@ -327,13 +325,8 @@ struct fused_globals {
     int remote_queue_stride;
     int defer_final_multicast_finish;
     int work_steal_enabled;
-    // Iter-44 D×S×F: when true, the intra-AR xdev barrier wait spins with
-    // `ld.acquire.sys.global.s32` (via wait_acquire()) instead of the canonical
-    // `ld.relaxed.sys.global.s32` (via wait()). Set from the host launch arg
-    // `use_acquire_poll` (default false). Branch is per-wait-call, not per-load:
-    // the compiler hoists the compare out of the spin body, so the hot-path PTX
-    // is identical to canonical when false. Only affects the canonical (probe-
-    // OFF) path; probe-ON uses `wait_with_tickcount()` unchanged.
+    // When true, intra-AR xdev barrier waits use acquire loads instead of
+    // relaxed loads. The branch is outside the spin body.
     bool use_acquire_poll = false;
     uint32_t r8_warp_spec = 0;
     int total_chunks;
@@ -365,15 +358,11 @@ __device__ __forceinline__ internode::D2HFifoDevice gemm_ar_send_fifo_for_lane(
     return internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, lane_id);
 }
 
-// v2: per-CTA TX path for gemm_ar under EFAGDA. Calls into TxQpDevice's
-// single-producer write_with_imm. `send_id` selects this CTA's owned TX QP;
-// `target_rx_id` selects the remote RX QP to address (= the receiver's
-// logical_q for gemm_ar.s drain semantics). Under proxy/IBGDA we delegate to the
-// legacy fifo.push() path.
+// Per-CTA TX path for gemm_ar. `send_id` selects this CTA's logical sender,
+// `target_rx_id` selects the remote logical queue. The current proxy backend
+// delegates to the FIFO push path.
 //
-// `cmd` is the same TransferCmd the proxy backend reads. We pull
-// (local_offset, bytes, remote_offset, src_view, tile_id, num_tiles) out of
-// it and let the EFAGDA path build the WQE directly.
+// `cmd` is the same TransferCmd the proxy backend reads.
 __device__ __forceinline__ void gemm_ar_post_send_cmd(
     const fused_globals& G,
     int send_id,
@@ -387,21 +376,21 @@ __device__ __forceinline__ void gemm_ar_post_send_cmd(
 // Batched-flush variant: enqueue WQE only (no fence, no DB). Pair with
 // gemm_ar_flush_send_qp() after all enqueues for the same TX QP. Mirrors
 // reference's flush_batch (gda_endpoint.cuh:163-195) which amortizes one
-// __threadfence_system across multiple WQEs. Falls back to gemm_ar_post_send_cmd
-// under proxy/IBGDA.
+// __threadfence_system across multiple WQEs. The proxy backend falls back to
+// gemm_ar_post_send_cmd.
 __device__ __forceinline__ void gemm_ar_enqueue_send_cmd(
     const fused_globals& G,
     int send_id,
     int target_rx_id,
     const internode::TransferCmd& cmd
 ) {
-    // Proxy/IBGDA paths post immediately on each call — no batched flush.
+    // Proxy path posts immediately on each call — no batched flush.
     gemm_ar_post_send_cmd(G, send_id, target_rx_id, cmd);
 }
 
 // Flush previously-enqueued WQEs on this CTA's TX QP: one __threadfence_system
-// followed by one doorbell ring at the current pc. No-op under proxy/IBGDA
-// (those backends post per-call). Matches reference's pattern of one fence +
+// followed by one doorbell ring at the current pc. No-op under the proxy
+// backend, which posts per call. Matches reference's pattern of one fence +
 // N doorbells per flush_batch.
 __device__ __forceinline__ void gemm_ar_flush_send_qp(
     const fused_globals& G,
@@ -454,9 +443,7 @@ __device__ inline void gemm_ar_cross_node_barrier_push_from(
     if (blockIdx.x == push_block_id && threadIdx.x == 0) {
         internode::TransferCmd cmd{};
         cmd.cmd_type = internode::CmdType::BARRIER_NOTIFY;
-        unsigned long long _bt;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_bt));
-        cmd.enqueue_device_ns = _bt;
+        cmd.enqueue_device_ns = comm::globaltimer();
         gemm_ar_send_fifo_for_lane(G, 0).push(cmd);
     }
 
@@ -478,17 +465,14 @@ __device__ inline void gemm_ar_cross_node_barrier_push_from(
             while (*G.cross_node_barrier < G.epoch) {
             }
             if (G.xnode_ready_device != nullptr) {
-                asm volatile("st.global.release.gpu.u32 [%0], %1;"
-                             :: "l"(G.xnode_ready_device), "r"(G.epoch)
-                             : "memory");
+                comm::atomic_u32::release_store_gpu(G.xnode_ready_device, G.epoch);
             }
         }
     } else if (G.xnode_ready_device != nullptr) {
         if (threadIdx.x == 0) {
             uint32_t v;
             do {
-                asm volatile("ld.acquire.gpu.u32 %0, [%1];"
-                             : "=r"(v) : "l"(G.xnode_ready_device) : "memory");
+                v = comm::atomic_u32::acquire_load_gpu(G.xnode_ready_device);
             } while (v < G.epoch);
         }
     } else {
@@ -548,9 +532,7 @@ __device__ inline void gemm_ar_hierarchical_xnode_barrier(
     // >= ours.
     internode::TransferCmd cmd{};
     cmd.cmd_type = internode::CmdType::BARRIER_NOTIFY;
-    unsigned long long _bt;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_bt));
-    cmd.enqueue_device_ns = _bt;
+    cmd.enqueue_device_ns = comm::globaltimer();
     gemm_ar_send_fifo_for_lane(G, 0).push(cmd);
 
 
@@ -558,7 +540,7 @@ __device__ inline void gemm_ar_hierarchical_xnode_barrier(
     // via peer's RDMA) are observed with proper ordering.
     uint32_t v;
     do {
-        v = osgc::atomic_u32::acquire_load_sys(const_cast<uint32_t*>(G.cross_node_barrier));
+        v = comm::atomic_u32::acquire_load_sys(const_cast<uint32_t*>(G.cross_node_barrier));
     } while (v < G.epoch);
 
 }
@@ -579,9 +561,7 @@ __device__ inline void gemm_ar_xbar_push_only(
     if (blockIdx.x != driver_block_id || threadIdx.x != 0) return;
     internode::TransferCmd cmd{};
     cmd.cmd_type = internode::CmdType::BARRIER_NOTIFY;
-    unsigned long long _bt;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_bt));
-    cmd.enqueue_device_ns = _bt;
+    cmd.enqueue_device_ns = comm::globaltimer();
     gemm_ar_send_fifo_for_lane(G, 0).push(cmd);
 }
 
@@ -592,7 +572,7 @@ __device__ inline void gemm_ar_xbar_wait_only(
     if (blockIdx.x != driver_block_id || threadIdx.x != 0) return;
     uint32_t v;
     do {
-        v = osgc::atomic_u32::acquire_load_sys(const_cast<uint32_t*>(G.cross_node_barrier));
+        v = comm::atomic_u32::acquire_load_sys(const_cast<uint32_t*>(G.cross_node_barrier));
     } while (v < G.epoch);
 }
 
@@ -656,17 +636,17 @@ __device__ __host__ inline int gemm_ar_chunk_first_tile(
 // published by other CTAs on this device with at-least acquire ordering.
 // Inline PTX with "memory" clobber so the compiler cannot CSE or cache
 // the result across calls (unlike a plain `const uint32_t*` helper, which
-// `osgc::atomic_u32::acquire_load_gpu` / `release_store_gpu` come from
+// `comm::atomic_u32::acquire_load_gpu` / `release_store_gpu` come from
 // include/comm/atomic_u32.cuh — single-instruction PTX wrappers shared with
 // gemm_rs (and any future kernel that needs the same primitive). Aliased
 // here so existing call sites keep working.
 template <typename PtrT>
 __device__ inline uint32_t gemm_ar_acquire_load_u32(PtrT* ptr) {
-    return osgc::atomic_u32::acquire_load_gpu(ptr);
+    return comm::atomic_u32::acquire_load_gpu(ptr);
 }
 template <typename PtrT>
 __device__ inline void gemm_ar_release_store_u32(PtrT* ptr, uint32_t val) {
-    osgc::atomic_u32::release_store_gpu(ptr, val);
+    comm::atomic_u32::release_store_gpu(ptr, val);
 }
 
 __device__ inline int gemm_ar_load_chunk_remote_arrived(const fused_globals& G, int chunk_id) {
@@ -674,12 +654,7 @@ __device__ inline int gemm_ar_load_chunk_remote_arrived(const fused_globals& G, 
 }
 
 __device__ inline uint32_t gemm_ar_load_arrival_word(volatile uint32_t* ptr) {
-    uint32_t val;
-    asm volatile("ld.volatile.global.u32 %0, [%1];"
-        : "=r"(val)
-        : "l"((const uint32_t*)ptr)
-        : "memory");
-    return val;
+    return comm::atomic_u32::volatile_load(ptr);
 }
 
 __device__ inline uint32_t gemm_ar_load_arrival_queue_tail(const fused_globals& G, int q) {
@@ -765,9 +740,7 @@ __device__ inline bool gemm_ar_deadlock_debug_enabled(const fused_globals& G) {
 }
 
 __device__ inline unsigned long long gemm_ar_globaltimer() {
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    return t;
+    return comm::globaltimer();
 }
 
 
@@ -802,7 +775,7 @@ __device__ inline void gemm_ar_debug_maybe_dump_stuck(
     (void)scan_stride;
 }
 
-__device__ inline coord<ducks::default_type> gemm_ar_final_slice_slot(int dev_idx, uint32_t epoch) {
+__device__ inline dist::coord gemm_ar_final_slice_slot(int dev_idx, uint32_t epoch) {
     // Per-epoch row so back-to-back iters under GEMM_AR_STEADY_STATE_BENCH do not
     // reuse the same slot (otherwise, with no kernel-side reset, iter N leaves
     // value=1 and iter N+1's signal_all becomes 2 → wait_mc(==1) hangs).
@@ -827,10 +800,10 @@ __device__ inline void gemm_ar_publish_final_vec8(
     // Stores are to independent adjacent addresses — no ordering needed.
     // Cross-chunk ordering is handled by __threadfence() + published_chunks.
     // Same pattern as the pipelined intra-AR tile (gemm_ar_pipelined_ar_tile).
-    asm volatile("multimem.st.weak.global.bf16x2 [%0], %1;" :: "l"(ptr0), "r"(packed.x));
-    asm volatile("multimem.st.weak.global.bf16x2 [%0], %1;" :: "l"(ptr1), "r"(packed.y));
-    asm volatile("multimem.st.weak.global.bf16x2 [%0], %1;" :: "l"(ptr2), "r"(packed.z));
-    asm volatile("multimem.st.weak.global.bf16x2 [%0], %1;" :: "l"(ptr3), "r"(packed.w));
+    comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(ptr0, packed.x);
+    comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(ptr1, packed.y);
+    comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(ptr2, packed.z);
+    comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(ptr3, packed.w);
 }
 
 
@@ -984,10 +957,7 @@ __host__ inline gemm_ar_role_split gemm_ar_compute_role_split(int num_intra_comm
 #endif
     split.num_inter_reduce_publish_sms = num_inter_comm_sms - split.num_inter_send_sms;
     // Unified inter-reduce path: every inter-reduce CTA both polls arrival
-    // flags and performs the reduction (via shared_reduce_my_slice). Splitting
-    // into dedicated recv_progress + reduce_store CTAs (the old
-    // GEMM_AR_SPLIT_INTER_REDUCE path) showed no perf benefit at M=32768 in the
-    // CTA sweep, so the split is retired to simplify the code.
+    // flags and performs reduction.
     split.num_inter_recv_progress_sms = 0;
     split.num_inter_reduce_store_sms = split.num_inter_reduce_publish_sms;
     split.num_comp_sms = config::NUM_BLOCKS - num_intra_comm_sms
@@ -1098,7 +1068,7 @@ __host__ inline gemm_ar_scratch_layout gemm_ar_compute_scratch_layout(
 }
 
 __host__ inline bool gemm_ar_deadlock_debug_enabled_host() {
-    const char* env = std::getenv("OSGC_GEMM_AR_DEADLOCK_DEBUG");
+    const char* env = std::getenv("MKERNEL_GEMM_AR_DEADLOCK_DEBUG");
     return env != nullptr && env[0] == '1';
 }
 
@@ -1139,11 +1109,11 @@ __host__ inline fused_globals gemm_ar_make_globals(
     int64_t cross_node_barrier_ptr = 0
 ) {
     fused_globals G{
-        .A = ::dist::gl_from_tensor<fused_globals::A_gl>(A),
-        .B = ::dist::gl_from_tensor<fused_globals::B_gl>(B),
-        .C = ::dist::dbuf_from_buffer<fused_globals::C_pgl>(C),
-        .C_final = ::dist::dbuf_from_buffer<fused_globals::final_pgl>(C_final),
-        .barrier = ::dist::dbuf_from_buffer<fused_globals::barrier_pgl>(barrier),
+        .A = ::dist::local_tensor_from_tensor<fused_globals::A_local_tensor>(A),
+        .B = ::dist::local_tensor_from_tensor<fused_globals::B_local_tensor>(B),
+        .C = ::dist::distributed_tensor_from_buffer<fused_globals::C_distributed_tensor>(C),
+        .C_final = ::dist::distributed_tensor_from_buffer<fused_globals::final_distributed_tensor>(C_final),
+        .barrier = ::dist::distributed_tensor_from_buffer<fused_globals::barrier_distributed_tensor>(barrier),
         .C_local = reinterpret_cast<bf16*>(C.data_.data_ptr()),
         .C_recv = reinterpret_cast<bf16*>(recv_buf_ptr),
         .staging_buf = reinterpret_cast<bf16*>(staging_buf_ptr),
@@ -1228,7 +1198,7 @@ __host__ inline fused_globals gemm_ar_make_globals(
             reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.reduce_cursor_offset,
         .chunk_claimed_flag =
             reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.chunk_claimed_flag_offset,
-        .N = B.size(1),
+        .N = static_cast<int>(B.size(1)),
         .dev_idx = C.local_rank_,
         .node_idx = node_idx,
         .slice_rows = scratch.slice_rows,
@@ -1294,9 +1264,7 @@ void entrypoint(
     int64_t rq_head_ptr = 0, int rq_capacity = 0, int rq_total = 0,
     int64_t cross_node_barrier_ptr = 0,
     int trace_slot = -1,
-    // Iter-44 D×S×F: launch-time gate that, when true, selects
-    // `wait_acquire()` (ld.acquire.sys) over `wait()` (ld.relaxed.sys) at the
-    // intra-AR xdev barrier wait. Default false preserves canonical behavior.
+    // Select acquire vs relaxed loads for the intra-AR xdev barrier wait.
     bool use_acquire_poll = false
 ) {
     const int dev_idx = C.local_rank_;
@@ -1308,7 +1276,6 @@ void entrypoint(
     if (num_allocated_remote_queues < num_remote_queues) num_allocated_remote_queues = num_remote_queues;
 
     const gemm_ar_role_split split = gemm_ar_compute_role_split(num_intra_comm_sms, num_inter_comm_sms);
-    const int num_inter_send = split.num_inter_send_sms;
     const int num_inter_reduce_publish = split.num_inter_reduce_publish_sms;
     const int num_inter_reduce_store = split.num_inter_reduce_store_sms;
     const int num_comp_sms = split.num_comp_sms;
@@ -1318,9 +1285,8 @@ void entrypoint(
 
     const gemm_ar_scratch_layout scratch =
         gemm_ar_compute_scratch_layout(M, N, num_remote_queues, num_allocated_remote_queues);
-    // scratch_ints == 0 means caller didn't pass an explicit size; fall back to
-    // total_tiles (legacy behaviour). When caller passes the actual buffer size
-    // (e.g. from _compute_scratch_ints_needed), use that instead.
+    // scratch_ints == 0 means caller did not pass an explicit size; fall back
+    // to total_tiles. Otherwise use the actual provided buffer size.
     const int ar_done_buf_size = (scratch_ints > 0) ? scratch_ints : scratch.total_tiles;
     TORCH_CHECK(
         scratch.scratch_ints_needed <= ar_done_buf_size,
@@ -1328,21 +1294,9 @@ void entrypoint(
         scratch.scratch_ints_needed, " ints but got ", ar_done_buf_size);
     gemm_ar_init_debug_scratch(ar_done_ptr, scratch, num_remote_queues);
 
-    internode::D2HFifoDeviceBundle fifo_bundle{};
-    if (fifo_capacity < 0) {
-        auto* bundle_ptr =
-            reinterpret_cast<const internode::D2HFifoDeviceBundle*>(fifo_triggers);
-        TORCH_CHECK(bundle_ptr != nullptr, "multi-proxy FIFO bundle pointer is null");
-        fifo_bundle = *bundle_ptr;
-    } else {
-        internode::D2HFifoDevice fd{};
-        fd.triggers = reinterpret_cast<internode::TransferCmd*>(fifo_triggers);
-        fd.head = reinterpret_cast<uint64_t*>(fifo_head);
-        fd.tail = reinterpret_cast<uint64_t*>(fifo_tail);
-        fd.tail_cache = reinterpret_cast<uint64_t*>(fifo_tail_cache);
-        fd.capacity = fifo_capacity;
-        fifo_bundle = internode::make_fifo_bundle(fd, num_qps, 1);
-    }
+    auto fifo_bundle = internode::resolve_fifo_bundle(
+        fifo_triggers, fifo_head, fifo_tail, fifo_tail_cache, fifo_capacity,
+        num_qps, 1, nullptr, "multi-proxy FIFO bundle pointer is null");
 
     fused_globals G = gemm_ar_make_globals(
         A, B, C, barrier, C_final,
@@ -1362,8 +1316,6 @@ void entrypoint(
         const char* r8_env = std::getenv("GEMM_AR_R8_WARP_SPEC");
         G.r8_warp_spec = (r8_env != nullptr && r8_env[0] == '1') ? 1u : 0u;
     }
-    // Iter-44 D×S×F: plumb the launch-time acquire-vs-relaxed gate into the
-    // kernel globals struct. Default false preserves canonical behavior.
     G.use_acquire_poll = use_acquire_poll;
 
 

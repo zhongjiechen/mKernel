@@ -20,10 +20,16 @@
 
 #pragma once
 
-#include "dbuf.cuh"
+#include "distributed_buffer.cuh"
+#include "../comm/atomic_u32.cuh"
 #include "../comm/internode/d2h_fifo.cuh"
 #include "../comm/internode/types.h"
+#if defined(INTERNODE_BACKEND_EFA) || defined(INTERNODE_BACKEND_IBVERBS)
+#include "../comm/internode/session_select.h"
+#else
+// Keep editor tooling usable when compile-time backend defines are absent.
 #include "../comm/internode/session_efa.h"
+#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -36,7 +42,7 @@ namespace dist {
 template<typename GL, int LOCAL_SIZE, bool MULTICAST,
          int NUM_CHANNELS, int NUM_NODES, typename... TMA_Types>
 __device__ inline void
-dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
+distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
 ::enqueue_send(int channel, uint32_t tile_id, uint16_t dst_node,
                uint64_t off, uint32_t bytes, uint32_t imm) const {
     const auto& ch = channels[channel];
@@ -48,8 +54,7 @@ dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
     // Backpressure: spin until consumer (comm CTA) has caught up.
     uint32_t t;
     while (true) {
-        asm volatile("ld.acquire.gpu.b32 %0, [%1];"
-                     : "=r"(t) : "l"(&ch.tail->v));
+        t = comm::atomic_u32::acquire_load_gpu(&ch.tail->v);
         if (h - t < ch.ring_capacity) break;
         __nanosleep(64);
     }
@@ -63,14 +68,13 @@ dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
 
     // Release-store the new head so the comm CTA's acquire-load sees the
     // fully-written job before the index advance.
-    asm volatile("st.release.gpu.b32 [%0], %1;"
-                 :: "l"(&ch.head->v), "r"(h + 1u) : "memory");
+    comm::atomic_u32::release_store_gpu(&ch.head->v, h + 1u);
 }
 
 template<typename GL, int LOCAL_SIZE, bool MULTICAST,
          int NUM_CHANNELS, int NUM_NODES, typename... TMA_Types>
 __device__ inline bool
-dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
+distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
 ::try_dequeue_send(int channel, SendJob* out) const {
     const auto& ch = channels[channel];
     const uint32_t mask = ch.ring_capacity - 1u;
@@ -78,21 +82,19 @@ dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
     // Single-consumer tail.
     uint32_t t = ch.tail->v;
     uint32_t h;
-    asm volatile("ld.acquire.gpu.b32 %0, [%1];"
-                 : "=r"(h) : "l"(&ch.head->v));
+    h = comm::atomic_u32::acquire_load_gpu(&ch.head->v);
     if (t == h) return false;
 
     *out = ch.ring[t & mask];
 
-    asm volatile("st.release.gpu.b32 [%0], %1;"
-                 :: "l"(&ch.tail->v), "r"(t + 1u) : "memory");
+    comm::atomic_u32::release_store_gpu(&ch.tail->v, t + 1u);
     return true;
 }
 
 template<typename GL, int LOCAL_SIZE, bool MULTICAST,
          int NUM_CHANNELS, int NUM_NODES, typename... TMA_Types>
 __device__ inline void
-dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
+distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
 ::put_inter(int channel, int dst_node,
             uint64_t local_off, uint64_t remote_off,
             uint32_t bytes, uint32_t imm, uint32_t lane_id) const {
@@ -122,7 +124,7 @@ dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
 template<typename GL, int LOCAL_SIZE, bool MULTICAST,
          int NUM_CHANNELS, int NUM_NODES, typename... TMA_Types>
 __device__ inline void
-dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
+distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
 ::flush_inter(int /*channel*/) const {
     // CPU-proxy backend: no doorbell to ring on the GPU side. The CPU proxy
     // already amortizes WQE posts internally as it drains the FIFO.
@@ -131,7 +133,7 @@ dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
 template<typename GL, int LOCAL_SIZE, bool MULTICAST,
          int NUM_CHANNELS, int NUM_NODES, typename... TMA_Types>
 __device__ inline void
-dbuf<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
+distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types...>
 ::drain_step(int /*channel*/) const {
     // CPU-proxy backend: the CPU thread drains the receive CQ and writes
     // arrived[].v on each WRITE_WITH_IMM completion. Nothing to do here.

@@ -15,12 +15,6 @@
 #include "rdma_transport.h"
 #include "proxy_diagnostics.h"
 
-// The entire CPU-proxy class is inert under IBGDA (GPU posts WQEs directly).
-// proxy_diagnostics.h already defines ProxyTimestamps/ProxyDiagnostics/
-// ProxyTimeline, so session.h's ifdef-guarded accessors can return empty
-// instances under IBGDA without any forward-declaration help.
-#if !defined(INTERNODE_BACKEND_IBGDA)
-
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -943,5 +937,3 @@ private:
 };
 
 } // namespace internode
-
-#endif  // !INTERNODE_BACKEND_IBGDA

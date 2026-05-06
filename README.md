@@ -15,7 +15,6 @@
 ## Roadmap
 - ✅ Fused, GPU-driven multi-node kernels
 - ✅ Add CX7 and EFA backend
-- 🚧 Support for IBGDA and EFAGDA
 - 🚧 Full support for heterogeneous accelerators and NICs
   - 🚧 Topology-aware accelerator and NIC discovery, placement, and routing
 - 🚧 Internode megakernels
