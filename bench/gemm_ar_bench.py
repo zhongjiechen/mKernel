@@ -145,7 +145,7 @@ def parse_args():
     # (especially M=2048, where it produced occasional bimodal slow iters that
     # inflated the median). 10 warmup iters keeps the timed window warm reliably.
     p.add_argument("--warmup", type=int, default=int(os.environ.get("MKERNEL_GEMM_AR_WARMUP", "10")))
-    p.add_argument("--iters", type=int, default=int(os.environ.get("MKERNEL_GEMM_AR_ITERS", "7")))
+    p.add_argument("--iters", type=int, default=int(os.environ.get("MKERNEL_GEMM_AR_ITERS", "10")))
     p.add_argument("--num-comm-sms", type=int, default=64)
     p.add_argument("--num-intra-comm-sms", type=int, default=None)
     p.add_argument("--num-inter-send-sms", type=int, default=None)

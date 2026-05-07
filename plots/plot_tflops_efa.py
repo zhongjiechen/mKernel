@@ -47,7 +47,10 @@ TRITON_DIST_DIR = EXTERNAL / "triton_dist" / "results"
 # Triton-dist baseline from best_baseline().
 TRITON_DIST_KEY = {
     "ag_gemm":        "q1",
-    "gemm_ar":        "q2",  # NCCL-equivalent (no real inter-node TD kernel)
+    # gemm_ar (q2) intentionally omitted: TritonDist has no inter-node
+    # GEMM+AllReduce kernel (`create_gemm_ar_context` asserts world ==
+    # local_world). The published q2_efa.json values are NCCL-equivalent
+    # placeholders and would duplicate the NCCL bar with a different color.
     "dispatch_gemm":  "q3",
     "gemm_rs":        "q5",
     # ring_attention (q4) has no Triton-dist baseline.
@@ -496,7 +499,10 @@ def render_kernel_chart(kernel: str, ax=None, value_fontsize=13):
             ("FA2+NCCL",          "#4C72B0", nccl_tf),
             ("Mercury",           "#9D755D", mercury_tf),
             ("MagiAttention",     "#C45BAF", magi_tf),
-            ("TE-CP (ring)",      "#54A24B", te_p2p_tf),
+            # TE-CP omitted: cuDNN backend unreproducible on current cluster
+            # (system cuda-13-0 conf added; cuDNN-frontend libcudart probe
+            # fails); FA2-fallback was 290 ms at seq=12288 = ~2× Magi but
+            # adds visual clutter without changing best-baseline.
             ("ring-flash-attn",   "#E45756", rfa_tf),
             ("mKernel",           "#F58518", fused_tf),
         ]

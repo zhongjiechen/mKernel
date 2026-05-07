@@ -60,8 +60,8 @@ def parse_args():
     p.add_argument("--mode", choices=["check", "bench"], default="bench")
     p.add_argument("--shapes", type=str,
                    default=",".join(str(s) for s in DEFAULT_SHAPES))
-    p.add_argument("--warmup", type=int, default=6)
-    p.add_argument("--iters", type=int, default=7)
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--iters", type=int, default=10)
     # SM split (per-shape tuned per INSTRUCTION.md §2).
     p.add_argument("--num-comm-sms", type=int, default=None)
     p.add_argument("--num-send-sms", type=int, default=None)

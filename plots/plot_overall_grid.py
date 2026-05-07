@@ -88,12 +88,12 @@ def main():
         extra_baselines = ()
         if kernel == "ring_attention":
             # Apples-to-apples = same head-sharding assumption (full H per rank).
-            # We exclude TE-CP a2a+p2p (Ulysses+ring) because it shards heads
-            # H/8 per rank — different parallelization. All others (Mercury,
-            # MagiAttention, FA2+NCCL, TE-CP-ring, ring-flash-attn) keep full-H.
-            mercury_tf, magi_tf, te_p2p_tf, _te_a2ap2p_tf, rfa_tf = \
+            # TE-CP omitted entirely: cuDNN backend unreproducible on current
+            # cluster (system cuda-13 conf shadowing causes libcudart probe
+            # failure); FA2 fallback adds clutter without flipping best-baseline.
+            mercury_tf, magi_tf, _te_p2p_tf, _te_a2ap2p_tf, rfa_tf = \
                 _load_external_q4(shapes)
-            extra_baselines = (mercury_tf, magi_tf, te_p2p_tf, rfa_tf)
+            extra_baselines = (mercury_tf, magi_tf, rfa_tf)
         # Triton-distributed: only include as a separate best-baseline
         # candidate when the published JSON is a NATIVE Triton-dist run (label
         # "Triton-distributed"). Skip "NCCL (Triton-dist fallback)" entries
