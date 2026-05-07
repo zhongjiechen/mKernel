@@ -18,10 +18,9 @@ os.environ.setdefault("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET", "1")
 # Fast prepare_epoch: skip cudaDeviceSynchronize + pause/drain_cq/reset (level 2).
 # Safe when MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1 because commit_epoch's
 # skip path doesn't reset proxy CQ/inflight, so pausing+draining in prepare_epoch
-# is overhead. drain_proxy itself is still load-bearing (level 3 hangs — the
+# is overhead. drain_proxy itself remains load-bearing (level 3 hangs — the
 # FIFO consistency invariant from session_efa.h:1017 needs the cursor sync).
-# Per-iter prepare_epoch drops ~50-150us → ~30us at steady state. See
-# agent_team/team_v4/artifacts/LEARNINGS.md Attempt 5.
+# Per-iter prepare_epoch drops ~50-150us → ~30us at steady state.
 os.environ.setdefault("MKERNEL_PREP_EPOCH_FAST", "2")
 
 import torch
@@ -140,12 +139,11 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["check", "bench"], default="bench")
     p.add_argument("--shapes", type=str, default=",".join(str(s) for s in DEFAULT_SHAPES))
-    # Default warmup bumped 6→10 (team_v4 cycle): under canonical no-sync timing,
-    # the per-iter `set_epoch` cudaDeviceSynchronize re-cold-starts the EFA proxy
-    # and 6 warmup iters were not enough to fully clear the cold-proxy state at
-    # small M (especially M=2048, where it produced occasional bimodal slow iters
-    # that inflated the median). 10 warmup iters keeps the timed window in the
-    # warm cluster reliably. See agent_team/team_v4/artifacts/GEMM_AR_M2048_TRIAGE.md.
+    # Warmup default 10: under canonical no-sync timing, the per-iter
+    # `set_epoch` cudaDeviceSynchronize re-cold-starts the EFA proxy and fewer
+    # warmup iters did not fully clear the cold-proxy state at small M
+    # (especially M=2048, where it produced occasional bimodal slow iters that
+    # inflated the median). 10 warmup iters keeps the timed window warm reliably.
     p.add_argument("--warmup", type=int, default=int(os.environ.get("MKERNEL_GEMM_AR_WARMUP", "10")))
     p.add_argument("--iters", type=int, default=int(os.environ.get("MKERNEL_GEMM_AR_ITERS", "7")))
     p.add_argument("--num-comm-sms", type=int, default=64)
@@ -320,7 +318,7 @@ def main():
 
         kernel_use_acquire_poll = (M == 4096)
 
-        # Canonical no-sync (steady-state) is the default since 2026-05-06.
+        # Canonical no-sync (steady-state) is the default.
         # MKERNEL_BENCH_LEGACY_SYNC=1 (or MKERNEL_BENCH_NO_SYNC=0) opts back
         # into per-iter sync. GEMM_AR_STEADY_STATE_BENCH is preserved for
         # back-compat (default 1; set to 0 to also force legacy).

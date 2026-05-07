@@ -45,13 +45,11 @@ SM_SPLIT = {
 
 
 def poll_tuning(m: int) -> tuple[int, int]:
-    # Acquire polling (`use_acquire_poll=1`) was historically enabled only at
-    # M=4096 under the legacy per-iter-sync timing methodology. Re-tuning
-    # under the canonical no-sync methodology (2026-05-06) showed that the
-    # acquire path costs ~50 µs/iter at M=4096 and amplifies a cold/warm
-    # bimodal pattern, regressing the median by ~17%. Other shapes already
-    # used the relaxed-poll path. The kernel-side acquire branch
-    # (`src/gemm_rs.cu:362`) is left in place but dormant for future use.
+    # Relaxed poll across all shapes. Acquire polling (`use_acquire_poll=1`)
+    # was historically enabled at M=4096 under per-iter-sync timing; under the
+    # canonical no-sync methodology it costs ~50 µs/iter and amplifies a
+    # cold/warm bimodal pattern, regressing the median by ~17%. The kernel-side
+    # acquire branch (`src/gemm_rs.cu:362`) is left in place but dormant.
     return (0, 100)
 
 
@@ -225,9 +223,8 @@ def main():
 
         samples = []
         # Canonical: NCCL-style no-sync timing — N back-to-back iters with a
-        # SINGLE sync after, divide by N. Mirrors the ag_gemm / ring_attention
-        # 2026-05-06 methodology fix. Set MKERNEL_BENCH_LEGACY_SYNC=1 (or
-        # MKERNEL_BENCH_NO_SYNC=0) to opt back into the per-iter-sync path.
+        # SINGLE sync after, divide by N. Set MKERNEL_BENCH_LEGACY_SYNC=1 (or
+        # MKERNEL_BENCH_NO_SYNC=0) to opt back into per-iter sync.
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
             legacy_sync = True

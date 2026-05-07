@@ -193,10 +193,8 @@ def main():
 
         samples = []
         # Canonical: no-sync (steady-state) timing — N back-to-back iters with
-        # a SINGLE sync at end, divide by N. This mirrors the same methodology
-        # we adopted for ag_gemm + NCCL baseline (post-2026-05-06 rebaseline).
-        # Set MKERNEL_BENCH_LEGACY_SYNC=1 (or MKERNEL_BENCH_NO_SYNC=0) to opt
-        # back into the old per-iter cuda.synchronize()+dist.barrier() path.
+        # a SINGLE sync at end, divide by N. Set MKERNEL_BENCH_LEGACY_SYNC=1
+        # (or MKERNEL_BENCH_NO_SYNC=0) to opt back into per-iter sync.
         # ring_attention's iter is much longer than ag_gemm's (≈2-135 ms per
         # iter across shapes), so we cap N to keep large-shape wall budget
         # bounded while still ensuring total measurement >= ~100 ms (timer

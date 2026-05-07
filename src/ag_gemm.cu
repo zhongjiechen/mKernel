@@ -50,13 +50,11 @@ __device__ inline void intra_comm_sm(const globals& G) {
         init_semaphore(inputs_arrived[warp_id], 0, 1);
 
         // ========== Phase 0: lifted to prologue kernel ==========
-        // Plan 1 (team_v1, 2026-05-06): the early RDMA WR posting that used
-        // to live here has been hoisted to a separate prologue kernel
-        // (ag_gemm_phase0_prologue_kernel) launched on the same stream just
-        // before this fused kernel. The prologue posts WRs to the host
-        // proxy's FIFO so the proxy can begin the post→wire→peer round-trip
-        // overlapped with this kernel's launch + intra-AG phase, removing
-        // the intra-comm CTA startup latency from the critical path.
+        // The early RDMA WR posting has been hoisted to a separate prologue
+        // kernel (ag_gemm_phase0_prologue_kernel). The prologue posts WRs to
+        // the host proxy's FIFO so the proxy can begin the post→wire→peer
+        // round-trip overlapped with this kernel's launch + intra-AG phase,
+        // removing intra-comm CTA startup latency from the critical path.
 
         // ========== Phase 1: sender-side intra-AG ==========
         // Gather own M_local shard from A[dev_idx] into A (multicast).
@@ -445,16 +443,12 @@ void ag_gemm_fused_kernel_stub(const __grid_constant__ globals G) {
 }
 
 // ============================================================================
-// Phase-0 prologue kernel  (Plan 1 — team_v1, 2026-05-06)
+// Phase-0 prologue kernel
 // ============================================================================
 // Posts the inter-node RDMA WRs (zero-copy from A.data_ DMA-BUF MR) to the
-// host proxy's D2H FIFO. Replaces the in-kernel phase-0 posting that used to
-// live at the head of intra_comm_sm. Launched on the same CUDA stream as
-// the main fused kernel, so all FIFO writes are made-visible to the host
-// proxy before the main kernel starts running. The proxy can begin issuing
-// post_send / waiting on CQE in parallel with the main kernel's launch +
-// intra-AG phase, hiding kernel-launch + intra-comm-CTA-startup latency
-// from the EFA critical path.
+// host proxy's D2H FIFO. The proxy can begin issuing post_send / waiting on
+// CQE in parallel with the main kernel's launch + intra-AG phase, hiding
+// kernel-launch + intra-comm-CTA-startup latency from the EFA critical path.
 //
 // Work distribution mirrors the original (one intra row per CTA, stride
 // num_intra_comm). One CTA, one warp, one thread per CTA does the push —
@@ -488,7 +482,7 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
         ag_gemm_fused_kernel_stub,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         dynamic_shared_memory));
-    // Plan 1a (team_v2, 2026-05-06): side-stream prologue.
+    // Side-stream prologue.
     //
     // The prologue (tiny kernel that pushes RDMA WRs to the host-proxy FIFO)
     // is launched on a SEPARATE non-blocking CUDA stream so its FIFO push can

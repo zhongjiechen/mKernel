@@ -324,10 +324,10 @@ def main():
         # Timed iters
         samples = []
         # Canonical: NCCL-style no-sync timing — N back-to-back iters, single
-        # sync at end, divide by N. Mirrors the ag_gemm 2026-05-06 fix. Set
-        # MKERNEL_BENCH_LEGACY_SYNC=1 (or MKERNEL_BENCH_NO_SYNC=0) to opt back.
-        # Per-shape N: keep total measurement >=~100 ms but cap by tokens since
-        # 131k-token iter is ~5 ms; smaller shapes use bigger N for stability.
+        # sync at end, divide by N. Set MKERNEL_BENCH_LEGACY_SYNC=1 (or
+        # MKERNEL_BENCH_NO_SYNC=0) to opt back. Per-shape N: keep total
+        # measurement >=~100 ms but cap by tokens since 131k-token iter is
+        # ~5 ms; smaller shapes use bigger N for stability.
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
             legacy_sync = True

@@ -173,14 +173,13 @@ run_one_2node() {
     local best_of_env=" MKERNEL_BENCH_BEST_OF_N=${MKERNEL_BENCH_BEST_OF_N:-0}"
     local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port MKERNEL_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
     # Optional: forward MKERNEL_DUMP_DIAG so the bench scripts can dump
-    # per-proxy diagnostics for the V2 Planner cost-model refit.
+    # per-proxy diagnostics.
     if [[ -n "${MKERNEL_DUMP_DIAG:-}" ]]; then
         env_str="$env_str MKERNEL_DUMP_DIAG=$MKERNEL_DUMP_DIAG"
     fi
-    # No-sync (steady-state) timing is the canonical default since 2026-05-06.
-    # Forward MKERNEL_BENCH_NO_SYNC if explicitly set (back-compat) and
-    # MKERNEL_BENCH_LEGACY_SYNC=1 for users who want to opt into the old
-    # per-iter-sync path.
+    # No-sync (steady-state) timing is the canonical default. Forward
+    # MKERNEL_BENCH_NO_SYNC if explicitly set (back-compat) and
+    # MKERNEL_BENCH_LEGACY_SYNC=1 for users who want to opt into per-iter sync.
     if [[ -n "${MKERNEL_BENCH_NO_SYNC:-}" ]]; then
         env_str="$env_str MKERNEL_BENCH_NO_SYNC=$MKERNEL_BENCH_NO_SYNC"
     fi
