@@ -7,10 +7,10 @@
 
 ## Highlights
 
-- **Multi-GPU + multi-node, in one kernel.** Intra-node NVLink and inter-node live inside the same kernel.
-- **Fine-grained intra-kernel overlapping.** Compute and communication overlap at tile/chunk granularity, covering both intra-node and inter-node communication
-- **Persistent kernel with SM specialization.** CTAs self-assign roles, such as compute / intra-comm / inter-send / inter-reduce. 
-- **GPU-driven networking, built from scratch.** Libibverbs with GPU-initiated communication. No NCCL/NVSHMEM dependency. 
+- **Multi-GPU + multi-node, in one kernel.** Handling both intra-node and inter-node GPU-driven communication inside the same kernel.
+- **Fine-grained intra-kernel overlapping.** Compute and communication overlap at tile/chunk granularity. 
+- **Persistent kernel with SM specialization.** CTAs are assigned roles, such as compute / intra-comm / inter-send / inter-reduce. 
+- **GPU-driven networking, built from scratch.** Directly implement communication over Libibverbs (without NCCL/NVSHMEM) for maximal performance.
 
 ## Roadmap
 - ✅ Fused, GPU-driven multi-node kernels
