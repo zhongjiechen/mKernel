@@ -94,10 +94,13 @@ def main():
             mercury_tf, magi_tf, te_p2p_tf, _te_a2ap2p_tf, rfa_tf = \
                 _load_external_q4(shapes)
             extra_baselines = (mercury_tf, magi_tf, te_p2p_tf, rfa_tf)
-        # Triton-distributed: applicable to ag_gemm (ag_gemm), gemm_rs (gemm_rs),
-        # ring_attention (ring_attention). Same EFA cluster, apples-to-apples.
-        td_tf = _load_triton_dist(kernel, shapes)
-        if td_tf is not None:
+        # Triton-distributed: only include as a separate best-baseline
+        # candidate when the published JSON is a NATIVE Triton-dist run (label
+        # "Triton-distributed"). Skip "NCCL (Triton-dist fallback)" entries
+        # since those are the same algorithm as the NCCL bar — including the
+        # min-of-two-NCCL-runs would double-count NCCL.
+        td_tf, td_label = _load_triton_dist(kernel, shapes, with_label=True)
+        if td_tf is not None and td_label == "Triton-distributed":
             extra_baselines = extra_baselines + (td_tf,)
         # dispatch_gemm: include cx7 (DeepEP+DeepGEMM reference) as a baseline
         # candidate. For all other kernels, cx7 is excluded as it was measured
