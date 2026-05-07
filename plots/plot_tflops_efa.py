@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 import matplotlib
@@ -300,25 +301,27 @@ def load_series(kernel: str):
     return shapes, fused_tf, nccl_tf, cx7_tf
 
 
-def _load_triton_dist(kernel: str, shapes):
-    """Return Triton-distributed TFLOPS aligned to `shapes`, or None if not
-    available for this kernel. Reads the published per-shape ms list from
-    `experiments/multinode/baselines/triton_dist/results/{q1,q5,q4}_efa.json`
-    and converts via the kernel's TFLOPS formula.
+def _load_triton_dist(kernel: str, shapes, with_label: bool = False):
+    """Triton-distributed bars temporarily disabled.
+
+    NVSHMEM-on-EFA via libfabric is broken on this cluster's libfabric 2.4.0
+    (in-place-upgraded from an older version, dropping FABRIC_1.9 ABI). The
+    historical published JSON values were collected against the older
+    libfabric and are not reproducible today. Set MKERNEL_PLOTS_INCLUDE_TD=1
+    to re-enable.
     """
+    if os.environ.get("MKERNEL_PLOTS_INCLUDE_TD") != "1":
+        return (None, None) if with_label else None
     qkey = TRITON_DIST_KEY.get(kernel)
     if qkey is None:
-        return None
+        return (None, None) if with_label else None
     path = TRITON_DIST_DIR / f"{qkey}_efa.json"
     if not path.exists():
-        return None
+        return (None, None) if with_label else None
     try:
         j = json.load(open(path))
         td_ms = j.get("triton_dist_ms") or j.get("fused_ms") or []
         td_shapes = [_parse_shape(s) for s in j.get("sizes", [])]
-        # ring_attention release shapes are seq_per_dev; Triton-dist data is
-        # keyed by total_seq for q4. Caller passes shapes already in the
-        # right space (load_series did the multiply for ring_attention).
         td_by_shape = {sh: ms for sh, ms in zip(td_shapes, td_ms)}
         out = []
         for s in shapes:
@@ -327,9 +330,11 @@ def _load_triton_dist(kernel: str, shapes):
                 out.append(float("nan"))
             else:
                 out.append(KERNELS[kernel]["tflops_fn"](s, float(ms)))
-        return out if any(math.isfinite(v) for v in out) else None
+        if not any(math.isfinite(v) for v in out):
+            return (None, None) if with_label else None
+        return (out, "Triton-distributed") if with_label else out
     except Exception:
-        return None
+        return (None, None) if with_label else None
 
 
 def _load_external_q4(shapes):
@@ -513,13 +518,13 @@ def render_kernel_chart(kernel: str, ax=None, value_fontsize=13):
                                 textcoords="offset points", ha="center",
                                 fontsize=value_fontsize, color="black")
     else:
-        # Optional Triton-distributed series (ag_gemm ag_gemm, gemm_rs gemm_rs).
-        td_tf = _load_triton_dist(kernel, shapes)
+        # Optional Triton-distributed series (ag_gemm, gemm_ar, gemm_rs).
+        td_tf, td_label = _load_triton_dist(kernel, shapes, with_label=True)
         has_td = td_tf is not None and any(math.isfinite(v) for v in td_tf)
         if has_td:
             tw = 0.27
             ax.bar(x - tw, nccl_tf, tw, color="#4C72B0", label="CuBLAS+NCCL", zorder=3)
-            ax.bar(x,      td_tf,   tw, color="#E45756", label="Triton-distributed", zorder=3)
+            ax.bar(x,      td_tf,   tw, color="#E45756", label=td_label, zorder=3)
             ax.bar(x + tw, fused_tf, tw, color="#F58518", label="mKernel", zorder=3)
             for xi, yi in zip(x, nccl_tf):
                 if math.isfinite(yi):

@@ -195,6 +195,12 @@ run_one_2node() {
     if [[ -n "${MKERNEL_PREP_EPOCH_FAST:-}" ]]; then
         env_str="$env_str MKERNEL_PREP_EPOCH_FAST=$MKERNEL_PREP_EPOCH_FAST"
     fi
+    if [[ -n "${MKERNEL_DISPATCH_GEMM_ROUTING:-}" ]]; then
+        env_str="$env_str MKERNEL_DISPATCH_GEMM_ROUTING=$MKERNEL_DISPATCH_GEMM_ROUTING"
+    fi
+    if [[ -n "${MKERNEL_DISPATCH_GEMM_ROUTING_SEED:-}" ]]; then
+        env_str="$env_str MKERNEL_DISPATCH_GEMM_ROUTING_SEED=$MKERNEL_DISPATCH_GEMM_ROUTING_SEED"
+    fi
     if [[ -n "${Q2_EPOCH_TIMING:-}" ]]; then
         env_str="$env_str Q2_EPOCH_TIMING=$Q2_EPOCH_TIMING"
     fi

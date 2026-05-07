@@ -72,19 +72,76 @@ def parse_args():
     return p.parse_args()
 
 
-def build_routing(num_tokens_global, world_size_per_node):
-    """Build deterministic uniform routing across all 16 GPUs."""
+def _build_routing_uniform(num_tokens_global):
+    """Deterministic uniform routing: expert_id = (t*TOP_K + k) % NUM_EXPERTS.
+
+    Each expert gets exactly num_tokens_global * TOP_K / NUM_EXPERTS tokens —
+    perfectly balanced (favors any MoE kernel; the absolute best case).
+    """
+    chosen = torch.empty((num_tokens_global, TOP_K), dtype=torch.int32)
+    flat = (torch.arange(num_tokens_global * TOP_K, dtype=torch.int64) %
+            NUM_EXPERTS).to(torch.int32)
+    chosen.copy_(flat.view(num_tokens_global, TOP_K))
+    return chosen
+
+
+def _build_routing_multinomial(num_tokens_global, rank, world_size, seed=0):
+    """Random multinomial routing: bit-equivalent to NCCL/TritonDist baselines.
+
+    Mirrors `nccl_16gpu_baseline.py:run_q3` lines 167-173: rank 0 samples
+    from a single Categorical(routing_weights) and broadcasts to all ranks.
+    Uses a fixed seed for reproducibility (NCCL itself does not seed; we
+    seed so multi-run averages are deterministic).
+    """
+    if rank == 0:
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        routing_weights = torch.rand(NUM_EXPERTS, device="cuda",
+                                     dtype=torch.float32, generator=g)
+        chosen = torch.multinomial(
+            routing_weights.repeat(num_tokens_global, 1), TOP_K,
+            replacement=False, generator=g
+        ).to(torch.int32)
+    else:
+        chosen = torch.empty((num_tokens_global, TOP_K),
+                              device="cuda", dtype=torch.int32)
+    if dist.is_initialized() and world_size > 1:
+        dist.broadcast(chosen, 0)
+    return chosen.cpu()
+
+
+def build_routing(num_tokens_global, world_size_per_node, mode="uniform",
+                  rank=0, world_size=1, seed=0):
+    """Build per-expert token lists from a routing mode.
+
+    mode:
+      "uniform"     — deterministic (t*TOP_K+k) % NUM_EXPERTS (legacy default)
+      "multinomial" — random routing matching the NCCL/TritonDist baselines
+
+    Returns (padded_list, expert_to_tokens) where:
+      padded_list[e]      = padded token count for expert e (padded to
+                            ROW_BLOCK)
+      expert_to_tokens[e] = list of (src_node, src_dev, local_tok) tuples
+                            of every token routed to expert e
+    """
     total_gpus = NUM_NODES * world_size_per_node
     num_local_tokens = num_tokens_global // total_gpus
     assert num_tokens_global % total_gpus == 0
+
+    if mode == "multinomial":
+        chosen = _build_routing_multinomial(num_tokens_global, rank,
+                                             world_size, seed=seed)
+    else:
+        chosen = _build_routing_uniform(num_tokens_global)
+    chosen_np = chosen.numpy()
+
     expert_to_tokens = [[] for _ in range(NUM_EXPERTS)]
     for t in range(num_tokens_global):
+        global_gpu = t // num_local_tokens
+        src_node = global_gpu // world_size_per_node
+        src_dev = global_gpu % world_size_per_node
+        local_tok = t % num_local_tokens
         for k in range(TOP_K):
-            expert_id = (t * TOP_K + k) % NUM_EXPERTS
-            global_gpu = t // num_local_tokens
-            src_node = global_gpu // world_size_per_node
-            src_dev = global_gpu % world_size_per_node
-            local_tok = t % num_local_tokens
+            expert_id = int(chosen_np[t, k])
             expert_to_tokens[expert_id].append((src_node, src_dev, local_tok))
     padded_list = []
     for e in range(NUM_EXPERTS):
@@ -180,7 +237,24 @@ def main():
                   f"local_tokens={num_local_tokens} "
                   f"sm(send,copy,comm)=({n_send},{n_copy},{n_comm})", flush=True)
 
-        padded_list, expert_to_tokens = build_routing(num_tokens_global, world_size)
+        # Routing mode: multinomial (default) matches NCCL/TritonDist
+        # baselines (`nccl_16gpu_baseline.py:167-170`); uniform is the
+        # legacy deterministic balanced-MoE workload. Override via
+        # MKERNEL_DISPATCH_GEMM_ROUTING={uniform,multinomial}.
+        routing_mode = os.environ.get("MKERNEL_DISPATCH_GEMM_ROUTING",
+                                       "multinomial").lower()
+        # Per-shape seed so different token counts get different draws
+        # but each shape is reproducible across runs.
+        routing_seed = int(os.environ.get("MKERNEL_DISPATCH_GEMM_ROUTING_SEED",
+                                           "0")) + num_tokens_global
+        padded_list, expert_to_tokens = build_routing(
+            num_tokens_global, world_size, mode=routing_mode,
+            rank=rank, world_size=world_size * NUM_NODES, seed=routing_seed)
+        if is_chief:
+            print(f"[dispatch_gemm] routing={routing_mode} "
+                  f"max_expert_tokens={max(len(toks) for toks in expert_to_tokens)} "
+                  f"min_expert_tokens={min(len(toks) for toks in expert_to_tokens)}",
+                  flush=True)
         padded_ppe = torch.tensor(padded_list, dtype=torch.int32, device="cuda")
         pull_idx, num_padded_local = build_pull_indices(
             global_gpu_idx, num_experts_per_dev, padded_list,
