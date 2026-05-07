@@ -302,15 +302,11 @@ def load_series(kernel: str):
 
 
 def _load_triton_dist(kernel: str, shapes, with_label: bool = False):
-    """Triton-distributed bars temporarily disabled.
-
-    NVSHMEM-on-EFA via libfabric is broken on this cluster's libfabric 2.4.0
-    (in-place-upgraded from an older version, dropping FABRIC_1.9 ABI). The
-    historical published JSON values were collected against the older
-    libfabric and are not reproducible today. Set MKERNEL_PLOTS_INCLUDE_TD=1
-    to re-enable.
+    """Triton-distributed bars from published JSON. Native NVSHMEM-EFA path
+    rebuilt against libfabric 2.5.0a1 + GDRCopy (the system libfabric 2.4 has
+    a known FABRIC_1.9 ABI break). Set MKERNEL_PLOTS_INCLUDE_TD=0 to disable.
     """
-    if os.environ.get("MKERNEL_PLOTS_INCLUDE_TD") != "1":
+    if os.environ.get("MKERNEL_PLOTS_INCLUDE_TD") == "0":
         return (None, None) if with_label else None
     qkey = TRITON_DIST_KEY.get(kernel)
     if qkey is None:
