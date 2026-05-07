@@ -172,7 +172,32 @@ run_one_2node() {
     fi
     local best_of_env=" MKERNEL_BENCH_BEST_OF_N=${MKERNEL_BENCH_BEST_OF_N:-0}"
     local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port MKERNEL_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
-
+    # Optional: forward MKERNEL_DUMP_DIAG so the bench scripts can dump
+    # per-proxy diagnostics.
+    if [[ -n "${MKERNEL_DUMP_DIAG:-}" ]]; then
+        env_str="$env_str MKERNEL_DUMP_DIAG=$MKERNEL_DUMP_DIAG"
+    fi
+    # No-sync (steady-state) timing is the canonical default. Forward
+    # MKERNEL_BENCH_NO_SYNC if explicitly set (back-compat) and
+    # MKERNEL_BENCH_LEGACY_SYNC=1 for users who want to opt into per-iter sync.
+    if [[ -n "${MKERNEL_BENCH_NO_SYNC:-}" ]]; then
+        env_str="$env_str MKERNEL_BENCH_NO_SYNC=$MKERNEL_BENCH_NO_SYNC"
+    fi
+    if [[ -n "${MKERNEL_BENCH_LEGACY_SYNC:-}" ]]; then
+        env_str="$env_str MKERNEL_BENCH_LEGACY_SYNC=$MKERNEL_BENCH_LEGACY_SYNC"
+    fi
+    if [[ -n "${MKERNEL_GEMM_AR_ITERS:-}" ]]; then
+        env_str="$env_str MKERNEL_GEMM_AR_ITERS=$MKERNEL_GEMM_AR_ITERS"
+    fi
+    if [[ -n "${MKERNEL_GEMM_AR_WARMUP:-}" ]]; then
+        env_str="$env_str MKERNEL_GEMM_AR_WARMUP=$MKERNEL_GEMM_AR_WARMUP"
+    fi
+    if [[ -n "${MKERNEL_PREP_EPOCH_FAST:-}" ]]; then
+        env_str="$env_str MKERNEL_PREP_EPOCH_FAST=$MKERNEL_PREP_EPOCH_FAST"
+    fi
+    if [[ -n "${Q2_EPOCH_TIMING:-}" ]]; then
+        env_str="$env_str Q2_EPOCH_TIMING=$Q2_EPOCH_TIMING"
+    fi
     # Hard timeout (default 5 min per kernel sweep — adjust via TIMEOUT env).
     local TIMEOUT_S=${TIMEOUT:-300}
     echo "==== $kernel ($MODE) timeout=${TIMEOUT_S}s master_port=${master_port} tcp_port=${tcp_port_base} ===="

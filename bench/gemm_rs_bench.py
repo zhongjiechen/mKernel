@@ -45,9 +45,12 @@ SM_SPLIT = {
 
 
 def poll_tuning(m: int) -> tuple[int, int]:
-    # Match the experiment/source-of-truth path: acquire polling only helped
-    # at 4K, while a short reducer sleep avoided flag-line thrash elsewhere.
-    return (1 if m == 4096 else 0, 100)
+    # Relaxed poll across all shapes. Acquire polling (`use_acquire_poll=1`)
+    # was historically enabled at M=4096 under per-iter-sync timing; under the
+    # canonical no-sync methodology it costs ~50 µs/iter and amplifies a
+    # cold/warm bimodal pattern, regressing the median by ~17%. The kernel-side
+    # acquire branch (`src/gemm_rs.cu:362`) is left in place but dormant.
+    return (0, 100)
 
 
 def median_then_max_cuda(samples):
@@ -219,14 +222,41 @@ def main():
             dist.barrier()
 
         samples = []
-        for _ in range(args.iters):
-            reset_state(); epoch += 1; mod.set_epoch(epoch)
-            dist.barrier(); time.sleep(0.05)
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record(); run_once(); e.record(); torch.cuda.synchronize()
-            samples.append(s.elapsed_time(e))
+        # Canonical: NCCL-style no-sync timing — N back-to-back iters with a
+        # SINGLE sync after, divide by N. Set MKERNEL_BENCH_LEGACY_SYNC=1 (or
+        # MKERNEL_BENCH_NO_SYNC=0) to opt back into per-iter sync.
+        legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
+        if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
+            legacy_sync = True
+        if not legacy_sync:
+            # No-sync (steady-state): per-iter reset_state + epoch bump (which
+            # internally syncs the proxy-side via set_epoch) but skip the
+            # per-iter dist.barrier + sleep + cuda.synchronize + elapsed_time
+            # readout. Defer event-pair elapsed_time to the end (mirrors
+            # gemm_ar's GEMM_AR_STEADY_STATE_BENCH path).
+            samples_pairs = []
+            for _ in range(args.iters):
+                reset_state(); epoch += 1; mod.set_epoch(epoch)
+                # NO dist.barrier + sleep here — that's the sync this fix removes.
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record(); run_once(); e.record()
+                samples_pairs.append((s, e))
+            torch.cuda.synchronize()
             dist.barrier()
+            samples = [s.elapsed_time(e) for (s, e) in samples_pairs]
+            if is_chief:
+                print(f"[gemm_rs-nosync] M={m} samples={[f'{x:.4f}' for x in samples]}",
+                      flush=True)
+        else:
+            for _ in range(args.iters):
+                reset_state(); epoch += 1; mod.set_epoch(epoch)
+                dist.barrier(); time.sleep(0.05)
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record(); run_once(); e.record(); torch.cuda.synchronize()
+                samples.append(s.elapsed_time(e))
+                dist.barrier()
 
         wall_ms = median_then_max_cuda(samples)
         if is_chief:

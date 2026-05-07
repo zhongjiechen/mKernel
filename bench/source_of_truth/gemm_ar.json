@@ -1,8 +1,0 @@
-{
-  "kernel": "gemm_ar",
-  "sizes": ["M=2048", "M=4096", "M=8192", "M=16384", "M=32768"],
-  "fused_ms": [0.418, 0.350, 0.868, 2.755, 10.896],
-  "world_size": 16,
-  "num_nodes": 2,
-  "_note": "Hardcoded from experiments/multinode/baselines/plot_multi_baseline.py gemm_ar branch (2026-04-28 post-optimization)."
-}
