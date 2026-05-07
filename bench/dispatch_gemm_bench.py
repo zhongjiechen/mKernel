@@ -323,14 +323,47 @@ def main():
 
         # Timed iters
         samples = []
-        for _ in range(args.iters):
+        # Canonical: NCCL-style no-sync timing — N back-to-back iters, single
+        # sync at end, divide by N. Mirrors the ag_gemm 2026-05-06 fix. Set
+        # MKERNEL_BENCH_LEGACY_SYNC=1 (or MKERNEL_BENCH_NO_SYNC=0) to opt back.
+        # Per-shape N: keep total measurement >=~100 ms but cap by tokens since
+        # 131k-token iter is ~5 ms; smaller shapes use bigger N for stability.
+        legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
+        if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
+            legacy_sync = True
+        if not legacy_sync:
+            # Tier N by shape so total measurement ~>= 100 ms.
+            if num_tokens_global <= 16384:
+                n_iters = max(args.iters, 64)
+            elif num_tokens_global <= 65536:
+                n_iters = max(args.iters, 32)
+            else:
+                n_iters = max(args.iters, 24)
             reset_state(); epoch += 1; mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.05)
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
-            s.record(); run_once(); e.record(); torch.cuda.synchronize()
+            torch.cuda.synchronize()
+            s.record()
+            for _ in range(n_iters):
+                run_once()
+            e.record()
+            torch.cuda.synchronize()
+            avg_ms = s.elapsed_time(e) / n_iters
+            samples = [avg_ms] * args.iters
+            if is_chief:
+                print(f"[dispatch_gemm-nosync] tokens={num_tokens_global} "
+                      f"N={n_iters} avg={avg_ms:.4f} ms", flush=True)
             dist.barrier()
-            samples.append(s.elapsed_time(e))
+        else:
+            for _ in range(args.iters):
+                reset_state(); epoch += 1; mod.set_epoch(epoch)
+                dist.barrier(); time.sleep(0.05)
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record(); run_once(); e.record(); torch.cuda.synchronize()
+                dist.barrier()
+                samples.append(s.elapsed_time(e))
 
         wall_ms = avg_then_max_cuda(samples)
         if is_chief:

@@ -45,34 +45,18 @@ __device__ inline void intra_comm_sm(const globals& G) {
     const int col_blocks = G.A.cols() / (globals::RED_BLOCK * 2);
     const int num_local_blocks = local_row_blocks * col_blocks;
     uint32_t phasebits = 0xFFFF0000;
-    const int K_val_for_merge = G.A_local.cols();
-    const int chunks_per_rb_for_merge = max(1,
-        (globals::ROW_BLOCK * K_val_for_merge * (int)sizeof(bf16)) / CHUNK_BYTES);
 
     if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
         init_semaphore(inputs_arrived[warp_id], 0, 1);
 
-        // ========== Phase 0: early RDMA send (t=0) ==========
-        // Each rank sends ONLY its own M_local-row slice via RDMA. That slice lives in
-        // A.data_ (VMM-IPC region, DMA-BUF-registered) from Python's
-        // pre-kernel copy_ — no intra-gather dependency. Post all WRs at
-        // kernel entry so the pipeline has maximum time to overlap with
-        // intra-gather + local compute.
-        //
-        // Work distribution: one intra row per CTA (intra rows = local_row_blocks).
-        // CTA `comm_sm_id` handles rows [comm_sm_id, local_row_blocks) stride
-        // num_intra_comm. Only warp 0 posts — fifo.push is thread-safe per
-        // queue (backed by atomics in gemm_ar_select_fifo_for_lane) but serializing
-        // through one warp per row avoids head-of-line interleave noise.
-        if (warp_id == 0) {
-            for (int lr = comm_sm_id; lr < local_row_blocks; lr += G.num_intra_comm) {
-                const int global_row_idx = lr + G.dev_idx * local_row_blocks;
-                post_merge_wrs_for_intra_row(
-                    G, global_row_idx, chunks_per_rb_for_merge);
-            }
-        }
-        // No barrier needed — each CTA's posts are independent and consumers
-        // use the FIFO's own ordering to observe cmds. Fall through.
+        // ========== Phase 0: lifted to prologue kernel ==========
+        // Plan 1 (team_v1, 2026-05-06): the early RDMA WR posting that used
+        // to live here has been hoisted to a separate prologue kernel
+        // (ag_gemm_phase0_prologue_kernel) launched on the same stream just
+        // before this fused kernel. The prologue posts WRs to the host
+        // proxy's FIFO so the proxy can begin the post→wire→peer round-trip
+        // overlapped with this kernel's launch + intra-AG phase, removing
+        // the intra-comm CTA startup latency from the critical path.
 
         // ========== Phase 1: sender-side intra-AG ==========
         // Gather own M_local shard from A[dev_idx] into A (multicast).
@@ -460,6 +444,43 @@ void ag_gemm_fused_kernel_stub(const __grid_constant__ globals G) {
     fused_kernel(G);
 }
 
+// ============================================================================
+// Phase-0 prologue kernel  (Plan 1 — team_v1, 2026-05-06)
+// ============================================================================
+// Posts the inter-node RDMA WRs (zero-copy from A.data_ DMA-BUF MR) to the
+// host proxy's D2H FIFO. Replaces the in-kernel phase-0 posting that used to
+// live at the head of intra_comm_sm. Launched on the same CUDA stream as
+// the main fused kernel, so all FIFO writes are made-visible to the host
+// proxy before the main kernel starts running. The proxy can begin issuing
+// post_send / waiting on CQE in parallel with the main kernel's launch +
+// intra-AG phase, hiding kernel-launch + intra-comm-CTA-startup latency
+// from the EFA critical path.
+//
+// Work distribution mirrors the original (one intra row per CTA, stride
+// num_intra_comm). One CTA, one warp, one thread per CTA does the push —
+// fifo.push() is thread-safe per queue.
+__device__ inline void phase0_post_wrs(const globals& G) {
+    const int comm_sm_id = blockIdx.x;
+    const int warp_id = warp::groupid();
+    const int lane_id = warp::laneid();
+    const int global_row_blocks = G.A.rows() / (globals::ROW_BLOCK * 2);
+    const int local_row_blocks = global_row_blocks / globals::NUM_DEVICES;
+    const int K_val_for_merge = G.A_local.cols();
+    const int chunks_per_rb_for_merge = max(1,
+        (globals::ROW_BLOCK * K_val_for_merge * (int)sizeof(bf16)) / CHUNK_BYTES);
+    if (warp_id == 0 && lane_id == 0) {
+        for (int lr = comm_sm_id; lr < local_row_blocks; lr += G.num_intra_comm) {
+            const int global_row_idx = lr + G.dev_idx * local_row_blocks;
+            post_merge_wrs_for_intra_row(
+                G, global_row_idx, chunks_per_rb_for_merge);
+        }
+    }
+}
+
+__global__ void ag_gemm_phase0_prologue_kernel(const __grid_constant__ globals G) {
+    phase0_post_wrs(G);
+}
+
 void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int dynamic_shared_memory = config::DYNAMIC_SHARED_MEMORY;
@@ -467,6 +488,49 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
         ag_gemm_fused_kernel_stub,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         dynamic_shared_memory));
+    // Plan 1a (team_v2, 2026-05-06): side-stream prologue.
+    //
+    // The prologue (tiny kernel that pushes RDMA WRs to the host-proxy FIFO)
+    // is launched on a SEPARATE non-blocking CUDA stream so its FIFO push can
+    // race past the main-stream launch latency / inter-iter Python-side work.
+    // The main fused kernel does NOT wait on the prologue at the device level
+    // — the proxy thread reads the FIFO from host-visible memory independently
+    // of the device-side scheduling. The bench's per-iter cuda.synchronize()
+    // still drains both streams, so end-of-iter ordering is preserved.
+    //
+    // Cross-stream sync model:
+    //   1. Record "main_pre" event on main stream (captures any prior
+    //      main-stream work — e.g. local_A copies, prior iter completion).
+    //   2. prologue stream waits on "main_pre" so the prologue cannot run
+    //      before prior local-data writes are device-visible.
+    //   3. Launch prologue on the side stream.
+    //   4. Launch the main fused kernel on the main stream WITHOUT waiting on
+    //      the prologue — that is the overlap. Both kernels then race; the
+    //      proxy picks up FIFO entries as the prologue makes them visible.
+    //
+    // The side stream + events are session-lifetime singletons so we don't
+    // pay creation cost per launch. A static-local guarded by a flag suffices
+    // since launches are serialized on a single host thread per session.
+    static cudaStream_t prologue_stream = nullptr;
+    static cudaEvent_t main_pre_event = nullptr;
+    static bool side_stream_inited = false;
+    if (!side_stream_inited) {
+        MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(
+            &prologue_stream, cudaStreamNonBlocking));
+        MKERNEL_CUDACHECK(cudaEventCreateWithFlags(
+            &main_pre_event, cudaEventDisableTiming));
+        side_stream_inited = true;
+    }
+
+    const int prologue_blocks = G.num_intra_comm > 0 ? G.num_intra_comm : 1;
+    // 1. Capture prior main-stream state.
+    MKERNEL_CUDACHECK(cudaEventRecord(main_pre_event, stream));
+    // 2. Prologue stream waits on it.
+    MKERNEL_CUDACHECK(cudaStreamWaitEvent(prologue_stream, main_pre_event, 0));
+    // 3. Launch prologue on the side stream.
+    ag_gemm_phase0_prologue_kernel<<<prologue_blocks, WARP_THREADS, 0,
+                                     prologue_stream>>>(G);
+    // 4. Launch main kernel — does NOT wait on prologue.
     ag_gemm_fused_kernel_stub<<<active_sms, config::NUM_THREADS,
                                 dynamic_shared_memory, stream>>>(G);
 }

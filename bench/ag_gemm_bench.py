@@ -31,7 +31,10 @@ DEFAULT_SHAPES = [4096, 8192, 16384, 24576, 32768]
 # Per-shape num_comm_sms override. Smaller values reduce coordination overhead
 # at small M (NCCL has minimal launch overhead and beats the fused path there
 # unless we cut the comm-CTA budget). Defaults found via sweep on this cluster.
-SMS_PER_SHAPE = {4096: 8, 8192: 8, 24576: 8}
+# M=16384 added 2026-05-06 (team_v4 cycle): sms=8 gives ~1% improvement over
+# default 64 at this shape; the 64-sms default oversubscribes comm CTAs at
+# medium M where the GEMM wave count is lower.
+SMS_PER_SHAPE = {4096: 8, 8192: 8, 16384: 8, 24576: 8}
 
 
 def avg_then_max_cuda(samples):
@@ -85,7 +88,12 @@ def main():
 
     # Per-shape intra override that bypasses the max(4) floor in the kernel
     # by going through num_intra_comm_override path (line 940 of src/ag_gemm.cu).
-    INTRA_OVERRIDE = {4096: 2}
+    # 2026-05-06 (team_v4 cycle): the {4096: 2} entry was a stale tuning from
+    # the legacy per-iter-sync bench era. Under canonical no-sync timing,
+    # capping intra_comm_sms to 2 starves the intra-node multicast at M=4096
+    # by ~10-15us/iter (median 0.186 → 0.168 ms = -9.7%). Removed; M=4096
+    # now uses the kernel's max(4) floor like the other shapes.
+    INTRA_OVERRIDE = {}
     for base_n in shapes:
         # Per-shape num_comm_sms override (small-M overhead reduction).
         if base_n in SMS_PER_SHAPE:
@@ -195,18 +203,63 @@ def main():
             dist.barrier()
 
         samples = []
-        for _ in range(args.iters):
+        # Canonical: NCCL-style no-sync timing — N back-to-back iters with a
+        # SINGLE sync after, divide by N. This mirrors nccl_16gpu_baseline.py's
+        # default --steady-state (post-2026-05-06 methodology fix). Set
+        # MKERNEL_BENCH_LEGACY_SYNC=1 to opt back into the old per-iter sync
+        # path (kept for A/B and source-of-truth regression debugging).
+        legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
+        # Back-compat: MKERNEL_BENCH_NO_SYNC=0 also forces legacy.
+        if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
+            legacy_sync = True
+        if not legacy_sync:
+            n_iters = max(args.iters, 32)
+            # Pre-flip enough epochs so all N iters have unique epochs without
+            # an inter-iter set_epoch that would re-issue prepare_epoch's
+            # drain_proxy + barrier (which is itself a sync). We reuse a single
+            # epoch across the back-to-back run; reset_state restores buffers.
             reset_state(); epoch += 1; mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.05)
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
-            s.record(); run_once(); e.record(); torch.cuda.synchronize()
-            samples.append(s.elapsed_time(e))
+            torch.cuda.synchronize()
+            s.record()
+            for _ in range(n_iters):
+                run_once()
+            e.record()
+            torch.cuda.synchronize()
+            avg_ms = s.elapsed_time(e) / n_iters
+            samples = [avg_ms] * args.iters  # reuse downstream reduce path
+            if is_chief:
+                print(f"[ag_gemm-nosync] M={M} N={n_iters} avg={avg_ms:.4f} ms",
+                      flush=True)
             dist.barrier()
+        else:
+            for _ in range(args.iters):
+                reset_state(); epoch += 1; mod.set_epoch(epoch)
+                dist.barrier(); time.sleep(0.05)
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record(); run_once(); e.record(); torch.cuda.synchronize()
+                samples.append(s.elapsed_time(e))
+                dist.barrier()
 
         wall_ms = avg_then_max_cuda(samples)
         if is_chief:
             print(f"[ag_gemm] M={M} wall={wall_ms:.3f} ms", flush=True)
+
+        # Optional proxy diagnostics dump for the V2 Planner cost-model refit.
+        # Off by default; enable with MKERNEL_DUMP_DIAG=1.
+        if os.environ.get("MKERNEL_DUMP_DIAG") == "1":
+            try:
+                diags = mod.get_proxy_diagnostics()
+                print(f"[ag_gemm-diag] node{node_idx}/lr{local_rank} M={M} "
+                      f"num_proxies={len(diags)}", flush=True)
+                for i, d in enumerate(diags):
+                    print(f"[ag_gemm-diag] node{node_idx}/lr{local_rank} M={M} "
+                          f"proxy{i} {dict(d)}", flush=True)
+            except Exception as ex:
+                print(f"[ag_gemm-diag] dump failed: {ex}", flush=True)
         result_sizes.append(f"M={M}")
         result_fused.append(wall_ms)
 

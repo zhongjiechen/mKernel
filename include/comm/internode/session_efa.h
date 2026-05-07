@@ -976,19 +976,34 @@ inline void prepare_epoch(Session* s) {
         const char* e = std::getenv("Q2_EPOCH_TIMING");
         return e && e[0] == '1';
     })();
+    // Read every call — Python may set this env var AFTER the first set_epoch(1)
+    // call (mirrors the MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET pattern at
+    // commit_epoch:1029). Three-level fast path:
+    //   '1' = skip cudaDeviceSynchronize (Sub-test A)
+    //   '2' = also skip pause/drain_cq/reset block (Sub-test B)
+    //   '3' = also skip drain_proxy (Sub-test C)
+    const char* fast_env = std::getenv("MKERNEL_PREP_EPOCH_FAST");
+    const int fast_level = (fast_env && fast_env[0] >= '1' && fast_env[0] <= '3')
+                               ? (fast_env[0] - '0')
+                               : 0;
+
     auto t0 = std::chrono::steady_clock::now();
-    cudaDeviceSynchronize();
+    if (fast_level < 1) cudaDeviceSynchronize();
     auto t1 = std::chrono::steady_clock::now();
-    drain_proxy(s);
+    if (fast_level < 3) drain_proxy(s);
     auto t2 = std::chrono::steady_clock::now();
-    for (int t = 0; t < s->num_proxy_threads; t++) {
-        s->proxies[t]->pause();
+    if (fast_level < 2) {
+        for (int t = 0; t < s->num_proxy_threads; t++) {
+            s->proxies[t]->pause();
+        }
     }
     auto t3 = std::chrono::steady_clock::now();
-    for (int t = 0; t < s->num_proxy_threads; t++) {
-        s->proxies[t]->drain_cq();
-        s->proxies[t]->reset_inflight();
-        s->proxies[t]->reset_timestamps();
+    if (fast_level < 2) {
+        for (int t = 0; t < s->num_proxy_threads; t++) {
+            s->proxies[t]->drain_cq();
+            s->proxies[t]->reset_inflight();
+            s->proxies[t]->reset_timestamps();
+        }
     }
     auto t4 = std::chrono::steady_clock::now();
     if (log_timing) {
@@ -997,8 +1012,9 @@ inline void prepare_epoch(Session* s) {
         };
         fprintf(stderr,
                 "[EPOCH_TIMING rank=%d] prepare_epoch: cudaSync=%ldus drain_proxy=%ldus "
-                "pause=%ldus drain_cq+reset=%ldus total=%ldus\n",
-                s->rank, us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4), us(t0, t4));
+                "pause=%ldus drain_cq+reset=%ldus total=%ldus (fast=%d)\n",
+                s->rank, us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4), us(t0, t4),
+                fast_level);
     }
 }
 

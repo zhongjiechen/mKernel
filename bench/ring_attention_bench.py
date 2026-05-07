@@ -192,7 +192,29 @@ def main():
             dist.barrier()
 
         samples = []
-        for _ in range(args.iters):
+        # Canonical: no-sync (steady-state) timing — N back-to-back iters with
+        # a SINGLE sync at end, divide by N. This mirrors the same methodology
+        # we adopted for ag_gemm + NCCL baseline (post-2026-05-06 rebaseline).
+        # Set MKERNEL_BENCH_LEGACY_SYNC=1 (or MKERNEL_BENCH_NO_SYNC=0) to opt
+        # back into the old per-iter cuda.synchronize()+dist.barrier() path.
+        # ring_attention's iter is much longer than ag_gemm's (≈2-135 ms per
+        # iter across shapes), so we cap N to keep large-shape wall budget
+        # bounded while still ensuring total measurement >= ~100 ms (timer
+        # noise <1%) at the smallest shapes.
+        legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
+        if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
+            legacy_sync = True
+        if not legacy_sync:
+            # Pick N so total ≥ ~100 ms at smaller shapes but bounded ≤ ~2s at
+            # the largest. For ring_attn, expected per-iter ms ≈ shape-dependent
+            # ~(2,4,11,35,135) — N=32 gives ~64ms..4.3s range. Cap at 32 small,
+            # taper to 8 at the biggest shape.
+            if seq_per_dev <= 1536:
+                n_iters = 32
+            elif seq_per_dev <= 6144:
+                n_iters = 16
+            else:
+                n_iters = 8
             epoch += 1
             K0.data_.copy_(K_local); V0.data_.copy_(V_local)
             K1.data_.zero_(); V1.data_.zero_()
@@ -202,18 +224,48 @@ def main():
             dist.barrier(); time.sleep(0.05)
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
             s.record()
-            mod.ring_attn_multinode(
-                Q, K0, K1, V0, V1, L, L_block, O, O_block, barrier,
-                send_buf_ptr, recv_ptr,
-                fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
-                arrival_ptr, epoch,
-                node_idx, args.num_comm_sms,
-                args.num_send_sms, args.num_copy_sms, NUM_NODES,
-            )
-            e.record(); torch.cuda.synchronize()
-            samples.append(s.elapsed_time(e))
+            for _ in range(n_iters):
+                mod.ring_attn_multinode(
+                    Q, K0, K1, V0, V1, L, L_block, O, O_block, barrier,
+                    send_buf_ptr, recv_ptr,
+                    fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
+                    arrival_ptr, epoch,
+                    node_idx, args.num_comm_sms,
+                    args.num_send_sms, args.num_copy_sms, NUM_NODES,
+                )
+            e.record()
+            torch.cuda.synchronize()
+            avg_ms = s.elapsed_time(e) / n_iters
+            samples = [avg_ms] * args.iters
+            if is_chief:
+                print(f"[ring_attn-nosync] seq={seq_per_dev} N={n_iters} "
+                      f"avg={avg_ms:.4f} ms", flush=True)
             dist.barrier()
+        else:
+            for _ in range(args.iters):
+                epoch += 1
+                K0.data_.copy_(K_local); V0.data_.copy_(V_local)
+                K1.data_.zero_(); V1.data_.zero_()
+                barrier.data_.zero_()
+                L.zero_(); L_block.zero_(); O.zero_(); O_block.zero_()
+                mod.set_epoch(epoch)
+                dist.barrier(); time.sleep(0.05)
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record()
+                mod.ring_attn_multinode(
+                    Q, K0, K1, V0, V1, L, L_block, O, O_block, barrier,
+                    send_buf_ptr, recv_ptr,
+                    fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
+                    arrival_ptr, epoch,
+                    node_idx, args.num_comm_sms,
+                    args.num_send_sms, args.num_copy_sms, NUM_NODES,
+                )
+                e.record(); torch.cuda.synchronize()
+                samples.append(s.elapsed_time(e))
+                dist.barrier()
 
         wall_ms = median_then_max_cuda(samples)
         if is_chief:

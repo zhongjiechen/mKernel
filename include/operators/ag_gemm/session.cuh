@@ -72,6 +72,67 @@ int64_t get_recv_buf_ptr_py() {
 
 #include <torch/csrc/utils/pybind.h>
 
+// Per-proxy diagnostic counters — mirrors the binding in
+// include/operators/gemm_ar/session.cuh so the V2 Planner can read
+// post→CQE per-WR latency directly from Python.
+pybind11::list get_proxy_diagnostics_py() {
+    pybind11::list out;
+    for (const auto& diag : internode::get_proxy_diagnostics(g_session)) {
+        pybind11::dict d;
+        d["qp_base_idx"] = diag.qp_base_idx;
+        d["num_qps"] = diag.num_qps;
+        d["loops"] = diag.loops;
+        d["empty_loops"] = diag.empty_loops;
+        d["full_batches"] = diag.full_batches;
+        d["partial_batches"] = diag.partial_batches;
+        d["inflight_limited_loops"] = diag.inflight_limited_loops;
+        d["batches_posted"] = diag.batches_posted;
+        d["cmds_posted"] = diag.cmds_posted;
+        d["cmds_completed"] = diag.cmds_completed;
+        d["backlog_samples"] = diag.backlog_samples;
+        d["backlog_nonzero_loops"] = diag.backlog_nonzero_loops;
+        d["backlog_gt_batch_loops"] = diag.backlog_gt_batch_loops;
+        d["backlog_sum"] = diag.backlog_sum;
+        d["backlog_max"] = diag.backlog_max;
+        d["batch_cmd_to_post_count"] = diag.batch_cmd_to_post_count;
+        d["batch_cmd_to_post_sum_ns"] = diag.batch_cmd_to_post_sum_ns;
+        d["batch_cmd_to_post_max_ns"] = diag.batch_cmd_to_post_max_ns;
+        d["batch_completion_count"] = diag.batch_completion_count;
+        d["batch_completion_sum_ns"] = diag.batch_completion_sum_ns;
+        d["batch_completion_max_ns"] = diag.batch_completion_max_ns;
+        d["enqueue_to_seen_count"] = diag.enqueue_to_seen_count;
+        d["enqueue_to_seen_raw_sum_ns"] = diag.enqueue_to_seen_raw_sum_ns;
+        d["enqueue_to_seen_raw_max_ns"] = diag.enqueue_to_seen_raw_max_ns;
+        d["enqueue_to_seen_raw_min_ns"] = diag.enqueue_to_seen_raw_min_ns;
+        d["loop_gap_max_ns"] = diag.loop_gap_max_ns;
+        d["loop_gap_over_100us"] = diag.loop_gap_over_100us;
+        d["loop_gap_over_1ms"] = diag.loop_gap_over_1ms;
+        d["first_cmd_ns"] = diag.first_cmd_ns;
+        d["last_cmd_ns"] = diag.last_cmd_ns;
+        d["first_post_ns"] = diag.first_post_ns;
+        d["last_post_ns"] = diag.last_post_ns;
+        d["first_completion_ns"] = diag.first_completion_ns;
+        d["last_completion_ns"] = diag.last_completion_ns;
+        out.append(d);
+    }
+    return out;
+}
+
+pybind11::list get_proxy_timelines_py() {
+    pybind11::list out;
+    for (const auto& timeline : internode::get_proxy_timelines(g_session)) {
+        pybind11::dict d;
+        pybind11::list posted;
+        for (uint64_t ts : timeline.signaled_post_ns) posted.append(ts);
+        pybind11::list completed;
+        for (uint64_t ts : timeline.completion_ns) completed.append(ts);
+        d["signaled_post_ns"] = posted;
+        d["completion_ns"] = completed;
+        out.append(d);
+    }
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
     m.def("create_session", &create_session_py,
@@ -88,6 +149,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_fifo_handles", &get_fifo_handles_py);
     m.def("get_arrival_flags_ptr", &get_arrival_flags_ptr_py);
     m.def("get_recv_buf_ptr", &get_recv_buf_ptr_py);
+    m.def("get_proxy_diagnostics", &get_proxy_diagnostics_py);
+    m.def("get_proxy_timelines", &get_proxy_timelines_py);
     m.def("ag_gemm_multinode", &ag_gemm_multinode::entrypoint,
           pybind11::arg("A"),
           pybind11::arg("B"),
