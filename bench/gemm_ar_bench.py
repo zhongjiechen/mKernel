@@ -40,6 +40,13 @@ COL_BLOCK = 256
 
 DEFAULT_SHAPES = [2048, 4096, 8192, 16384, 32768]
 
+# Per-shape num_intra_comm_sms override. Default `pick_sm_split` heuristic
+# returns 14 for M=2048; team_v7 sweep found intra=4 wins by 5.9% over baseline
+# (n=6, σ=0.005/0.007, σ-overlap 0.72, statistically separated). At small M
+# there isn't much intra-AR work to parallelize, so freeing those CTAs to the
+# compute role is the win.
+INTRA_OVERRIDE_AR = {2048: 4}
+
 
 def median_then_max_cuda(samples):
     sorted_samples = sorted(float(x) for x in samples)
@@ -146,7 +153,7 @@ def parse_args():
     # inflated the median). 10 warmup iters keeps the timed window warm reliably.
     p.add_argument("--warmup", type=int, default=int(os.environ.get("MKERNEL_GEMM_AR_WARMUP", "10")))
     p.add_argument("--iters", type=int, default=int(os.environ.get("MKERNEL_GEMM_AR_ITERS", "10")))
-    p.add_argument("--num-comm-sms", type=int, default=64)
+    p.add_argument("--num-comm-sms", type=int, default=int(os.environ.get("GEMM_AR_NUM_COMM_SMS", "64")))
     p.add_argument("--num-intra-comm-sms", type=int, default=None)
     p.add_argument("--num-inter-send-sms", type=int, default=None)
     p.add_argument("--save-json", type=str, default=None)
@@ -282,9 +289,15 @@ def main():
         barrier_device_ptr = mod.get_barrier_device_ptr() if hasattr(mod, "get_barrier_device_ptr") else 0
 
         logical_queues_per_qp = max(1, int(os.environ.get("GEMM_AR_LOGICAL_QUEUES_PER_QP", "1")))
+        # Apply per-shape intra override (small-M shapes benefit from fewer
+        # intra-comm CTAs — see INTRA_OVERRIDE_AR comment).
+        intra_override_for_shape = (
+            args.num_intra_comm_sms if args.num_intra_comm_sms is not None
+            else INTRA_OVERRIDE_AR.get(M)
+        )
         n_intra, n_inter, n_inter_send = pick_sm_split(
             M, N, world_size, args.num_comm_sms,
-            args.num_intra_comm_sms, args.num_inter_send_sms)
+            intra_override_for_shape, args.num_inter_send_sms)
         num_allocated_remote_queues = max(1, num_qps * logical_queues_per_qp)
         col_blocks_for_queues = N // COL_BLOCK
         chunks_per_row_for_queues = max(
