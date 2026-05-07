@@ -195,6 +195,21 @@ run_one_2node() {
     if [[ -n "${MKERNEL_PREP_EPOCH_FAST:-}" ]]; then
         env_str="$env_str MKERNEL_PREP_EPOCH_FAST=$MKERNEL_PREP_EPOCH_FAST"
     fi
+    # Allow per-shape SM-split overrides for gemm_ar tuning sweeps. These
+    # take precedence over the COMMON_ENV defaults because later assignments
+    # in the env_str win.
+    if [[ -n "${GEMM_AR_NUM_INTRA_COMM_SMS_OVERRIDE:-}" ]]; then
+        env_str="$env_str GEMM_AR_NUM_INTRA_COMM_SMS=$GEMM_AR_NUM_INTRA_COMM_SMS_OVERRIDE"
+    fi
+    if [[ -n "${GEMM_AR_INTER_SEND_SMS_OVERRIDE:-}" ]]; then
+        env_str="$env_str GEMM_AR_INTER_SEND_SMS=$GEMM_AR_INTER_SEND_SMS_OVERRIDE"
+    fi
+    if [[ -n "${GEMM_AR_NUM_COMM_SMS_OVERRIDE:-}" ]]; then
+        env_str="$env_str GEMM_AR_NUM_COMM_SMS=$GEMM_AR_NUM_COMM_SMS_OVERRIDE"
+    fi
+    if [[ -n "${GEMM_AR_RDMA_CHUNK_TILES_RT:-}" ]]; then
+        env_str="$env_str GEMM_AR_RDMA_CHUNK_TILES_RT=$GEMM_AR_RDMA_CHUNK_TILES_RT"
+    fi
     if [[ -n "${MKERNEL_DISPATCH_GEMM_ROUTING:-}" ]]; then
         env_str="$env_str MKERNEL_DISPATCH_GEMM_ROUTING=$MKERNEL_DISPATCH_GEMM_ROUTING"
     fi
@@ -204,6 +219,14 @@ run_one_2node() {
     if [[ -n "${Q2_EPOCH_TIMING:-}" ]]; then
         env_str="$env_str Q2_EPOCH_TIMING=$Q2_EPOCH_TIMING"
     fi
+    # team_v8: forward MKERNEL_GEMM_RS_SPLIT_<M> overrides for sweep tuning.
+    for var in $(compgen -e | grep '^MKERNEL_GEMM_RS_SPLIT_' || true); do
+        env_str="$env_str ${var}=${!var}"
+    done
+    # team_v13: forward AG_GEMM_INTRA_OVERRIDE_<M> for ag_gemm sweep tuning.
+    for var in $(compgen -e | grep '^AG_GEMM_INTRA_OVERRIDE_' || true); do
+        env_str="$env_str ${var}=${!var}"
+    done
     # Hard timeout (default 5 min per kernel sweep — adjust via TIMEOUT env).
     local TIMEOUT_S=${TIMEOUT:-300}
     echo "==== $kernel ($MODE) timeout=${TIMEOUT_S}s master_port=${master_port} tcp_port=${tcp_port_base} ===="

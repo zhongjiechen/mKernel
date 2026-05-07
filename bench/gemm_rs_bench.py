@@ -34,9 +34,16 @@ DEFAULT_SHAPES = [2048, 4096, 8192, 16384, 32768]
 # which hangs on this hardware. Excluded from default sweep.
 
 # Tuned role split for the fused compute/intra/send/reduce path.
+# (n_comp, n_intra, n_send, n_reduce, chunk_tiles).
+# 2026-05-07 (team_v5): retuned M=4096 from (116,0,8,8,4) -> (114,0,10,8,2).
+# Halving chunk_tiles from 4 -> 2 is the dominant lever (smaller staging
+# granularity reduces the per-iter cold-cluster penalty in the bimodal
+# pattern) and bumping n_send 8 -> 10 better feeds the per-peer inter-tile
+# rate at m_local=512. M=4096 wall drops 0.367 -> 0.218 ms (-41%) and now
+# beats NCCL 0.236 ms by ~7%. No regression at any other shape.
 SM_SPLIT = {
     2048:  (112, 0, 10, 10, 2),
-    4096:  (116, 0, 8,  8,  4),
+    4096:  (114, 0, 10,  8,  2),
     8192:  (118, 0, 6, 8, 4),
     16384: (120, 0, 4,  8,  4),
     32768: (120, 0, 4,  8,  8),
@@ -108,6 +115,12 @@ def main():
 
         n_comp, n_intra, n_send, n_reduce, chunk_tiles = SM_SPLIT.get(
             m, (118, 0, 6, 8, 4))
+        # team_v8 sweep override: MKERNEL_GEMM_RS_SPLIT_<M>="comp,intra,send,reduce,ct"
+        _ovr = os.environ.get(f"MKERNEL_GEMM_RS_SPLIT_{m}")
+        if _ovr:
+            _vals = [int(x) for x in _ovr.split(",")]
+            assert len(_vals) == 5, f"MKERNEL_GEMM_RS_SPLIT_{m} must be 5 ints"
+            n_comp, n_intra, n_send, n_reduce, chunk_tiles = _vals
 
         if is_chief:
             print(f"\n[gemm_rs] M={m} K={k} N={n} m_local={m_local} "

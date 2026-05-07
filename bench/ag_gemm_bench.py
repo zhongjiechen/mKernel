@@ -87,6 +87,13 @@ def main():
     # Per-shape intra override that bypasses the max(4) floor in the kernel
     # by going through num_intra_comm_override path (line 940 of src/ag_gemm.cu).
     INTRA_OVERRIDE = {}
+    # team_v13: env-var override for sweep tuning. Format: AG_GEMM_INTRA_OVERRIDE_<M>=<intra>
+    for base_n in shapes:
+        env_key = f"AG_GEMM_INTRA_OVERRIDE_{base_n}"
+        if env_key in os.environ:
+            INTRA_OVERRIDE[base_n] = int(os.environ[env_key])
+            if is_chief:
+                print(f"[ag_gemm] env override {env_key}={os.environ[env_key]}", flush=True)
     for base_n in shapes:
         # Per-shape num_comm_sms override (small-M overhead reduction).
         if base_n in SMS_PER_SHAPE:
