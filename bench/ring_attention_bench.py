@@ -11,12 +11,19 @@ os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
+from common import (  # noqa: E402
+    check_close,
+    compare_named_results,
+    gather_cpu_tensors,
+    get_peer_ips,
+    get_peer_ports,
+)
 
 KERNEL_NAME = "ring_attention"
 from common import get_num_nodes  # noqa: E402
@@ -34,7 +41,7 @@ DEFAULT_SHAPES = [768, 1536, 3072, 6144, 12288]
 
 def median_then_max_cuda(samples):
     median = sorted(float(x) for x in samples)[len(samples) // 2]
-    t = torch.tensor([median], device="cuda")
+    t = torch.tensor([median], dtype=torch.float64)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
@@ -62,7 +69,11 @@ def main():
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ["WORLD_SIZE"]))
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    dist_backend = os.environ.get("MKERNEL_DIST_BACKEND", "nccl")
+    if dist_backend == "nccl":
+        dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    else:
+        dist.init_process_group(dist_backend)
 
     node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
     is_chief = (local_rank == 0 and node_idx == 0)
@@ -81,6 +92,7 @@ def main():
     global_gpu = node_idx * local_world_size + local_rank
 
     result_sizes, result_fused = [], []
+    correctness_ok = True
 
     # Per-shape SM split (comm, send, copy). Larger seqs benefit from
     # smaller comm pool (more compute SMs); small seqs need comm coverage.
@@ -202,6 +214,8 @@ def main():
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
             legacy_sync = True
+        if NUM_NODES > 2:
+            legacy_sync = True
         if not legacy_sync:
             # Pick N so total ≥ ~100 ms at smaller shapes but bounded ≤ ~2s at
             # the largest. For ring_attn, expected per-iter ms ≈ shape-dependent
@@ -268,6 +282,18 @@ def main():
         wall_ms = median_then_max_cuda(samples)
         if is_chief:
             print(f"[ring_attn] seq={seq_per_dev} wall={wall_ms:.3f} ms", flush=True)
+        if args.mode == "check":
+            if seq_per_dev <= 1536:
+                K_full = torch.cat(gather_cpu_tensors(K_local), dim=2).to("cuda")
+                V_full = torch.cat(gather_cpu_tensors(V_local), dim=2).to("cuda")
+                O_ref = F.scaled_dot_product_attention(Q, K_full, V_full)
+                correctness_ok = check_close(
+                    f"ring_attention seq={seq_per_dev}",
+                    O, O_ref, atol=0.55, rtol=0.12
+                ) and correctness_ok
+            elif is_chief:
+                print(f"[correctness] ring_attention seq={seq_per_dev}: "
+                      "skipped full reference (shape too large)", flush=True)
         # Store as total_seq to match NCCL reference + published chart x-axis.
         result_sizes.append(seq_per_dev)
         result_fused.append(wall_ms)
@@ -282,9 +308,13 @@ def main():
 
     if is_chief and args.compare_to:
         ok = compare_named_results("ring_attn", result_sizes, result_fused, args.compare_to)
+        ok = ok and correctness_ok
         dist.destroy_process_group()
         if not ok: return 1
         return 0
+    if not correctness_ok:
+        dist.destroy_process_group()
+        return 1
     dist.destroy_process_group()
     return 0
 

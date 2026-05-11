@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <limits>
@@ -62,6 +63,8 @@ struct ProxyConfig {
     // Remote data buffer (peer's GPU HBM)
     uint64_t      remote_data_addr; // base address
     uint32_t      remote_data_rkey; // MR rkey
+    uint64_t      remote_data_addr_by_qp[kMaxExchangeQPs] = {};
+    uint32_t      remote_data_rkey_by_qp[kMaxExchangeQPs] = {};
 
     // Flag staging (host-pinned, holds epoch value for flag RDMA write)
     FlagStaging*  flag_staging;
@@ -71,14 +74,36 @@ struct ProxyConfig {
     uint32_t      remote_flags_rkey;
     uint64_t      remote_tail_addr;
     uint32_t      remote_tail_rkey;
+    uint64_t      remote_flags_addr_by_qp[kMaxExchangeQPs] = {};
+    uint32_t      remote_flags_rkey_by_qp[kMaxExchangeQPs] = {};
+    uint64_t      remote_tail_addr_by_qp[kMaxExchangeQPs] = {};
+    uint32_t      remote_tail_rkey_by_qp[kMaxExchangeQPs] = {};
     bool          use_arrival_queue = false; // selects queue vs flat arrival layout at runtime
     uint32_t      remote_queue_stride; // slots per remote logical queue (queue layout)
     int           logical_queues_per_qp; // number of software queues mapped onto each QP
+    bool          channelize_gpu_peers = false; // route by TransferCmd::reserved0
     bool          enable_remote_tail = false; // publish queue tail after metadata write
 
     // Remote stage barrier flags (for stage_barrier RDMA write)
     uint64_t      remote_barrier_addr;
     uint32_t      remote_barrier_rkey;
+    uint64_t      remote_barrier_addr_by_qp[kMaxExchangeQPs] = {};
+    uint32_t      remote_barrier_rkey_by_qp[kMaxExchangeQPs] = {};
+
+    // Optional AG-GEMM ring store-and-forward notification table. Sender writes
+    // ForwardNotify records into the receiver's host-pinned table after the
+    // data+arrival WRs; the receiver proxy polls its local table and forwards.
+    bool          enable_forward_notify = false;
+    volatile ForwardNotify* local_forward_notify = nullptr;
+    int           forward_notify_slots = 0;
+    uint64_t      remote_forward_notify_addr = 0;
+    uint32_t      remote_forward_notify_rkey = 0;
+    uint64_t      remote_forward_notify_addr_by_qp[kMaxExchangeQPs] = {};
+    uint32_t      remote_forward_notify_rkey_by_qp[kMaxExchangeQPs] = {};
+    int           rank = 0;
+    int           num_nodes = 2;
+    int           total_chunks = 0;
+    uint64_t      a_half_bytes = 0;
 
     uint32_t      epoch;           // current epoch value written to remote flags
     int           max_inflight;    // max outstanding RDMA WRs (default 128)
@@ -101,6 +126,9 @@ public:
         if (cfg_.global_num_qps <= 0) cfg_.global_num_qps = cfg_.num_qps;
         if (cfg_.logical_queues_per_qp <= 0) cfg_.logical_queues_per_qp = 1;
         if (cfg_.logical_queues_per_qp > 16) cfg_.logical_queues_per_qp = 16;
+        if (const char* env_channelize = std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS")) {
+            cfg_.channelize_gpu_peers = (env_channelize[0] != '\0' && env_channelize[0] != '0');
+        }
         // Each WRITE command posts either two WRs (data + arrival flag) or
         // three WRs when sender-published remote tails are enabled
         // (data + arrival flag + remote tail counter).
@@ -114,7 +142,9 @@ public:
         // We leave a small safety margin for in-flight CQEs that
         // have not yet been polled.
         constexpr int kQpSqDepth = 2048;          // matches create_rc_qp default
-        const int kWrsPerChunk = cfg_.enable_remote_tail ? 3 : 2;
+        const int kWrsPerChunk =
+            2 + (cfg_.enable_remote_tail ? 1 : 0)
+              + (cfg_.enable_forward_notify ? 1 : 0);
         constexpr int kSafetyMargin = 64;         // headroom for unpolled CQEs
         int per_qp_chunk_cap = (kQpSqDepth / kWrsPerChunk) - kSafetyMargin;
         if (per_qp_chunk_cap < 1) per_qp_chunk_cap = 1;
@@ -123,6 +153,9 @@ public:
         // Effective inflight scales with QP count
         effective_max_inflight_ = requested * cfg_.num_qps;
         memset(sender_seq_, 0, sizeof(sender_seq_));
+        if (cfg_.enable_forward_notify && cfg_.forward_notify_slots > 0) {
+            forward_seen_epoch_.assign((size_t)cfg_.forward_notify_slots, 0);
+        }
         diag_.qp_base_idx = cfg_.qp_base_idx;
         diag_.num_qps = cfg_.num_qps;
     }
@@ -210,27 +243,33 @@ public:
     /**
      * Post a single strided-direct WR chain: gather row_count rows from
      * C_local (up to max_send_sge rows per WR), chained with arrival flag
-     * and optional tail WR. Returns true on successful ibv_post_send.
+     * and optional tail WR. Returns the number of SQ slots posted, or 0 on
+     * failure.
      *
      * Used when cmd.src_view == 2 (direct DMA-BUF strided). The chain is
      * self-signaling (last WR has SIGNAL) and carries wr_id count=1.
      */
-    bool post_strided_direct(const TransferCmd& cmd, int batch_qp,
+    int post_strided_direct(const TransferCmd& cmd, int batch_qp,
                               uint32_t total_logical_queues) {
         constexpr uint32_t kTileBytes = 128u * 256u * 2u;
-        constexpr int kMaxRows = 128;           // ROW_BLOCK
-        constexpr int kMaxDataWrs = 8;          // supports up to 256 rows at max_sge=32
+        constexpr int kMaxRows = 256;           // AG tiled-direct publishes 256-row tiles
+        constexpr int kMaxDataWrs = 16;         // supports 256 rows when max_sge < 32
         ibv_send_wr wrs[kMaxDataWrs + 2];
         ibv_sge sges[kMaxRows + 2];
         const uint32_t stride = (uint32_t)cfg_.row_stride_bytes;
         const uint32_t rows = cmd.row_count;
         const uint32_t span = cmd.row_span;
         const uint32_t max_sge = cfg_.max_send_sge > 0 ? cfg_.max_send_sge : 1;
-        if (stride == 0 || rows == 0 || span == 0 || rows > kMaxRows) return false;
+        if (stride == 0 || rows == 0 || span == 0 || rows > kMaxRows) return 0;
         const uint64_t base = cfg_.clocal_data_addr + cmd.local_offset;
-        const uint64_t remote_base = cfg_.remote_data_addr + cmd.remote_offset;
+        const uint64_t remote_base = remote_data_addr_for_qp(batch_qp) + cmd.remote_offset;
+        const uint32_t remote_data_rkey = remote_data_rkey_for_qp(batch_qp);
+        const uint64_t remote_flags_addr = remote_flags_addr_for_qp(batch_qp);
+        const uint32_t remote_flags_rkey = remote_flags_rkey_for_qp(batch_qp);
+        const uint64_t remote_tail_addr = remote_tail_addr_for_qp(batch_qp);
+        const uint32_t remote_tail_rkey = remote_tail_rkey_for_qp(batch_qp);
         const uint32_t n_data_wrs = (rows + max_sge - 1u) / max_sge;
-        if ((int)n_data_wrs > kMaxDataWrs) return false;
+        if ((int)n_data_wrs > kMaxDataWrs) return 0;
 
         uint32_t sge_cursor = 0;
         uint32_t row_cursor = 0;
@@ -248,7 +287,7 @@ public:
             wr.num_sge = (int)n;
             wr.opcode = IBV_WR_RDMA_WRITE;
             wr.wr.rdma.remote_addr = remote_cursor;
-            wr.wr.rdma.rkey = cfg_.remote_data_rkey;
+            wr.wr.rdma.rkey = remote_data_rkey;
             wr.send_flags = 0;
             wr.next = &wrs[w + 1];
             sge_cursor += n;
@@ -284,13 +323,13 @@ public:
             logical_q = total_logical_queues > 0
                 ? (cmd.lane_id % total_logical_queues) : 0u;
             q_slot = sender_seq_[logical_q]++;
-            flag_wr.wr.rdma.remote_addr = cfg_.remote_flags_addr +
+            flag_wr.wr.rdma.remote_addr = remote_flags_addr +
                 (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) * sizeof(uint32_t);
         } else {
-            flag_wr.wr.rdma.remote_addr = cfg_.remote_flags_addr +
+            flag_wr.wr.rdma.remote_addr = remote_flags_addr +
                 (uint64_t)cmd.tile_id * sizeof(uint32_t);
         }
-        flag_wr.wr.rdma.rkey = cfg_.remote_flags_rkey;
+        flag_wr.wr.rdma.rkey = remote_flags_rkey;
         flag_wr.send_flags = IBV_SEND_INLINE;
 
         if (cfg_.use_arrival_queue && cfg_.enable_remote_tail) {
@@ -306,31 +345,50 @@ public:
             tail_wr.num_sge = 1;
             tail_wr.opcode = IBV_WR_RDMA_WRITE;
             tail_wr.wr.rdma.remote_addr =
-                cfg_.remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t);
-            tail_wr.wr.rdma.rkey = cfg_.remote_tail_rkey;
+                remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t);
+            tail_wr.wr.rdma.rkey = remote_tail_rkey;
             tail_wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
-            tail_wr.wr_id = encode_wr_id(batch_qp, 1);
+            tail_wr.wr_id = encode_wr_id(batch_qp, (int)n_data_wrs + 2);
             tail_wr.next = nullptr;
         } else {
             flag_wr.send_flags |= IBV_SEND_SIGNALED;
-            flag_wr.wr_id = encode_wr_id(batch_qp, 1);
+            flag_wr.wr_id = encode_wr_id(batch_qp, (int)n_data_wrs + 1);
             flag_wr.next = nullptr;
         }
 
         ibv_qp* post_qp = (batch_qp == 0) ? cfg_.qp : cfg_.extra_qps[batch_qp - 1];
+        if (std::getenv("MKERNEL_STRIDED_DIRECT_DEBUG") != nullptr) {
+            static std::atomic<int> dbg_count{0};
+            int n = dbg_count.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                const int global_qp = cfg_.qp_base_idx + batch_qp;
+                fprintf(stderr,
+                        "proxy-strided-debug: rank=%d dev=%d dst=%u "
+                        "global_qp=%d tile_id=%u local_off=%u remote_off=%u "
+                        "bytes=%u rows=%u span=%u total_qps=%d\n",
+                        cfg_.rank, cfg_.device_id, (unsigned)cmd.dst_rank,
+                        global_qp, (unsigned)cmd.tile_id,
+                        (unsigned)cmd.local_offset,
+                        (unsigned)cmd.remote_offset, (unsigned)cmd.bytes,
+                        (unsigned)cmd.row_count, (unsigned)cmd.row_span,
+                        cfg_.global_num_qps);
+            }
+        }
         ibv_send_wr* bad = nullptr;
         int ret = ibv_post_send(post_qp, &wrs[0], &bad);
         if (ret != 0) {
             fprintf(stderr, "proxy: strided post failed (rows=%u span=%u wrs=%u): %s\n",
                     rows, span, n_data_wrs, strerror(ret));
-            return false;
+            return 0;
         }
         if (__builtin_expect(!strided_logged_, false)) {
             fprintf(stderr, "proxy: q2 dmabuf strided: rows=%u span=%u wrs=%u max_sge=%u\n",
                     rows, span, n_data_wrs, max_sge);
             strided_logged_ = true;
         }
-        return true;
+        return cfg_.use_arrival_queue && cfg_.enable_remote_tail
+            ? (int)n_data_wrs + 2
+            : (int)n_data_wrs + 1;
     }
 
     /** Get current inflight WR count (approximate, for drain polling). */
@@ -423,13 +481,16 @@ private:
     bool strided_logged_ = false;
 
     // Pre-allocated WR/SGE templates — initialized once, only dynamic fields updated per batch.
-    ibv_send_wr wrs_[BATCH_SIZE * 3];
-    ibv_sge     sges_[BATCH_SIZE * 3];
+    ibv_send_wr wrs_[BATCH_SIZE * 4];
+    ibv_sge     sges_[BATCH_SIZE * 4];
+    ForwardNotify notify_payload_[BATCH_SIZE];
     bool        wrs_initialized_ = false;
     ProxyDiagnostics diag_;
     std::deque<uint64_t> batch_post_ns_[kMaxExchangeQPs];
     std::vector<uint64_t> signaled_post_ns_;
     std::vector<uint64_t> completion_ns_;
+    std::vector<uint32_t> forward_seen_epoch_;
+    int forward_scan_cursor_ = 0;
 
     // Diagnostics: track how the proxy spends its time
     uint64_t diag_total_loops_ = 0;
@@ -506,9 +567,10 @@ private:
         memset(wrs_, 0, sizeof(wrs_));
         memset(sges_, 0, sizeof(sges_));
         for (int i = 0; i < BATCH_SIZE; i++) {
-            const int di = i * 3;      // data WR index
-            const int fi = i * 3 + 1;  // flag WR index
-            const int ti = i * 3 + 2;  // tail WR index
+            const int di = i * 4;      // data WR index
+            const int fi = i * 4 + 1;  // flag WR index
+            const int ni = i * 4 + 2;  // optional forward-notify WR index
+            const int ti = i * 4 + 3;  // optional tail WR index
 
             // Data WR template
             sges_[di].lkey   = cfg_.local_data_lkey;
@@ -526,6 +588,14 @@ private:
             wrs_[fi].num_sge = 1;
             wrs_[fi].opcode  = IBV_WR_RDMA_WRITE;
             wrs_[fi].wr.rdma.rkey = cfg_.remote_flags_rkey;
+
+            // Optional forward notification WR template.
+            sges_[ni].addr   = (uint64_t)&notify_payload_[i];
+            sges_[ni].length = sizeof(ForwardNotify);
+            sges_[ni].lkey   = 0; // ignored for INLINE
+            wrs_[ni].sg_list = &sges_[ni];
+            wrs_[ni].num_sge = 1;
+            wrs_[ni].opcode  = IBV_WR_RDMA_WRITE;
 
             // Optional tail WR template
             sges_[ti].addr   = (uint64_t)(cfg_.flag_staging->host_ptr + BATCH_SIZE);
@@ -556,6 +626,186 @@ private:
 
     static int decode_wr_count(uint64_t wr_id) {
         return (int)(wr_id & kWrCountMask);
+    }
+
+    int route_global_qp(const TransferCmd& cmd) const {
+        if (cfg_.global_num_qps <= 0) return 0;
+        if (cfg_.channelize_gpu_peers) {
+            return (int)(cmd.reserved0 % (uint8_t)cfg_.global_num_qps);
+        }
+        return (int)(cmd.lane_id % cfg_.global_num_qps);
+    }
+
+    uint64_t remote_data_addr_for_qp(int local_qp) const {
+        const int global_qp = cfg_.qp_base_idx + local_qp;
+        uint64_t v = (global_qp >= 0 && global_qp < kMaxExchangeQPs)
+            ? cfg_.remote_data_addr_by_qp[global_qp] : 0;
+        return v != 0 ? v : cfg_.remote_data_addr;
+    }
+    uint32_t remote_data_rkey_for_qp(int local_qp) const {
+        const int global_qp = cfg_.qp_base_idx + local_qp;
+        uint32_t v = (global_qp >= 0 && global_qp < kMaxExchangeQPs)
+            ? cfg_.remote_data_rkey_by_qp[global_qp] : 0;
+        return v != 0 ? v : cfg_.remote_data_rkey;
+    }
+    uint64_t remote_flags_addr_for_qp(int local_qp) const {
+        const int global_qp = cfg_.qp_base_idx + local_qp;
+        uint64_t v = (global_qp >= 0 && global_qp < kMaxExchangeQPs)
+            ? cfg_.remote_flags_addr_by_qp[global_qp] : 0;
+        return v != 0 ? v : cfg_.remote_flags_addr;
+    }
+    uint32_t remote_flags_rkey_for_qp(int local_qp) const {
+        const int global_qp = cfg_.qp_base_idx + local_qp;
+        uint32_t v = (global_qp >= 0 && global_qp < kMaxExchangeQPs)
+            ? cfg_.remote_flags_rkey_by_qp[global_qp] : 0;
+        return v != 0 ? v : cfg_.remote_flags_rkey;
+    }
+    uint64_t remote_tail_addr_for_qp(int local_qp) const {
+        const int global_qp = cfg_.qp_base_idx + local_qp;
+        uint64_t v = (global_qp >= 0 && global_qp < kMaxExchangeQPs)
+            ? cfg_.remote_tail_addr_by_qp[global_qp] : 0;
+        return v != 0 ? v : cfg_.remote_tail_addr;
+    }
+    uint32_t remote_tail_rkey_for_qp(int local_qp) const {
+        const int global_qp = cfg_.qp_base_idx + local_qp;
+        uint32_t v = (global_qp >= 0 && global_qp < kMaxExchangeQPs)
+            ? cfg_.remote_tail_rkey_by_qp[global_qp] : 0;
+        return v != 0 ? v : cfg_.remote_tail_rkey;
+    }
+
+    uint64_t remote_forward_notify_addr_for_qp(int local_qp) const {
+        const int global_qp = cfg_.qp_base_idx + local_qp;
+        uint64_t v = (global_qp >= 0 && global_qp < kMaxExchangeQPs)
+            ? cfg_.remote_forward_notify_addr_by_qp[global_qp] : 0;
+        return v != 0 ? v : cfg_.remote_forward_notify_addr;
+    }
+    uint32_t remote_forward_notify_rkey_for_qp(int local_qp) const {
+        const int global_qp = cfg_.qp_base_idx + local_qp;
+        uint32_t v = (global_qp >= 0 && global_qp < kMaxExchangeQPs)
+            ? cfg_.remote_forward_notify_rkey_by_qp[global_qp] : 0;
+        return v != 0 ? v : cfg_.remote_forward_notify_rkey;
+    }
+
+    bool forward_notify_enabled_for_cmd(const TransferCmd& cmd) const {
+        if (!cfg_.enable_forward_notify || cfg_.num_nodes <= 2 ||
+            cfg_.total_chunks <= 0 || cfg_.a_half_bytes == 0) {
+            return false;
+        }
+        if (cmd.tile_id >= (uint32_t)cfg_.forward_notify_slots) return false;
+        const int n_peers = cfg_.num_nodes - 1;
+        const int src_virtual = (int)cmd.tile_id / cfg_.total_chunks;
+        const int src_bank = src_virtual / n_peers;
+        return src_bank + 1 < n_peers;
+    }
+
+    TransferCmd make_forward_cmd_from_notify(const ForwardNotify& n) const {
+        TransferCmd cmd{};
+        cmd.cmd_type = CmdType::WRITE;
+        cmd.dst_rank = (uint8_t)peer_rank_for_slot(cfg_.rank, cfg_.num_nodes, 0);
+        cmd.bytes = n.bytes;
+        cmd.local_offset = n.local_offset;
+        cmd.src_view = 0;
+        cmd.lane_id = n.lane_id;
+        cmd.reserved0 = (uint8_t)cfg_.device_id; // peer_slot 0 * 8 + local GPU
+
+        const int n_peers = cfg_.num_nodes - 1;
+        const int src_virtual = (int)n.tile_id / cfg_.total_chunks;
+        const int src_slot = src_virtual % n_peers;
+        const int src_bank = src_virtual / n_peers;
+        const int origin_rank = peer_rank_for_slot(cfg_.rank, cfg_.num_nodes, src_slot);
+        const int next_rank = peer_rank_for_slot(cfg_.rank, cfg_.num_nodes, 0);
+        const int dst_slot = slot_at_peer(origin_rank, next_rank, cfg_.num_nodes);
+        const int dst_virtual = dst_slot + n_peers * (src_bank + 1);
+        const uint32_t chunk = n.tile_id % (uint32_t)cfg_.total_chunks;
+        const uint32_t base = (uint32_t)((uint64_t)n.local_offset % cfg_.a_half_bytes);
+        cmd.tile_id = (uint16_t)(dst_virtual * cfg_.total_chunks + chunk);
+        cmd.remote_offset = (uint32_t)((uint64_t)dst_virtual * cfg_.a_half_bytes + base);
+        return cmd;
+    }
+
+    bool post_single_write_flat(const TransferCmd& cmd) {
+        const int global_qp = route_global_qp(cmd);
+        const int batch_qp = global_qp - cfg_.qp_base_idx;
+        if (batch_qp < 0 || batch_qp >= cfg_.num_qps) return false;
+
+        ibv_sge sges[2]{};
+        ibv_send_wr wrs[2]{};
+        sges[0].addr = cfg_.local_data_addr + cmd.local_offset;
+        sges[0].length = cmd.bytes;
+        sges[0].lkey = cfg_.local_data_lkey;
+        wrs[0].sg_list = &sges[0];
+        wrs[0].num_sge = 1;
+        wrs[0].opcode = IBV_WR_RDMA_WRITE;
+        wrs[0].wr.rdma.remote_addr = remote_data_addr_for_qp(batch_qp) + cmd.remote_offset;
+        wrs[0].wr.rdma.rkey = remote_data_rkey_for_qp(batch_qp);
+        wrs[0].next = &wrs[1];
+
+        cfg_.flag_staging->host_ptr[BATCH_SIZE * 2] = cfg_.epoch;
+        sges[1].addr = (uint64_t)(cfg_.flag_staging->host_ptr + BATCH_SIZE * 2);
+        sges[1].length = sizeof(uint32_t);
+        sges[1].lkey = cfg_.flag_staging->mr->lkey;
+        wrs[1].sg_list = &sges[1];
+        wrs[1].num_sge = 1;
+        wrs[1].opcode = IBV_WR_RDMA_WRITE;
+        wrs[1].wr.rdma.remote_addr =
+            remote_flags_addr_for_qp(batch_qp) + (uint64_t)cmd.tile_id * sizeof(uint32_t);
+        wrs[1].wr.rdma.rkey = remote_flags_rkey_for_qp(batch_qp);
+        wrs[1].send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+        wrs[1].wr_id = encode_wr_id(batch_qp, 1);
+
+        ibv_qp* post_qp = (batch_qp == 0) ? cfg_.qp : cfg_.extra_qps[batch_qp - 1];
+        ibv_send_wr* bad = nullptr;
+        int ret = ibv_post_send(post_qp, &wrs[0], &bad);
+        if (ret != 0) return false;
+        inflight_.fetch_add(1, std::memory_order_release);
+        return true;
+    }
+
+    void flush_inbound_gdr_writes_for_forward() {
+#if CUDART_VERSION >= 11030
+        int opts = 0;
+        if (cudaDeviceGetAttribute(&opts, cudaDevAttrGPUDirectRDMAFlushWritesOptions,
+                                   cfg_.device_id) != cudaSuccess) {
+            return;
+        }
+        if ((opts & cudaFlushGPUDirectRDMAWritesOptionHost) == 0) return;
+        cudaSetDevice(cfg_.device_id);
+        cudaDeviceFlushGPUDirectRDMAWrites(
+            cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+            cudaFlushGPUDirectRDMAWritesToAllDevices);
+#endif
+    }
+
+    void poll_forward_notifications() {
+        if (!cfg_.enable_forward_notify || cfg_.local_forward_notify == nullptr ||
+            cfg_.forward_notify_slots <= 0 || forward_seen_epoch_.empty()) {
+            return;
+        }
+        constexpr int kScanPerLoop = 256;
+        for (int i = 0; i < kScanPerLoop; ++i) {
+            const int slot = forward_scan_cursor_;
+            forward_scan_cursor_++;
+            if (forward_scan_cursor_ >= cfg_.forward_notify_slots) forward_scan_cursor_ = 0;
+            if (forward_seen_epoch_[(size_t)slot] == cfg_.epoch) continue;
+            const volatile ForwardNotify& src = cfg_.local_forward_notify[slot];
+            ForwardNotify n{};
+            n.bytes = src.bytes;
+            n.local_offset = src.local_offset;
+            n.tile_id = src.tile_id;
+            n.lane_id = src.lane_id;
+            n.reserved0 = src.reserved0;
+            n.src_view = src.src_view;
+            n.epoch = src.epoch;
+            n.reserved1 = src.reserved1;
+            n.reserved2 = src.reserved2;
+            if (n.epoch != cfg_.epoch) continue;
+            if (n.tile_id != (uint32_t)slot) continue;
+            TransferCmd fwd = make_forward_cmd_from_notify(n);
+            flush_inbound_gdr_writes_for_forward();
+            if (post_single_write_flat(fwd)) {
+                forward_seen_epoch_[(size_t)slot] = cfg_.epoch;
+            }
+        }
     }
 
     /**
@@ -603,6 +853,10 @@ private:
                 continue;  // re-check running_ and start fresh
             }
 
+            if (inflight_.load(std::memory_order_relaxed) < effective_max_inflight_) {
+                poll_forward_notifications();
+            }
+
             // --- Step 1: Collect a batch of commands from FIFO ---
             TransferCmd batch[BATCH_SIZE];
             int count = 0;
@@ -617,8 +871,7 @@ private:
                     batch[0] = pending_cmd_;
                     has_pending_cmd_ = false;
                     count = 1;
-                    const int global_qp =
-                        (cfg_.global_num_qps > 0) ? (batch[0].lane_id % cfg_.global_num_qps) : 0;
+                    const int global_qp = route_global_qp(batch[0]);
                     batch_qp = global_qp - cfg_.qp_base_idx;
                 }
                 while (count < BATCH_SIZE && pre_inflight + count < effective_max_inflight_) {
@@ -644,8 +897,7 @@ private:
                         continue;
                     }
                     if (cmd.cmd_type != CmdType::WRITE) continue;
-                    const int global_qp =
-                        (cfg_.global_num_qps > 0) ? (cmd.lane_id % cfg_.global_num_qps) : 0;
+                    const int global_qp = route_global_qp(cmd);
                     const int cmd_qp = global_qp - cfg_.qp_base_idx;
                     if (cmd_qp < 0 || cmd_qp >= cfg_.num_qps) {
                         fprintf(stderr,
@@ -665,6 +917,13 @@ private:
             } else {
                 // Flat layout collect: simpler — round-robin across QPs and
                 // accumulate up to BATCH_SIZE without pre-routing by lane.
+                if (cfg_.channelize_gpu_peers && has_pending_cmd_ &&
+                    pre_inflight < effective_max_inflight_) {
+                    batch[0] = pending_cmd_;
+                    has_pending_cmd_ = false;
+                    count = 1;
+                    batch_qp = route_global_qp(batch[0]) - cfg_.qp_base_idx;
+                }
                 while (count < BATCH_SIZE &&
                        pre_inflight + count < effective_max_inflight_ &&
                        cfg_.fifo->poll(&batch[count])) {
@@ -686,6 +945,22 @@ private:
                     if (batch[count].cmd_type == CmdType::BARRIER_NOTIFY) {
                         post_stage_barrier(/*slot=*/0, cfg_.epoch);
                     } else if (batch[count].cmd_type == CmdType::WRITE) {
+                        if (cfg_.channelize_gpu_peers) {
+                            const int cmd_qp = route_global_qp(batch[count]) - cfg_.qp_base_idx;
+                            if (cmd_qp < 0 || cmd_qp >= cfg_.num_qps) {
+                                fprintf(stderr,
+                                        "proxy: channel %u routed outside local range [%d, %d)\n",
+                                        (unsigned)batch[count].reserved0, cfg_.qp_base_idx,
+                                        cfg_.qp_base_idx + cfg_.num_qps);
+                                continue;
+                            }
+                            if (count == 0) batch_qp = cmd_qp;
+                            if (cmd_qp != batch_qp) {
+                                pending_cmd_ = batch[count];
+                                has_pending_cmd_ = true;
+                                break;
+                            }
+                        }
                         count++;
                     }
                 }
@@ -733,9 +1008,8 @@ private:
                 int new_count = 0;
                 for (int i = 0; i < count; i++) {
                     if (batch[i].src_view == 2) {
-                        if (post_strided_direct(batch[i], batch_qp, total_logical_queues)) {
-                            strided_posted++;
-                        }
+                        strided_posted += post_strided_direct(
+                            batch[i], batch_qp, total_logical_queues);
                     } else {
                         if (new_count != i) batch[new_count] = batch[i];
                         new_count++;
@@ -771,10 +1045,12 @@ private:
                 // Only update dynamic fields — templates set constant fields once.
                 for (int i = 0; i < count; i++) {
                     const TransferCmd& cmd = batch[i];
-                    const int di = i * 3;
-                    const int fi = i * 3 + 1;
-                    const int ti = i * 3 + 2;
+                    const int di = i * 4;
+                    const int fi = i * 4 + 1;
+                    const int ni = i * 4 + 2;
+                    const int ti = i * 4 + 3;
                     bool is_last = (i == count - 1);
+                    const bool do_forward_notify = forward_notify_enabled_for_cmd(cmd);
 
                     // Data WR: update address + length + remote addr.
                     // If direct-DMABUF is enabled and this command tags
@@ -787,7 +1063,9 @@ private:
                         sges_[di].lkey = cfg_.local_data_lkey;
                     }
                     sges_[di].length = cmd.bytes;
-                    wrs_[di].wr.rdma.remote_addr = cfg_.remote_data_addr + cmd.remote_offset;
+                    wrs_[di].wr.rdma.remote_addr =
+                        remote_data_addr_for_qp(batch_qp) + cmd.remote_offset;
+                    wrs_[di].wr.rdma.rkey = remote_data_rkey_for_qp(batch_qp);
 
                     // Metadata WR: update remote readiness addr + signaling + chain
                     // IBV_SEND_INLINE embeds the 4-byte flag in the WQE itself,
@@ -804,7 +1082,8 @@ private:
                         const uint32_t logical_q =
                             total_logical_queues > 0 ? (cmd.lane_id % total_logical_queues) : 0u;
                         const uint32_t q_slot = sender_seq_[logical_q]++;
-                        wrs_[fi].wr.rdma.remote_addr = cfg_.remote_flags_addr +
+                        wrs_[fi].wr.rdma.rkey = remote_flags_rkey_for_qp(batch_qp);
+                        wrs_[fi].wr.rdma.remote_addr = remote_flags_addr_for_qp(batch_qp) +
                                                         (uint64_t)(logical_q * cfg_.remote_queue_stride + q_slot) * sizeof(uint32_t);
                         if (cfg_.enable_remote_tail) {
                             cfg_.flag_staging->host_ptr[BATCH_SIZE + i] = q_slot + 1u;
@@ -816,22 +1095,42 @@ private:
                             wrs_[ti].send_flags = IBV_SEND_INLINE |
                                                   (is_last ? IBV_SEND_SIGNALED : 0);
                             wrs_[ti].wr.rdma.remote_addr =
-                                cfg_.remote_tail_addr + (uint64_t)logical_q * sizeof(uint32_t);
-                            wrs_[ti].next = is_last ? nullptr : &wrs_[(i + 1) * 3];
+                                remote_tail_addr_for_qp(batch_qp) + (uint64_t)logical_q * sizeof(uint32_t);
+                            wrs_[ti].wr.rdma.rkey = remote_tail_rkey_for_qp(batch_qp);
+                            wrs_[ti].next = is_last ? nullptr : &wrs_[(i + 1) * 4];
                         } else {
                             wrs_[fi].wr_id      = is_last ? encode_wr_id(batch_qp, count) : 0;
                             wrs_[fi].send_flags = IBV_SEND_INLINE |
                                                   (is_last ? IBV_SEND_SIGNALED : 0);
-                            wrs_[fi].next = is_last ? nullptr : &wrs_[(i + 1) * 3];
+                            wrs_[fi].next = is_last ? nullptr : &wrs_[(i + 1) * 4];
                         }
                     } else {
                         sges_[fi].addr = (uint64_t)cfg_.flag_staging->host_ptr;
-                        wrs_[fi].wr.rdma.remote_addr = cfg_.remote_flags_addr +
+                        wrs_[fi].wr.rdma.rkey = remote_flags_rkey_for_qp(batch_qp);
+                        wrs_[fi].wr.rdma.remote_addr = remote_flags_addr_for_qp(batch_qp) +
                                                         cmd.tile_id * sizeof(uint32_t);
-                        wrs_[fi].wr_id      = is_last ? encode_wr_id(batch_qp, count) : 0;
-                        wrs_[fi].send_flags = IBV_SEND_INLINE |
-                                              (is_last ? IBV_SEND_SIGNALED : 0);
-                        wrs_[fi].next = is_last ? nullptr : &wrs_[(i + 1) * 3];
+                        if (do_forward_notify) {
+                            notify_payload_[i] = ForwardNotify{
+                                cmd.bytes, cmd.remote_offset, cmd.tile_id,
+                                cmd.lane_id, cmd.reserved0, cmd.src_view,
+                                cfg_.epoch, 0};
+                            wrs_[fi].wr_id = 0;
+                            wrs_[fi].send_flags = IBV_SEND_INLINE;
+                            wrs_[fi].next = &wrs_[ni];
+                            wrs_[ni].wr_id = is_last ? encode_wr_id(batch_qp, count) : 0;
+                            wrs_[ni].send_flags = IBV_SEND_INLINE |
+                                                  (is_last ? IBV_SEND_SIGNALED : 0);
+                            wrs_[ni].wr.rdma.rkey = remote_forward_notify_rkey_for_qp(batch_qp);
+                            wrs_[ni].wr.rdma.remote_addr =
+                                remote_forward_notify_addr_for_qp(batch_qp) +
+                                (uint64_t)cmd.tile_id * sizeof(ForwardNotify);
+                            wrs_[ni].next = is_last ? nullptr : &wrs_[(i + 1) * 4];
+                        } else {
+                            wrs_[fi].wr_id      = is_last ? encode_wr_id(batch_qp, count) : 0;
+                            wrs_[fi].send_flags = IBV_SEND_INLINE |
+                                                  (is_last ? IBV_SEND_SIGNALED : 0);
+                            wrs_[fi].next = is_last ? nullptr : &wrs_[(i + 1) * 4];
+                        }
                     }
                 }
 

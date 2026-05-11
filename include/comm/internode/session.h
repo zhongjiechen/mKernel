@@ -207,9 +207,11 @@ struct SessionConfig {
     int         num_qps;             // number of QPs to create (0 or 1 = single QP, max 24)
     int         logical_queues_per_qp = 1; // software queues mapped onto each QP
     int         num_proxy_threads = 1;     // host proxy threads / FIFO channels
+    bool        channelize_gpu_peers = false; // route peer/GPU channels through stable QPs
     bool        use_write_imm = false;
     int         ready_queue_cap = 0;
     bool        use_arrival_queue = false;
+    bool        enable_forward_notify = false;
 
     const char* nic_name;            // IB device name (e.g., "mlx5_4"); NULL = auto-select based on device_id
 
@@ -259,12 +261,15 @@ struct Session {
     ArrivalFlags  arrival;
     FlagStaging   flag_stagings[kMaxProxyThreads];
     StageBarrierFlags stage_barrier;
+    ForwardNotifyTable forward_notify;
 
     // CPU proxy threads.
     Proxy*        proxies[kMaxProxyThreads];
 
     // Remote connection info (populated after TCP exchange)
     ConnectionInfo remote_info;
+    ConnectionInfo remote_infos[kMaxPeers];
+    int            num_remote_peers = 1;
 
     // Session config (for reference)
     int rank;
@@ -296,6 +301,9 @@ inline Session* create_session(const SessionConfig& cfg) {
 
     // Determine effective QP count (0 treated as 1, clamped to kMaxQPs)
     int effective_num_qps = (cfg.num_qps <= 0) ? 1 : cfg.num_qps;
+    if (cfg.channelize_gpu_peers && cfg.num_peers > 1) {
+        effective_num_qps = std::max(effective_num_qps, cfg.num_peers * 8);
+    }
     if (effective_num_qps > kMaxQPs) effective_num_qps = kMaxQPs;
     s->num_qps = effective_num_qps;
     int requested_proxy_threads = cfg.num_proxy_threads <= 0 ? 1 : cfg.num_proxy_threads;
@@ -469,6 +477,16 @@ inline Session* create_session(const SessionConfig& cfg) {
                                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
                                        | IBV_ACCESS_RELAXED_ORDERING);
 
+    // --- 6c. Optional host-polled forward notifications ---
+    if (cfg.enable_forward_notify) {
+        s->forward_notify = create_forward_notify_table(total_arrival_slots);
+        s->forward_notify.mr = rdma::reg_mr(
+            s->pd, (void*)s->forward_notify.host_ptr,
+            (size_t)s->forward_notify.count * sizeof(ForwardNotify),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
+            | IBV_ACCESS_RELAXED_ORDERING);
+    }
+
     // --- 7. TCP exchange ---
     ConnectionInfo local_info{};
     rdma::fill_local_info(local_info, s->qp, s->ctx);
@@ -483,6 +501,11 @@ inline Session* create_session(const SessionConfig& cfg) {
     local_info.tail_addr = (uint64_t)s->arrival.tail_device_ptr;
     local_info.barrier_rkey = s->stage_barrier.mr->rkey;
     local_info.barrier_addr = (uint64_t)s->stage_barrier.host_ptr;
+    if (s->forward_notify.mr != nullptr) {
+        local_info.forward_notify_rkey = s->forward_notify.mr->rkey;
+        local_info.forward_notify_addr = (uint64_t)s->forward_notify.host_ptr;
+        local_info.forward_notify_count = (uint32_t)s->forward_notify.count;
+    }
 
     // Multi-QP: fill extra QP info for TCP exchange
     local_info.num_qps = s->num_qps;
@@ -491,35 +514,122 @@ inline Session* create_session(const SessionConfig& cfg) {
         local_info.extra_psns[i - 1] = 0;  // PSN 0 for extra QPs
     }
 
-    // Multi-peer normalization: when num_peers > 0, peer_ips[0] / peer_tcp_ports[0]
-    // are the inputs; otherwise fall back to the legacy single peer_ip/tcp_port.
-    // CX7 still aborts on num_peers > 1 since the per-peer RTR loop isn't wired.
-    const char* sess_peer_ip = (cfg.num_peers > 0) ? cfg.peer_ips[0] : cfg.peer_ip;
-    int sess_tcp_port        = (cfg.num_peers > 0) ? cfg.peer_tcp_ports[0] : cfg.tcp_port;
-    if (cfg.num_peers > 1) {
-        fprintf(stderr,
-                "session.h (CX7): num_peers=%d > 1 is WIP — only slot 0 is "
-                "wired through TCP exchange / RC RTR. Aborting.\n",
-                cfg.num_peers);
+    // Multi-peer normalization. Slot order is the same skip-self order used by
+    // peer_rank_for_slot(), so device-side reserved0=peer_slot*8+gpu maps to
+    // the QP subset connected to that peer.
+    const int num_remote_peers = (cfg.num_peers > 0) ? cfg.num_peers : 1;
+    if (num_remote_peers > kMaxPeers) {
+        fprintf(stderr, "session.h (CX7): num_peers=%d exceeds kMaxPeers=%d\n",
+                num_remote_peers, kMaxPeers);
         delete s;
         return nullptr;
     }
-    bool is_server = (cfg.rank == 0);
-    s->remote_info = rdma::exchange_info_tcp(local_info, sess_peer_ip,
-                                              sess_tcp_port, is_server);
+    s->num_remote_peers = num_remote_peers;
+    memset(s->remote_infos, 0, sizeof(s->remote_infos));
+    const int inferred_num_nodes = num_remote_peers + 1;
+    const int qps_per_peer = cfg.channelize_gpu_peers
+        ? std::max(1, s->num_qps / num_remote_peers)
+        : s->num_qps;
+    const bool session_debug = []() {
+        const char* v = std::getenv("MKERNEL_SESSION_DEBUG");
+        return v && v[0] == '1';
+    }();
+    if (session_debug) {
+        fprintf(stderr,
+                "session-debug: rank=%d dev=%d peers=%d channelize=%d "
+                "num_qps=%d qps_per_peer=%d requested_qps=%d\n",
+                cfg.rank, cfg.device_id, num_remote_peers,
+                cfg.channelize_gpu_peers ? 1 : 0, s->num_qps,
+                qps_per_peer, cfg.num_qps);
+    }
+
+    auto qp_for_global = [&](int global_qp) -> ibv_qp* {
+        return (global_qp == 0) ? s->qp : s->extra_qps[global_qp - 1];
+    };
+    auto local_psn_for_global = [&](int global_qp) -> uint32_t {
+        return (global_qp == 0) ? local_info.psn : local_info.extra_psns[global_qp - 1];
+    };
+
+    auto peer_rank_for_local_slot = [&](int peer_slot) -> int {
+        return cfg.peer_ranks
+            ? cfg.peer_ranks[peer_slot]
+            : peer_rank_for_slot(cfg.rank, inferred_num_nodes, peer_slot);
+    };
+    auto peer_slot_for_rank = [&](int peer_rank) -> int {
+        for (int slot = 0; slot < num_remote_peers; ++slot) {
+            if (peer_rank_for_local_slot(slot) == peer_rank) return slot;
+        }
+        return -1;
+    };
+
+    // Bring up unordered node pairs in a global order to avoid N>2 bootstrap
+    // cycles such as 0->1, 1->2, 2->0 when every node uses local peer order.
+    for (int lo = 0; lo < inferred_num_nodes; ++lo) {
+        for (int hi = lo + 1; hi < inferred_num_nodes; ++hi) {
+            if (cfg.rank != lo && cfg.rank != hi) continue;
+            const int peer_rank = (cfg.rank == lo) ? hi : lo;
+            const int peer_slot = peer_slot_for_rank(peer_rank);
+            if (peer_slot < 0) {
+                fprintf(stderr,
+                        "session.h: could not map peer_rank=%d for rank=%d "
+                        "(num_peers=%d)\n",
+                        peer_rank, cfg.rank, num_remote_peers);
+                delete s;
+                return nullptr;
+            }
+            const char* sess_peer_ip = (cfg.num_peers > 0) ? cfg.peer_ips[peer_slot] : cfg.peer_ip;
+            const int sess_tcp_port  = (cfg.num_peers > 0) ? cfg.peer_tcp_ports[peer_slot] : cfg.tcp_port;
+            const bool is_server = (cfg.rank == lo);
+            s->remote_infos[peer_slot] =
+                rdma::exchange_info_tcp(local_info, sess_peer_ip, sess_tcp_port, is_server);
+            if (session_debug) {
+                fprintf(stderr,
+                        "session-debug: rank=%d dev=%d peer_rank=%d peer_slot=%d "
+                        "remote_num_qps=%d remote_qp0=%u\n",
+                        cfg.rank, cfg.device_id, peer_rank, peer_slot,
+                        s->remote_infos[peer_slot].num_qps,
+                        s->remote_infos[peer_slot].qp_num);
+            }
+        }
+    }
+    s->remote_info = s->remote_infos[0];
 
     // --- 8. QP transitions ---
-    rdma::modify_qp_rtr(s->qp, s->remote_info);
-    rdma::modify_qp_rts(s->qp, local_info.psn);
-
-    // Connect extra QPs (RTR/RTS) using the exchanged QP nums
-    for (int i = 1; i < s->num_qps; i++) {
-        // Build a ConnectionInfo for this extra QP pair
-        ConnectionInfo extra_remote = s->remote_info;
-        extra_remote.qp_num = s->remote_info.extra_qp_nums[i - 1];
-        extra_remote.psn = s->remote_info.extra_psns[i - 1];
-        rdma::modify_qp_rtr(s->extra_qps[i - 1], extra_remote);
-        rdma::modify_qp_rts(s->extra_qps[i - 1], local_info.extra_psns[i - 1]);
+    for (int peer_slot = 0; peer_slot < num_remote_peers; ++peer_slot) {
+        const int peer_rank = cfg.peer_ranks
+            ? cfg.peer_ranks[peer_slot]
+            : peer_rank_for_slot(cfg.rank, inferred_num_nodes, peer_slot);
+        const int remote_slot = (num_remote_peers == 1)
+            ? 0
+            : slot_at_peer(cfg.rank, peer_rank, inferred_num_nodes);
+        const int local_qp_base = cfg.channelize_gpu_peers ? peer_slot * qps_per_peer : 0;
+        const int remote_qp_base = cfg.channelize_gpu_peers ? remote_slot * qps_per_peer : 0;
+        const int local_qp_end = cfg.channelize_gpu_peers
+            ? std::min(s->num_qps, local_qp_base + qps_per_peer)
+            : s->num_qps;
+        for (int local_qp = local_qp_base, remote_qp = remote_qp_base;
+             local_qp < local_qp_end;
+             ++local_qp, ++remote_qp) {
+            ConnectionInfo remote_qp_info = s->remote_infos[peer_slot];
+            if (remote_qp == 0) {
+                remote_qp_info.qp_num = s->remote_infos[peer_slot].qp_num;
+                remote_qp_info.psn = s->remote_infos[peer_slot].psn;
+            } else {
+                remote_qp_info.qp_num = s->remote_infos[peer_slot].extra_qp_nums[remote_qp - 1];
+                remote_qp_info.psn = s->remote_infos[peer_slot].extra_psns[remote_qp - 1];
+            }
+            if (session_debug) {
+                fprintf(stderr,
+                        "session-debug: rank=%d dev=%d peer_slot=%d peer_rank=%d "
+                        "local_qp=%d remote_slot=%d remote_qp=%d remote_qpn=%u "
+                        "remote_num_qps=%d\n",
+                        cfg.rank, cfg.device_id, peer_slot, peer_rank,
+                        local_qp, remote_slot, remote_qp, remote_qp_info.qp_num,
+                        s->remote_infos[peer_slot].num_qps);
+            }
+            rdma::modify_qp_rtr(qp_for_global(local_qp), remote_qp_info);
+            rdma::modify_qp_rts(qp_for_global(local_qp), local_psn_for_global(local_qp));
+        }
     }
 
     // --- 9. Proxy threads ---
@@ -557,13 +667,53 @@ inline Session* create_session(const SessionConfig& cfg) {
         pcfg.remote_flags_rkey = s->remote_info.flags_rkey;
         pcfg.remote_tail_addr = s->remote_info.tail_addr;
         pcfg.remote_tail_rkey = s->remote_info.tail_rkey;
+        memset(pcfg.remote_data_addr_by_qp, 0, sizeof(pcfg.remote_data_addr_by_qp));
+        memset(pcfg.remote_data_rkey_by_qp, 0, sizeof(pcfg.remote_data_rkey_by_qp));
+        memset(pcfg.remote_flags_addr_by_qp, 0, sizeof(pcfg.remote_flags_addr_by_qp));
+        memset(pcfg.remote_flags_rkey_by_qp, 0, sizeof(pcfg.remote_flags_rkey_by_qp));
+        memset(pcfg.remote_tail_addr_by_qp, 0, sizeof(pcfg.remote_tail_addr_by_qp));
+        memset(pcfg.remote_tail_rkey_by_qp, 0, sizeof(pcfg.remote_tail_rkey_by_qp));
+        memset(pcfg.remote_barrier_addr_by_qp, 0, sizeof(pcfg.remote_barrier_addr_by_qp));
+        memset(pcfg.remote_barrier_rkey_by_qp, 0, sizeof(pcfg.remote_barrier_rkey_by_qp));
+        memset(pcfg.remote_forward_notify_addr_by_qp, 0, sizeof(pcfg.remote_forward_notify_addr_by_qp));
+        memset(pcfg.remote_forward_notify_rkey_by_qp, 0, sizeof(pcfg.remote_forward_notify_rkey_by_qp));
+        for (int q = 0; q < s->num_qps && q < kMaxExchangeQPs; ++q) {
+            const int peer_slot = cfg.channelize_gpu_peers
+                ? std::min(num_remote_peers - 1, q / qps_per_peer)
+                : 0;
+            const ConnectionInfo& ri = s->remote_infos[peer_slot];
+            pcfg.remote_data_addr_by_qp[q] = ri.data_addr;
+            pcfg.remote_data_rkey_by_qp[q] = ri.data_rkey;
+            pcfg.remote_flags_addr_by_qp[q] = ri.flags_addr;
+            pcfg.remote_flags_rkey_by_qp[q] = ri.flags_rkey;
+            pcfg.remote_tail_addr_by_qp[q] = ri.tail_addr;
+            pcfg.remote_tail_rkey_by_qp[q] = ri.tail_rkey;
+            pcfg.remote_barrier_addr_by_qp[q] = ri.barrier_addr;
+            pcfg.remote_barrier_rkey_by_qp[q] = ri.barrier_rkey;
+            pcfg.remote_forward_notify_addr_by_qp[q] = ri.forward_notify_addr;
+            pcfg.remote_forward_notify_rkey_by_qp[q] = ri.forward_notify_rkey;
+        }
         pcfg.use_arrival_queue   = cfg.use_arrival_queue;
         pcfg.remote_queue_stride = (uint32_t)logical_queue_stride;
         pcfg.logical_queues_per_qp = logical_queues_per_qp;
+        pcfg.channelize_gpu_peers = cfg.channelize_gpu_peers;
         pcfg.enable_remote_tail = (std::getenv("Q2_SENDER_PUBLISHED_TAIL") != nullptr
                                    && std::getenv("Q2_SENDER_PUBLISHED_TAIL")[0] == '1');
         pcfg.remote_barrier_addr = s->remote_info.barrier_addr;
         pcfg.remote_barrier_rkey = s->remote_info.barrier_rkey;
+        pcfg.local_forward_notify = s->forward_notify.host_ptr;
+        pcfg.forward_notify_slots = s->forward_notify.count;
+        pcfg.remote_forward_notify_addr = s->remote_info.forward_notify_addr;
+        pcfg.remote_forward_notify_rkey = s->remote_info.forward_notify_rkey;
+        pcfg.enable_forward_notify = cfg.enable_forward_notify && !cfg.use_arrival_queue;
+        pcfg.rank = cfg.rank;
+        pcfg.num_nodes = inferred_num_nodes;
+        const int ring_banks = pcfg.enable_forward_notify && num_remote_peers > 1
+            ? num_remote_peers : 1;
+        pcfg.total_chunks =
+            total_arrival_slots / std::max(1, num_remote_peers * ring_banks);
+        pcfg.a_half_bytes =
+            cfg.local_gpu_buf_size / (size_t)std::max(1, num_remote_peers * ring_banks);
         pcfg.epoch = s->epoch;
         pcfg.max_inflight = cfg.max_inflight > 0 ? cfg.max_inflight : 512;
         pcfg.device_id = cfg.device_id;
@@ -633,6 +783,7 @@ inline void destroy_session(Session* s) {
         if (s->flag_stagings[t].mr) rdma::dereg_mr(s->flag_stagings[t].mr);
     }
     if (s->stage_barrier.mr) rdma::dereg_mr(s->stage_barrier.mr);
+    if (s->forward_notify.mr) rdma::dereg_mr(s->forward_notify.mr);
     if (s->clocal_data_mr) rdma::dereg_mr(s->clocal_data_mr);
     if (s->local_data_mr)  rdma::dereg_mr(s->local_data_mr);
 
@@ -651,6 +802,7 @@ inline void destroy_session(Session* s) {
         destroy_flag_staging(s->flag_stagings[t]);
     }
     destroy_stage_barrier_flags(s->stage_barrier);
+    destroy_forward_notify_table(s->forward_notify);
 
     // Destroy extra QPs (indices 1..num_qps-1, in reverse order)
     for (int i = s->num_qps - 1; i >= 1; i--) {
@@ -785,6 +937,7 @@ inline void commit_epoch(Session* s, uint32_t epoch) {
     if (std::getenv("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET") == nullptr) {
         reset_arrival_flags(s->arrival);
     }
+    reset_forward_notify_table(s->forward_notify);
 
     // Reset FIFO: zero head (device mem), zero tail (host mem), clear trigger slots
     for (int t = 0; t < s->num_proxy_threads; t++) {

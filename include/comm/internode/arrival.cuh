@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "types.h"
 #include "../atomic_u32.cuh"
 #include "../../common/cuda_checks.cuh"
 
@@ -182,6 +183,39 @@ inline void reset_stage_barrier_flags(StageBarrierFlags& flags) {
 inline void destroy_stage_barrier_flags(StageBarrierFlags& flags) {
     if (flags.host_ptr) cudaFreeHost((void*)flags.host_ptr);
     flags = StageBarrierFlags{};
+}
+
+// ---------------------------------------------------------------------------
+// ForwardNotifyTable: host-pinned receiver-side store-and-forward notices.
+// ---------------------------------------------------------------------------
+
+struct ForwardNotifyTable {
+    volatile ForwardNotify* host_ptr;
+    ibv_mr*                 mr;
+    int                     count;
+};
+
+inline ForwardNotifyTable create_forward_notify_table(int count) {
+    ForwardNotifyTable table{};
+    table.count = count > 0 ? count : 0;
+    table.mr = nullptr;
+    if (table.count == 0) return table;
+    MKERNEL_CUDACHECK(cudaHostAlloc((void**)&table.host_ptr,
+                                    (size_t)table.count * sizeof(ForwardNotify),
+                                    cudaHostAllocMapped));
+    memset((void*)table.host_ptr, 0, (size_t)table.count * sizeof(ForwardNotify));
+    return table;
+}
+
+inline void reset_forward_notify_table(ForwardNotifyTable& table) {
+    if (table.host_ptr && table.count > 0) {
+        memset((void*)table.host_ptr, 0, (size_t)table.count * sizeof(ForwardNotify));
+    }
+}
+
+inline void destroy_forward_notify_table(ForwardNotifyTable& table) {
+    if (table.host_ptr) cudaFreeHost((void*)table.host_ptr);
+    table = ForwardNotifyTable{};
 }
 
 // ---------------------------------------------------------------------------

@@ -70,7 +70,8 @@ DEFS_ag_gemm        :=
 # gemm_ar's session shim sets it to true. No compile-time switch needed.
 DEFS_gemm_ar        :=
 
-DEFS_dispatch_gemm  := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
+TK_MOE_NUM_NODES ?= 2
+DEFS_dispatch_gemm  := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 DEFS_ring_attention :=
 DEFS_gemm_rs        :=
 

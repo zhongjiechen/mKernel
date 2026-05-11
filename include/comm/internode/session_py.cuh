@@ -82,25 +82,21 @@ inline void set_epoch(Session* session, int epoch) {
 }
 
 inline FifoHandleTuple get_fifo_handles(Session* session) {
-    auto h = internode::get_fifo_device_handle(session);
-    // Multi-FIFO / GPU-initiated backends pass a bundle pointer in slot 0 and
-    // encode the bundle width as a negative capacity sentinel.
-    if (h.num_fifos > 1) {
-        return {
-            reinterpret_cast<int64_t>(&session->fifo_bundle),
-            0,
-            0,
-            0,
-            -h.num_fifos
-        };
+    if (!session) {
+        return {0, 0, 0, 0, 0};
     }
-    auto fd = h.fifos[0];
+    // Always pass the session's D2HFifoDeviceBundle by pointer (negative
+    // capacity sentinel). Kernels used to reconstruct a bundle from raw FIFO
+    // pointers + MKERNEL_EFA_NUM_QPS default (16), which could disagree with the
+    // session's actual num_qps / logical_queues when num_fifos==1 (gemm_ar
+    // passes explicit num_qps into resolve_fifo_bundle; ag_gemm did not).
+    const int nf = session->fifo_bundle.num_fifos > 0 ? session->fifo_bundle.num_fifos : 1;
     return {
-        reinterpret_cast<int64_t>(fd.triggers),
-        reinterpret_cast<int64_t>(fd.head),
-        reinterpret_cast<int64_t>(fd.tail),
-        reinterpret_cast<int64_t>(fd.tail_cache),
-        fd.capacity
+        reinterpret_cast<int64_t>(&session->fifo_bundle),
+        0,
+        0,
+        0,
+        -nf
     };
 }
 

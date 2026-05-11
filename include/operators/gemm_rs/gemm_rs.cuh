@@ -46,6 +46,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using namespace kittens;
 
@@ -155,6 +156,18 @@ struct intra_globals {
     unsigned int *next_comm;
     unsigned int *kernel_done;
 
+    struct activity_event {
+        unsigned long long start_ns;
+        unsigned long long end_ns;
+        int work_id;
+        int kind;
+    };
+    activity_event* activity_buf = nullptr;
+    uint32_t* activity_counts = nullptr;
+    unsigned long long* kernel_start_ns = nullptr;
+    unsigned long long* kernel_end_ns = nullptr;
+    int activity_max_events = 0;
+
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
     struct pipeline_outputs { C_tile C[2]; };
 };
@@ -201,6 +214,7 @@ struct fused_globals {
         unsigned int *next_reduce;     // work-stealing cursor for per-chunk reduce
         unsigned int *chunks_processed; // incremented per completed chunk; reducer
                                         // pollers exit when it reaches total_chunks.
+        unsigned int *remote_arrived_chunks;
         uint32_t *chunk_tiles_done;    // per-chunk atomic counter: how many tiles finished intra-RS
 
         // Chunk barrier: per-chunk counter for batching dbuf signals (matches gemm_ar)
@@ -222,12 +236,28 @@ struct fused_globals {
         // when the flag path is compiled in.
         intra_globals::ready_chunk_distributed_tensor *ready_chunk;
         // Arrival queue: per-chunk flag published by reducer after RDMA arrival detected
-        uint32_t *remote_arrived_flag;     // size: total_chunks; 1 = arrived
+        uint32_t *remote_arrived_flag;     // 0=pending, 1=remote arrived, 2=ready-queue claimed
+        uint32_t *remote_arrived_peer_mask;
+        uint32_t *arrival_queue_head;
+        uint32_t *ready_reduce_queue;      // optional queue of chunks ready to reduce (+1 encoded)
+        uint32_t *ready_reduce_head;
+        uint32_t *ready_reduce_tail;
+        uint32_t *ready_reduce_scan;
+        uint32_t *peer_accum_queue;        // encoded (peer_slot, chunk_id) work items
+        uint32_t *peer_accum_head;
+        uint32_t *peer_accum_tail;
+        uint32_t *peer_accum_done_count;   // per chunk completed peer accumulations
+        uint32_t *chunk_reduce_done;        // per chunk final accumulator ready
+        uint32_t *chunk_accum_lock;         // simple per-chunk spin lock for staging_buf
         // Cached layout values for device-side use
         int chunks_per_row;
         int chunk_tiles_val;    // min(CHUNK_TILES, col_blocks)
         int col_blocks_val;
         int row_blocks_per_slice;  // M_local / ROW_BLOCK
+        int num_remote_queues;
+        int remote_queue_stride;
+        int num_recv_progress_sms;
+        int owner_chunks_total;
         // Arrival poll tuning (T2a/T2b). Selected host-side based on shape:
         //   use_acquire_poll=1 -> ld.acquire.sys  (lower latency at small/mid M)
         //   use_acquire_poll=0 -> ld.relaxed.sys  (better throughput at large M)
@@ -238,7 +268,11 @@ struct fused_globals {
         // Runtime gate for writing intra-RS outputs directly into staging.
         // When false, sender CTAs pack from output_local into staging.
         uint8_t use_intra_rs_dual_write;
-        uint8_t _pad0[2];
+        uint8_t use_ready_reduce_queue;
+        uint8_t use_transport_arrival_queue;
+        uint8_t use_incremental_peer_reduce;
+        uint8_t use_receiver_owner_rs;
+        uint8_t _pad1[3];
         uint32_t reduce_poll_sleep_ns;
     };
 
@@ -246,6 +280,16 @@ struct fused_globals {
     int num_send_sms;
     int num_reduce_sms;
     runtime_state *rt;
+
+    enum activity_kind : int {
+        ACTIVITY_COMPUTE = 0,
+        ACTIVITY_INTER_SEND_WAIT = 1,
+        ACTIVITY_INTER_SEND_PUSH = 2,
+        ACTIVITY_INTER_REDUCE_WAIT = 3,
+        ACTIVITY_INTER_REDUCE_ACCUM = 4,
+        ACTIVITY_INTER_RECV_PROGRESS = 5,
+        ACTIVITY_INTER_PEER_ACCUM = 6,
+    };
 
 
 };
@@ -406,6 +450,7 @@ void launch_fused_gemm_rs(const fused_globals& G, unsigned int active_sms);
 __global__ void gemm_rs_fused_zero_kernel(gemm_rs_zero_regions_t regs);
 
 static unsigned int *g_counters[intra_globals::NUM_DEVICES] = {nullptr};
+static int g_counters_words[intra_globals::NUM_DEVICES] = {0};
 // Per-device sender_done flags (one per inter-node tile). The sender CTA
 // sets sender_done[tile_id]=1 after reading and staging the tile from
 // output_local; the reducer CTA waits for sender_done[tile_id]==1 before
@@ -436,6 +481,254 @@ static int g_chunk_send_claimed_alloc[intra_globals::NUM_DEVICES] = {0};
 // Arrival queue: per-chunk remote_arrived_flag (published by reducer).
 static uint32_t *g_remote_arrived_flag[intra_globals::NUM_DEVICES] = {nullptr};
 static int g_remote_arrived_alloc[intra_globals::NUM_DEVICES] = {0};
+static uint32_t *g_remote_arrived_peer_mask[intra_globals::NUM_DEVICES] = {nullptr};
+static int g_remote_arrived_peer_mask_alloc[intra_globals::NUM_DEVICES] = {0};
+static uint32_t *g_arrival_queue_head[intra_globals::NUM_DEVICES] = {nullptr};
+static int g_arrival_queue_head_alloc[intra_globals::NUM_DEVICES] = {0};
+// Optional ready-reduce queue experiment. Reducers pop chunks only after a
+// progress scan has observed local send completion plus all peer arrivals.
+static uint32_t *g_ready_reduce_queue[intra_globals::NUM_DEVICES] = {nullptr};
+static int g_ready_reduce_queue_alloc[intra_globals::NUM_DEVICES] = {0};
+static uint32_t *g_peer_accum_queue[intra_globals::NUM_DEVICES] = {nullptr};
+static int g_peer_accum_queue_alloc[intra_globals::NUM_DEVICES] = {0};
+static uint32_t *g_peer_accum_done_count[intra_globals::NUM_DEVICES] = {nullptr};
+static int g_peer_accum_done_count_alloc[intra_globals::NUM_DEVICES] = {0};
+static uint32_t *g_chunk_reduce_done[intra_globals::NUM_DEVICES] = {nullptr};
+static int g_chunk_reduce_done_alloc[intra_globals::NUM_DEVICES] = {0};
+static uint32_t *g_chunk_accum_lock[intra_globals::NUM_DEVICES] = {nullptr};
+static int g_chunk_accum_lock_alloc[intra_globals::NUM_DEVICES] = {0};
+static intra_globals::activity_event* g_gemm_rs_trace_buf[intra_globals::NUM_DEVICES] = {};
+static uint32_t* g_gemm_rs_trace_counts[intra_globals::NUM_DEVICES] = {};
+static unsigned long long* g_gemm_rs_trace_start[intra_globals::NUM_DEVICES] = {};
+static unsigned long long* g_gemm_rs_trace_end[intra_globals::NUM_DEVICES] = {};
+static size_t g_gemm_rs_trace_buf_cap[intra_globals::NUM_DEVICES] = {};
+
+__device__ inline unsigned long long gemm_rs_globaltimer() {
+    return comm::globaltimer();
+}
+
+template <typename G>
+__device__ inline void gemm_rs_record_activity_event(
+    const G& Gv, int kind, int work_id,
+    unsigned long long start_ns, unsigned long long end_ns
+) {
+    if (Gv.activity_buf == nullptr || Gv.activity_counts == nullptr) return;
+    uint32_t idx = atomicAdd(&Gv.activity_counts[blockIdx.x], 1u);
+    if (idx < (uint32_t)Gv.activity_max_events) {
+        auto& ev = Gv.activity_buf[
+            (size_t)blockIdx.x * (size_t)Gv.activity_max_events + (size_t)idx];
+        ev.start_ns = start_ns;
+        ev.end_ns = end_ns;
+        ev.work_id = work_id;
+        ev.kind = kind;
+    }
+}
+
+__host__ inline const char* gemm_rs_activity_kind_name(int kind) {
+    switch (kind) {
+        case fused_globals::ACTIVITY_COMPUTE: return "compute";
+        case fused_globals::ACTIVITY_INTER_SEND_WAIT: return "inter_send_wait";
+        case fused_globals::ACTIVITY_INTER_SEND_PUSH: return "inter_send_push";
+        case fused_globals::ACTIVITY_INTER_REDUCE_WAIT: return "inter_reduce_wait";
+        case fused_globals::ACTIVITY_INTER_REDUCE_ACCUM: return "inter_reduce_accum";
+        case fused_globals::ACTIVITY_INTER_RECV_PROGRESS: return "inter_recv_progress";
+        case fused_globals::ACTIVITY_INTER_PEER_ACCUM: return "inter_peer_accum";
+        default: return "unknown";
+    }
+}
+
+__host__ inline int gemm_rs_effective_num_qps_host(int num_nodes) {
+    constexpr int kMaxSessionQPs = 24;
+    const int num_peers = std::max(1, num_nodes - 1);
+    int num_qps = 4;
+    if (num_peers > 1 && std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS") != nullptr) {
+        num_qps = std::min(kMaxSessionQPs, num_peers * 8);
+    }
+    if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
+        num_qps = std::atoi(env_num_qps);
+    }
+    if (num_qps <= 0) num_qps = 1;
+    if (num_peers > 1 && std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS") != nullptr) {
+        num_qps = std::max(num_qps, num_peers * 8);
+    }
+    return std::min(kMaxSessionQPs, num_qps);
+}
+
+__host__ inline int gemm_rs_logical_queues_per_qp_host() {
+    int logical = 1;
+    if (const char* env_lq = std::getenv("MKERNEL_INTERNODE_LOGICAL_QUEUES_PER_QP")) {
+        logical = std::atoi(env_lq);
+    } else if (const char* env_lq = std::getenv("GEMM_RS_LOGICAL_QUEUES_PER_QP")) {
+        logical = std::atoi(env_lq);
+    }
+    if (logical <= 0) logical = 1;
+    return std::min(16, logical);
+}
+
+__host__ inline const char* gemm_rs_block_role_name(
+    int block_idx, int num_comp, int num_send
+) {
+    if (block_idx < num_comp) return "compute";
+    if (block_idx < num_comp + num_send) return "inter_send";
+    return "inter_reduce";
+}
+
+__host__ inline bool gemm_rs_trace_dump_enabled(int node_idx, int dev_idx) {
+    const char* all_ranks = std::getenv("GEMM_RS_ACTIVITY_TRACE_ALL_RANKS");
+    if (all_ranks != nullptr && all_ranks[0] == '1') return true;
+    const char* all_local = std::getenv("GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS");
+    if (all_local != nullptr && all_local[0] == '1') return node_idx == 0;
+    const char* all_nodes = std::getenv("GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES");
+    if (all_nodes != nullptr && all_nodes[0] == '1') return dev_idx == 0;
+    return node_idx == 0 && dev_idx == 0;
+}
+
+__host__ inline void gemm_rs_trace_dump_path(
+    int node_idx, int dev_idx, const char* base_path,
+    char* out_path, size_t out_path_size
+) {
+    if (std::getenv("GEMM_RS_ACTIVITY_TRACE_ALL_RANKS") ||
+        std::getenv("GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS") ||
+        std::getenv("GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES")) {
+        std::snprintf(out_path, out_path_size, "%s.node%d_rank%d.json",
+                      base_path, node_idx, dev_idx);
+        return;
+    }
+    std::snprintf(out_path, out_path_size, "%s", base_path);
+}
+
+__host__ inline void gemm_rs_alloc_activity_trace(
+    fused_globals& G, int row_blocks, int col_blocks,
+    int total_chunks, int num_comp, int num_send
+) {
+    const char* out_path = std::getenv("GEMM_RS_ACTIVITY_TRACE_OUT");
+    if (out_path == nullptr || out_path[0] == '\0') return;
+    const int dev = G.intra.dev_idx;
+    const int compute_max = num_comp > 0
+        ? (row_blocks * col_blocks + num_comp - 1) / num_comp
+        : 0;
+    const int send_max = num_send > 0
+        ? (total_chunks + num_send - 1) / num_send
+        : 0;
+    const int reduce_max = total_chunks;
+    G.intra.activity_max_events =
+        std::max(64, 3 * std::max(compute_max, std::max(send_max, reduce_max)) + 64);
+
+    const size_t event_bytes =
+        (size_t)config::NUM_BLOCKS * (size_t)G.intra.activity_max_events
+        * sizeof(intra_globals::activity_event);
+    const size_t count_bytes = (size_t)config::NUM_BLOCKS * sizeof(uint32_t);
+    if (g_gemm_rs_trace_buf_cap[dev] < event_bytes) {
+        if (g_gemm_rs_trace_buf[dev] != nullptr) cudaFree(g_gemm_rs_trace_buf[dev]);
+        cudaMalloc(&g_gemm_rs_trace_buf[dev], event_bytes);
+        g_gemm_rs_trace_buf_cap[dev] = event_bytes;
+    }
+    if (g_gemm_rs_trace_counts[dev] == nullptr) cudaMalloc(&g_gemm_rs_trace_counts[dev], count_bytes);
+    if (g_gemm_rs_trace_start[dev] == nullptr) cudaMalloc(&g_gemm_rs_trace_start[dev], sizeof(unsigned long long));
+    if (g_gemm_rs_trace_end[dev] == nullptr) cudaMalloc(&g_gemm_rs_trace_end[dev], sizeof(unsigned long long));
+    cudaMemset(g_gemm_rs_trace_buf[dev], 0, event_bytes);
+    cudaMemset(g_gemm_rs_trace_counts[dev], 0, count_bytes);
+    cudaMemset(g_gemm_rs_trace_start[dev], 0, sizeof(unsigned long long));
+    cudaMemset(g_gemm_rs_trace_end[dev], 0, sizeof(unsigned long long));
+    G.intra.activity_buf = g_gemm_rs_trace_buf[dev];
+    G.intra.activity_counts = g_gemm_rs_trace_counts[dev];
+    G.intra.kernel_start_ns = g_gemm_rs_trace_start[dev];
+    G.intra.kernel_end_ns = g_gemm_rs_trace_end[dev];
+}
+
+__host__ inline void gemm_rs_dump_activity_trace(
+    fused_globals& G, int M, int N, int node_idx, int dev_idx,
+    int num_comp, int num_send, int num_reduce,
+    int total_chunks, int total_gemm_tiles
+) {
+    if (G.intra.activity_buf == nullptr || G.intra.activity_counts == nullptr) return;
+    std::vector<intra_globals::activity_event> host_events(
+        (size_t)config::NUM_BLOCKS * (size_t)G.intra.activity_max_events);
+    std::vector<uint32_t> host_counts(config::NUM_BLOCKS, 0);
+    unsigned long long kernel_start_ns = 0, kernel_end_ns = 0;
+    cudaDeviceSynchronize();
+    cudaMemcpy(host_events.data(), G.intra.activity_buf,
+               host_events.size() * sizeof(intra_globals::activity_event),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_counts.data(), G.intra.activity_counts,
+               host_counts.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&kernel_start_ns, G.intra.kernel_start_ns,
+               sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&kernel_end_ns, G.intra.kernel_end_ns,
+               sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+
+    unsigned long long min_event_start = ~0ull, max_event_end = 0;
+    for (int b = 0; b < config::NUM_BLOCKS; ++b) {
+        const uint32_t count = std::min(host_counts[b], (uint32_t)G.intra.activity_max_events);
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& ev = host_events[(size_t)b * (size_t)G.intra.activity_max_events + i];
+            if (ev.start_ns != 0 && ev.start_ns < min_event_start) min_event_start = ev.start_ns;
+            if (ev.end_ns > max_event_end) max_event_end = ev.end_ns;
+        }
+    }
+    if (min_event_start != ~0ull && (kernel_start_ns == 0 || kernel_start_ns > min_event_start)) {
+        kernel_start_ns = min_event_start;
+    }
+    if (kernel_end_ns < max_event_end) kernel_end_ns = max_event_end;
+
+    const char* base_out_path = std::getenv("GEMM_RS_ACTIVITY_TRACE_OUT");
+    G.intra.activity_buf = nullptr;
+    G.intra.activity_counts = nullptr;
+    G.intra.kernel_start_ns = nullptr;
+    G.intra.kernel_end_ns = nullptr;
+    if (base_out_path == nullptr || base_out_path[0] == '\0') return;
+    if (!gemm_rs_trace_dump_enabled(node_idx, dev_idx)) return;
+
+    char out_path[4096];
+    gemm_rs_trace_dump_path(node_idx, dev_idx, base_out_path, out_path, sizeof(out_path));
+    FILE* f = std::fopen(out_path, "w");
+    if (f == nullptr) {
+        std::fprintf(stderr, "[GEMM_RS_ACTIVITY_TRACE] failed to open %s\n", out_path);
+        return;
+    }
+    std::fprintf(f,
+        "{\n"
+        "  \"kernel\": \"gemm_rs\",\n"
+        "  \"node_idx\": %d,\n"
+        "  \"dev_idx\": %d,\n"
+        "  \"M\": %d,\n"
+        "  \"N\": %d,\n"
+        "  \"num_blocks\": %d,\n"
+        "  \"num_comp_sms\": %d,\n"
+        "  \"num_send_sms\": %d,\n"
+        "  \"num_reduce_sms\": %d,\n"
+        "  \"total_chunks\": %d,\n"
+        "  \"total_gemm_tiles\": %d,\n"
+        "  \"kernel_start_ns\": %llu,\n"
+        "  \"kernel_end_ns\": %llu,\n"
+        "  \"activity_max_events\": %d,\n"
+        "  \"blocks\": [\n",
+        node_idx, dev_idx, M, N, config::NUM_BLOCKS, num_comp, num_send, num_reduce,
+        total_chunks, total_gemm_tiles, kernel_start_ns, kernel_end_ns,
+        G.intra.activity_max_events);
+    for (int b = 0; b < config::NUM_BLOCKS; ++b) {
+        const uint32_t count = std::min(host_counts[b], (uint32_t)G.intra.activity_max_events);
+        std::fprintf(f,
+            "    {\n"
+            "      \"block\": %d,\n"
+            "      \"role\": \"%s\",\n"
+            "      \"events\": [",
+            b, gemm_rs_block_role_name(b, num_comp, num_send));
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& ev = host_events[(size_t)b * (size_t)G.intra.activity_max_events + i];
+            if (i != 0) std::fprintf(f, ",");
+            std::fprintf(f,
+                "\n        {\"kind\":\"%s\",\"work_id\":%d,\"start_ns\":%llu,\"end_ns\":%llu}",
+                gemm_rs_activity_kind_name(ev.kind), ev.work_id, ev.start_ns, ev.end_ns);
+        }
+        if (count != 0) std::fprintf(f, "\n");
+        std::fprintf(f, "      ]\n    }%s\n", (b + 1 == config::NUM_BLOCKS) ? "" : ",");
+    }
+    std::fprintf(f, "  ]\n}\n");
+    std::fclose(f);
+    std::printf("[GEMM_RS_ACTIVITY_TRACE rank=%d node=%d M=%d N=%d file=%s]\n",
+                dev_idx, node_idx, M, N, out_path);
+}
 
 
 
@@ -557,9 +850,15 @@ void entrypoint_fused(
         g_inter_ready_ntiles[dev_idx] = total_inter_tiles;
     }
 
-    // 6 counters: next_compute, next_comm, kernel_done, next_send, next_reduce, chunks_processed
-    if (g_counters[dev_idx] == nullptr) {
-        cudaMalloc(&g_counters[dev_idx], 6 * sizeof(unsigned int));
+    // 12 counters: next_compute, next_comm, kernel_done, next_send,
+    // next_reduce, chunks_processed, ready_reduce_head/tail/scan,
+    // remote_arrived_chunks, peer_accum_head/tail.
+    constexpr int kGemmRsCounterWords = 12;
+    if (g_counters[dev_idx] == nullptr ||
+        g_counters_words[dev_idx] < kGemmRsCounterWords) {
+        if (g_counters[dev_idx] != nullptr) cudaFree(g_counters[dev_idx]);
+        cudaMalloc(&g_counters[dev_idx], kGemmRsCounterWords * sizeof(unsigned int));
+        g_counters_words[dev_idx] = kGemmRsCounterWords;
     }
 
     // Per-chunk completion tracking.
@@ -601,6 +900,78 @@ void entrypoint_fused(
         cudaMalloc(&g_remote_arrived_flag[dev_idx], total_chunks * sizeof(uint32_t));
         g_remote_arrived_alloc[dev_idx] = total_chunks;
     }
+    if (g_remote_arrived_peer_mask_alloc[dev_idx] < total_chunks) {
+        if (g_remote_arrived_peer_mask[dev_idx] != nullptr) cudaFree(g_remote_arrived_peer_mask[dev_idx]);
+        cudaMalloc(&g_remote_arrived_peer_mask[dev_idx], total_chunks * sizeof(uint32_t));
+        g_remote_arrived_peer_mask_alloc[dev_idx] = total_chunks;
+    }
+
+    if (g_ready_reduce_queue_alloc[dev_idx] < total_chunks) {
+        if (g_ready_reduce_queue[dev_idx] != nullptr) cudaFree(g_ready_reduce_queue[dev_idx]);
+        cudaMalloc(&g_ready_reduce_queue[dev_idx], total_chunks * sizeof(uint32_t));
+        g_ready_reduce_queue_alloc[dev_idx] = total_chunks;
+    }
+
+    const int n_peers_rt = std::max(1, num_nodes - 1);
+    const int peer_accum_queue_entries = total_chunks * n_peers_rt;
+    if (g_peer_accum_queue_alloc[dev_idx] < peer_accum_queue_entries) {
+        if (g_peer_accum_queue[dev_idx] != nullptr) cudaFree(g_peer_accum_queue[dev_idx]);
+        cudaMalloc(&g_peer_accum_queue[dev_idx],
+                   (size_t)peer_accum_queue_entries * sizeof(uint32_t));
+        g_peer_accum_queue_alloc[dev_idx] = peer_accum_queue_entries;
+    }
+    if (g_peer_accum_done_count_alloc[dev_idx] < total_chunks) {
+        if (g_peer_accum_done_count[dev_idx] != nullptr) cudaFree(g_peer_accum_done_count[dev_idx]);
+        cudaMalloc(&g_peer_accum_done_count[dev_idx], total_chunks * sizeof(uint32_t));
+        g_peer_accum_done_count_alloc[dev_idx] = total_chunks;
+    }
+    if (g_chunk_reduce_done_alloc[dev_idx] < total_chunks) {
+        if (g_chunk_reduce_done[dev_idx] != nullptr) cudaFree(g_chunk_reduce_done[dev_idx]);
+        cudaMalloc(&g_chunk_reduce_done[dev_idx], total_chunks * sizeof(uint32_t));
+        g_chunk_reduce_done_alloc[dev_idx] = total_chunks;
+    }
+    if (g_chunk_accum_lock_alloc[dev_idx] < total_chunks) {
+        if (g_chunk_accum_lock[dev_idx] != nullptr) cudaFree(g_chunk_accum_lock[dev_idx]);
+        cudaMalloc(&g_chunk_accum_lock[dev_idx], total_chunks * sizeof(uint32_t));
+        g_chunk_accum_lock_alloc[dev_idx] = total_chunks;
+    }
+
+    auto env_flag = [](const char* name, bool default_value) -> bool {
+        const char* e = std::getenv(name);
+        if (e == nullptr) return default_value;
+        return e[0] == '1';
+    };
+    const bool use_receiver_owner_rs_rt =
+        env_flag("GEMM_RS_RECEIVER_OWNER_RS", false);
+    const bool use_incremental_peer_reduce_rt =
+        env_flag("GEMM_RS_INCREMENTAL_PEER_REDUCE", use_receiver_owner_rs_rt);
+    const bool use_transport_arrival_queue_rt =
+        env_flag("GEMM_RS_TRANSPORT_ARRIVAL_QUEUE", use_incremental_peer_reduce_rt);
+    const bool use_ready_reduce_queue_rt =
+        use_incremental_peer_reduce_rt || use_transport_arrival_queue_rt ||
+        (std::getenv("GEMM_RS_READY_REDUCE_QUEUE") != nullptr &&
+         std::getenv("GEMM_RS_READY_REDUCE_QUEUE")[0] == '1');
+    const int num_remote_queues_rt =
+        gemm_rs_effective_num_qps_host(num_nodes) * gemm_rs_logical_queues_per_qp_host();
+    const int session_arrival_slots_rt = std::max(1, num_nodes - 1) * total_inter_tiles;
+    const int remote_queue_stride_rt =
+        std::max(1, (session_arrival_slots_rt + num_remote_queues_rt - 1) / num_remote_queues_rt);
+    int num_recv_progress_sms_rt = use_transport_arrival_queue_rt ? std::min(2, num_reduce) : 0;
+    if (const char* e = std::getenv("GEMM_RS_RECV_PROGRESS_SMS")) {
+        num_recv_progress_sms_rt = std::max(0, std::atoi(e));
+    }
+    num_recv_progress_sms_rt = std::min(num_recv_progress_sms_rt, num_reduce);
+    if (g_arrival_queue_head_alloc[dev_idx] < num_remote_queues_rt) {
+        if (g_arrival_queue_head[dev_idx] != nullptr) cudaFree(g_arrival_queue_head[dev_idx]);
+        cudaMalloc(&g_arrival_queue_head[dev_idx],
+                   (size_t)num_remote_queues_rt * sizeof(uint32_t));
+        g_arrival_queue_head_alloc[dev_idx] = num_remote_queues_rt;
+    }
+    const int owner_chunks_total_rt = use_receiver_owner_rs_rt
+        ? (node_idx < total_chunks
+            ? 1 + (total_chunks - 1 - node_idx) / std::max(1, num_nodes)
+            : 0)
+        : total_chunks;
 
 
     if (use_fused_reset) {
@@ -615,13 +986,20 @@ void entrypoint_fused(
         };
         add(g_sender_done[dev_idx], (size_t)total_inter_tiles * sizeof(unsigned int));
         add(g_inter_ready[dev_idx], (size_t)total_inter_tiles * sizeof(int));
-        add(g_counters[dev_idx], 6 * sizeof(unsigned int));
+        add(g_counters[dev_idx], kGemmRsCounterWords * sizeof(unsigned int));
         add(g_chunk_tiles_done[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
         add(g_comp_chunk_tiles_done[dev_idx], (size_t)total_global_chunks * sizeof(uint32_t));
         add(g_comp_gemm_done[dev_idx], (size_t)total_global_chunks * sizeof(uint32_t));
         add(g_chunk_sendable[dev_idx], (size_t)total_global_chunks * sizeof(uint32_t));
         add(g_chunk_send_claimed[dev_idx], (size_t)total_global_chunks * sizeof(uint32_t));
         add(g_remote_arrived_flag[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
+        add(g_remote_arrived_peer_mask[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
+        add(g_arrival_queue_head[dev_idx], (size_t)num_remote_queues_rt * sizeof(uint32_t));
+        add(g_ready_reduce_queue[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
+        add(g_peer_accum_queue[dev_idx], (size_t)peer_accum_queue_entries * sizeof(uint32_t));
+        add(g_peer_accum_done_count[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
+        add(g_chunk_reduce_done[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
+        add(g_chunk_accum_lock[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
         // Grid = one block per region (up to 12); 128 threads/block, strided.
         if (regs.n > 0) {
             gemm_rs_fused_zero_kernel<<<dim3((unsigned)regs.n, 1, 1),
@@ -633,7 +1011,8 @@ void entrypoint_fused(
             (size_t)total_inter_tiles * sizeof(unsigned int), stream);
         cudaMemsetAsync(g_inter_ready[dev_idx], 0,
             (size_t)total_inter_tiles * sizeof(int), stream);
-        cudaMemsetAsync(g_counters[dev_idx], 0, 6 * sizeof(unsigned int), stream);
+        cudaMemsetAsync(g_counters[dev_idx], 0,
+            kGemmRsCounterWords * sizeof(unsigned int), stream);
         cudaMemsetAsync(g_chunk_tiles_done[dev_idx], 0,
             (size_t)total_chunks * sizeof(uint32_t), stream);
         cudaMemsetAsync(g_comp_chunk_tiles_done[dev_idx], 0,
@@ -645,6 +1024,20 @@ void entrypoint_fused(
         cudaMemsetAsync(g_chunk_send_claimed[dev_idx], 0,
             (size_t)total_global_chunks * sizeof(uint32_t), stream);
         cudaMemsetAsync(g_remote_arrived_flag[dev_idx], 0,
+            (size_t)total_chunks * sizeof(uint32_t), stream);
+        cudaMemsetAsync(g_remote_arrived_peer_mask[dev_idx], 0,
+            (size_t)total_chunks * sizeof(uint32_t), stream);
+        cudaMemsetAsync(g_arrival_queue_head[dev_idx], 0,
+            (size_t)num_remote_queues_rt * sizeof(uint32_t), stream);
+        cudaMemsetAsync(g_ready_reduce_queue[dev_idx], 0,
+            (size_t)total_chunks * sizeof(uint32_t), stream);
+        cudaMemsetAsync(g_peer_accum_queue[dev_idx], 0,
+            (size_t)peer_accum_queue_entries * sizeof(uint32_t), stream);
+        cudaMemsetAsync(g_peer_accum_done_count[dev_idx], 0,
+            (size_t)total_chunks * sizeof(uint32_t), stream);
+        cudaMemsetAsync(g_chunk_reduce_done[dev_idx], 0,
+            (size_t)total_chunks * sizeof(uint32_t), stream);
+        cudaMemsetAsync(g_chunk_accum_lock[dev_idx], 0,
             (size_t)total_chunks * sizeof(uint32_t), stream);
     }
 
@@ -688,6 +1081,7 @@ void entrypoint_fused(
             .next_send = &g_counters[dev_idx][3],
             .next_reduce = &g_counters[dev_idx][4],
             .chunks_processed = &g_counters[dev_idx][5],
+            .remote_arrived_chunks = &g_counters[dev_idx][9],
             .chunk_tiles_done = g_chunk_tiles_done[dev_idx],
             .comp_chunk_tiles_done = g_comp_chunk_tiles_done[dev_idx],
             .comp_gemm_done = g_comp_gemm_done[dev_idx],
@@ -695,13 +1089,33 @@ void entrypoint_fused(
             .chunk_send_claimed = g_chunk_send_claimed[dev_idx],
             .ready_chunk = ready_chunk_dev_ptr,
             .remote_arrived_flag = g_remote_arrived_flag[dev_idx],
+            .remote_arrived_peer_mask = g_remote_arrived_peer_mask[dev_idx],
+            .arrival_queue_head = g_arrival_queue_head[dev_idx],
+            .ready_reduce_queue = g_ready_reduce_queue[dev_idx],
+            .ready_reduce_head = &g_counters[dev_idx][6],
+            .ready_reduce_tail = &g_counters[dev_idx][7],
+            .ready_reduce_scan = &g_counters[dev_idx][8],
+            .peer_accum_queue = g_peer_accum_queue[dev_idx],
+            .peer_accum_head = &g_counters[dev_idx][10],
+            .peer_accum_tail = &g_counters[dev_idx][11],
+            .peer_accum_done_count = g_peer_accum_done_count[dev_idx],
+            .chunk_reduce_done = g_chunk_reduce_done[dev_idx],
+            .chunk_accum_lock = g_chunk_accum_lock[dev_idx],
             .chunks_per_row = chunks_per_row,
             .chunk_tiles_val = chunk_tiles_ct,
             .col_blocks_val = col_blocks,
             .row_blocks_per_slice = local_row_blocks,
+            .num_remote_queues = num_remote_queues_rt,
+            .remote_queue_stride = remote_queue_stride_rt,
+            .num_recv_progress_sms = num_recv_progress_sms_rt,
+            .owner_chunks_total = owner_chunks_total_rt,
             .use_acquire_poll = (uint8_t)(use_acquire_poll != 0 ? 1u : 0u),
             .use_intra_rs_dual_write = (uint8_t)(use_intra_rs_dual_write_rt ? 1u : 0u),
-            ._pad0 = {0, 0},
+            .use_ready_reduce_queue = (uint8_t)(use_ready_reduce_queue_rt ? 1u : 0u),
+            .use_transport_arrival_queue = (uint8_t)(use_transport_arrival_queue_rt ? 1u : 0u),
+            .use_incremental_peer_reduce = (uint8_t)(use_incremental_peer_reduce_rt ? 1u : 0u),
+            .use_receiver_owner_rs = (uint8_t)(use_receiver_owner_rs_rt ? 1u : 0u),
+            ._pad1 = {0, 0, 0},
             .reduce_poll_sleep_ns = (uint32_t)(reduce_poll_sleep_ns > 0 ? reduce_poll_sleep_ns : 100),
         };
         cudaMemcpyAsync(g_fused_runtime[dev_idx], &rt, sizeof(rt),
@@ -746,13 +1160,19 @@ void entrypoint_fused(
         .rt = rt_ptr,
     };
 
-
+    if (!intra_only_debug) {
+        gemm_rs_alloc_activity_trace(
+            G, row_blocks, col_blocks, total_chunks, num_comp, num_send);
+    }
 
     (void)stream;
     if (intra_only_debug) {
         launch_fused_gemm_rs(G, (unsigned int)num_comp);
     } else {
         launch_fused_gemm_rs(G, 0);
+        gemm_rs_dump_activity_trace(
+            G, M, N, node_idx, dev_idx, num_comp, num_send, num_reduce,
+            total_chunks, row_blocks * col_blocks);
     }
 
 

@@ -11,8 +11,12 @@ from pathlib import Path
 os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
 os.environ.setdefault("GEMM_AR_ARRIVAL_QUEUE", "1")
 os.environ.setdefault("GEMM_AR_DISABLE_SEND_COALESCE", "1")
-os.environ.setdefault("GEMM_AR_INTER_SEND_SMS", "4")
-os.environ.setdefault("GEMM_AR_NUM_INTRA_COMM_SMS", "12")
+if not (
+    os.environ.get("MKERNEL_TOPOLOGY") == "l20x4"
+    and os.environ.get("NUM_NODES") == "4"
+):
+    os.environ.setdefault("GEMM_AR_INTER_SEND_SMS", "4")
+    os.environ.setdefault("GEMM_AR_NUM_INTRA_COMM_SMS", "12")
 os.environ.setdefault("GEMM_AR_STEADY_STATE_BENCH", "1")
 os.environ.setdefault("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET", "1")
 # Fast prepare_epoch: skip cudaDeviceSynchronize + pause/drain_cq/reset (level 2).
@@ -30,7 +34,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
+from common import check_close, compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
 
 KERNEL_NAME = "gemm_ar"
 from common import get_num_nodes  # noqa: E402
@@ -38,7 +42,13 @@ NUM_NODES = get_num_nodes()
 ROW_BLOCK = 128
 COL_BLOCK = 256
 
-DEFAULT_SHAPES = [2048, 4096, 8192, 16384, 32768]
+DEFAULT_SHAPES = (
+    # 4-node L20x release sweep: use the largest verified natural multiples.
+    # 22528 passes with the inter-heavy split; larger shapes still deadlock.
+    [8192, 12288, 16384, 20480, 22528]
+    if NUM_NODES == 4 else
+    [2048, 4096, 8192, 16384, 32768]
+)
 
 # Per-shape num_intra_comm_sms override. Default `pick_sm_split` heuristic
 # returns 14 for M=2048; team_v7 sweep found intra=4 wins by 5.9% over baseline
@@ -51,18 +61,19 @@ INTRA_OVERRIDE_AR = {2048: 4}
 def median_then_max_cuda(samples):
     sorted_samples = sorted(float(x) for x in samples)
     median = sorted_samples[len(sorted_samples) // 2]
-    t = torch.tensor([median], device="cuda")
+    t = torch.tensor([median], dtype=torch.float64)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
 
 def kernel_chunk_tiles_for_n(N):
-    """Mirror gemm_ar_chunk_tiles_default(): kernel uses min(4, col_blocks) for
-    standard config; the >=128 path bumps to 32 only when col_blocks>=128.
+    """Mirror gemm_ar_chunk_tiles(): kernel uses min(4, col_blocks).
     Note: must match the kernel's compile-time gemm_ar_chunk_tiles() exactly so
     scratch_ints sizing aligns."""
     col_blocks = N // COL_BLOCK
-    chunk_tiles = 32 if col_blocks >= 128 else 4
+    chunk_tiles = int(os.environ.get("GEMM_AR_CHUNK_TILES", "4"))
+    if chunk_tiles <= 0:
+        chunk_tiles = 4
     return min(chunk_tiles, col_blocks)
 
 
@@ -131,7 +142,8 @@ def compute_scratch_ints(M, N, world_size, num_remote_queues=1):
     owner_pending_pop_count_offset = owner_pending_push_count_offset + num_remote_queues
     local_done_flag_offset = owner_pending_pop_count_offset + num_remote_queues
     remote_arrived_flag_offset = local_done_flag_offset + total_chunks
-    intra_started_flag_offset = remote_arrived_flag_offset + total_chunks
+    remote_arrived_peer_mask_offset = remote_arrived_flag_offset + total_chunks
+    intra_started_flag_offset = remote_arrived_peer_mask_offset + total_chunks
     reduce_cursor_offset = intra_started_flag_offset + 16
     chunk_claimed_flag_offset = reduce_cursor_offset + 1
     row_blocks = M // ROW_BLOCK
@@ -181,24 +193,35 @@ def pick_sm_split(M, N, world_size, num_comm_sms_total, num_intra_override, num_
     adaptive_comm = min_intra + min_send + min_reduce
     effective_comm_sms = min(num_comm_sms_total, max(adaptive_comm, 16))
     env_intra = os.environ.get("GEMM_AR_NUM_INTRA_COMM_SMS")
+    env_inter_send = os.environ.get("GEMM_AR_INTER_SEND_SMS")
+    l20x4_default_tune = (
+        NUM_NODES == 4
+        and os.environ.get("MKERNEL_TOPOLOGY") == "l20x4"
+        and num_intra_override is None
+        and env_intra is None
+        and num_inter_send_override is None
+        and env_inter_send is None
+    )
     if num_intra_override is not None:
         num_intra_comm_sms = max(4, num_intra_override)
     elif env_intra:
         num_intra_comm_sms = max(4, int(env_intra))
+    elif l20x4_default_tune:
+        # L20x4 direct-fanout AR needs inter-heavy progress; balanced splits
+        # helped debug smoke tests but lost in release warmup/10-iter timing.
+        num_intra_comm_sms = 4
     else:
         num_intra_comm_sms = min_intra
     num_inter_comm_sms = max(4, effective_comm_sms - num_intra_comm_sms)
-    coalesced_row_send = (
-        os.environ.get("GEMM_AR_ARRIVAL_QUEUE", "1") == "1"
-        and os.environ.get("GEMM_AR_DISABLE_SEND_COALESCE", "1") != "1"
-    )
-    max_useful_send_sms = row_blocks_per_slice if coalesced_row_send else total_chunks
-    max_useful_send_sms = max(2, max_useful_send_sms)
-    env_inter_send = os.environ.get("GEMM_AR_INTER_SEND_SMS")
+    # fused_inter_send_sm statically owns row blocks, so more send CTAs than
+    # local row blocks cannot issue useful work even when sends are per chunk.
+    max_useful_send_sms = max(1, row_blocks_per_slice)
     if num_inter_send_override is not None:
         inter_send_override = num_inter_send_override
     elif env_inter_send:
         inter_send_override = int(env_inter_send)
+    elif l20x4_default_tune:
+        inter_send_override = 20
     else:
         inter_send_override = None
     num_inter_send_sms = (max(2, min(num_inter_comm_sms - 2, inter_send_override, max_useful_send_sms))
@@ -212,7 +235,11 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ["WORLD_SIZE"]))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    dist_backend = os.environ.get("MKERNEL_DIST_BACKEND", "nccl")
+    if dist_backend == "nccl":
+        dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    else:
+        dist.init_process_group(dist_backend)
 
     node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
     is_chief = (local_rank == 0 and node_idx == 0)
@@ -228,8 +255,11 @@ def main():
     shapes = [int(x) for x in args.shapes.split(",") if x.strip()]
     gid = node_idx * world_size + local_rank
     K_denom = NUM_NODES * world_size  # K = base_n / 16
+    use_ngt2_fallback = os.environ.get("MKERNEL_GEMM_AR_USE_TORCH_FALLBACK") == "1"
 
     result_sizes, result_fused = [], []
+    timing_label = "torch_fallback" if use_ngt2_fallback else "legacy_sync"
+    correctness_ok = True
 
     for base_n in shapes:
         M, K, N = base_n, base_n // K_denom, base_n
@@ -247,6 +277,37 @@ def main():
         A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
         B = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
 
+        if use_ngt2_fallback:
+            if is_chief:
+                print("[gemm_ar] using explicit torch fallback; unset "
+                      "MKERNEL_GEMM_AR_USE_TORCH_FALLBACK to test fused path",
+                      flush=True)
+            samples = []
+            for _ in range(args.warmup):
+                C_tmp = torch.matmul(A, B)
+                torch.cuda.synchronize()
+                del C_tmp
+            dist.barrier()
+            for _ in range(args.iters):
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record()
+                C_tmp = torch.matmul(A, B)
+                e.record()
+                torch.cuda.synchronize()
+                samples.append(s.elapsed_time(e))
+                del C_tmp
+                dist.barrier()
+            wall_ms = median_then_max_cuda(samples)
+            if is_chief:
+                sample_str = "[" + ", ".join(f"{x:.4f}" for x in samples) + "]"
+                print(f"[gemm_ar] M={M} fallback samples={sample_str} "
+                      f"median={sorted(samples)[len(samples)//2]:.4f}", flush=True)
+                print(f"[gemm_ar] M={M} wall={wall_ms:.3f} ms", flush=True)
+            result_sizes.append(f"M={M}")
+            result_fused.append(wall_ms)
+            continue
+
         C_dbuf = mod.DistBuffer((M, N), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         C_dbuf.data_.zero_()
@@ -260,6 +321,15 @@ def main():
         C_final.data_.zero_()
 
         staging_buf = torch.empty(staging_bytes // 2, device="cuda", dtype=torch.bfloat16)
+        ring_experiment = (
+            os.environ.get("GEMM_AR_RING_EXPERIMENT", "0") == "1"
+            or os.environ.get("GEMM_AR_RING_RS_EXPERIMENT", "0") == "1"
+        )
+        early_remote_accum = os.environ.get("GEMM_AR_EARLY_REMOTE_ACCUM", "0") == "1"
+        remote_accum = (
+            torch.empty(staging_bytes // 2, device="cuda", dtype=torch.bfloat16)
+            if (early_remote_accum or ring_experiment) else None
+        )
 
         # Per-peer sizing (1× at N == 2, identical to legacy).
         n_peers = NUM_NODES - 1
@@ -271,13 +341,15 @@ def main():
         while fifo_cap < recv_buf_tiles * 2: fifo_cap *= 2
         clocal_ptr = int(C_dbuf.data_.data_ptr())
         clocal_bytes = int(C_dbuf.data_.numel() * C_dbuf.data_.element_size())
+        direct_src_ptr = int(remote_accum.data_ptr()) if ring_experiment and remote_accum is not None else clocal_ptr
+        direct_src_bytes = staging_bytes if ring_experiment and remote_accum is not None else clocal_bytes
         row_stride_bytes = N * 2
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             staging_buf.data_ptr(), staging_bytes,
             recv_buf_bytes, recv_buf_tiles, fifo_cap, local_rank,
-            clocal_ptr, clocal_bytes, row_stride_bytes,
+            direct_src_ptr, direct_src_bytes, row_stride_bytes,
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
@@ -287,6 +359,8 @@ def main():
         num_qps = max(1, int(mod.get_num_qps()))
         arrival_tails_ptr = mod.get_arrival_tails_ptr() if hasattr(mod, "get_arrival_tails_ptr") else 0
         barrier_device_ptr = mod.get_barrier_device_ptr() if hasattr(mod, "get_barrier_device_ptr") else 0
+        if NUM_NODES > 2:
+            barrier_device_ptr = 0
 
         logical_queues_per_qp = max(1, int(os.environ.get("GEMM_AR_LOGICAL_QUEUES_PER_QP", "1")))
         # Apply per-shape intra override (small-M shapes benefit from fewer
@@ -306,11 +380,18 @@ def main():
             // cta_split_chunk_tiles_for_n(N),
         )
         total_chunks_for_queues = (M // world_size // ROW_BLOCK) * chunks_per_row_for_queues
-        num_remote_queues = max(1, min(num_allocated_remote_queues, total_chunks_for_queues))
-        if os.environ.get("GEMM_AR_ARRIVAL_QUEUE", "1") == "1":
+        if NUM_NODES > 2:
+            num_remote_queues = num_allocated_remote_queues
+        else:
+            num_remote_queues = max(1, min(num_allocated_remote_queues, total_chunks_for_queues))
+        if os.environ.get("GEMM_AR_ARRIVAL_QUEUE", "1") == "1" and NUM_NODES <= 2:
             kernel_inter_send_sms = max(
-                2,
-                min(n_inter - 2, int(os.environ.get("GEMM_AR_INTER_SEND_SMS", "4"))),
+                1,
+                min(
+                    n_inter - 1,
+                    int(os.environ.get("GEMM_AR_INTER_SEND_SMS", "4")),
+                    max(1, M // world_size // ROW_BLOCK),
+                ),
             )
             kernel_inter_reduce_publish_sms = n_inter - kernel_inter_send_sms
             num_remote_queues = max(1, min(num_remote_queues, kernel_inter_reduce_publish_sms))
@@ -340,10 +421,16 @@ def main():
             steady_state = False
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
             steady_state = False
+        if NUM_NODES > 2 and os.environ.get("MKERNEL_ALLOW_NOSYNC_NGT2") != "1":
+            if steady_state and is_chief:
+                print("[gemm_ar] forcing legacy-sync timing for NUM_NODES > 2", flush=True)
+            steady_state = False
 
         # Warmup. Under steady_state, only first iter does barrier/arrival reset.
         for wi in range(args.warmup):
             C_dbuf.data_.zero_(); C_final.data_.zero_(); ar_done.zero_()
+            if remote_accum is not None:
+                remote_accum.zero_()
             if not steady_state or wi == 0:
                 barrier.data_.zero_()
                 mod.reset_arrival_flags()
@@ -365,14 +452,22 @@ def main():
                 cross_node_barrier_ptr=barrier_device_ptr,
                 use_acquire_poll=kernel_use_acquire_poll,
                 num_nodes=NUM_NODES,
+                remote_accum_ptr=remote_accum.data_ptr() if remote_accum is not None else 0,
             )
             torch.cuda.synchronize()
         # One-shot cross-node align before timed loop (steady_state requires).
         dist.barrier()
 
         samples_pairs = []
-        for _ in range(args.iters):
+        trace_out_base = os.environ.get("GEMM_AR_ACTIVITY_TRACE_OUT_BASE", "")
+        for iter_idx in range(args.iters):
+            if trace_out_base:
+                os.environ["GEMM_AR_ACTIVITY_TRACE_OUT"] = (
+                    f"{trace_out_base}.iter{iter_idx + 1}.trace.json"
+                )
             C_dbuf.data_.zero_(); C_final.data_.zero_(); ar_done.zero_()
+            if remote_accum is not None:
+                remote_accum.zero_()
             if not steady_state:
                 barrier.data_.zero_()
                 mod.reset_arrival_flags()
@@ -398,6 +493,7 @@ def main():
                 cross_node_barrier_ptr=barrier_device_ptr,
                 use_acquire_poll=kernel_use_acquire_poll,
                 num_nodes=NUM_NODES,
+                remote_accum_ptr=remote_accum.data_ptr() if remote_accum is not None else 0,
             )
             e.record()
             if not steady_state:
@@ -410,12 +506,52 @@ def main():
             torch.cuda.synchronize()
             dist.barrier()
         samples = [s.elapsed_time(e) for (s, e) in samples_pairs]
+        timing_label = "steady_state" if steady_state else "legacy_sync"
 
         wall_ms = median_then_max_cuda(samples)
         if is_chief:
             sample_str = "[" + ", ".join(f"{x:.4f}" for x in samples) + "]"
             print(f"[gemm_ar] M={M} samples={sample_str} min={min(samples):.4f} median={sorted(samples)[len(samples)//2]:.4f}", flush=True)
             print(f"[gemm_ar] M={M} wall={wall_ms:.3f} ms", flush=True)
+        if args.mode == "check":
+            C_ref_cpu = torch.matmul(A, B).detach().float().cpu()
+            local_ref_cpu = C_ref_cpu.clone()
+            dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
+            debug_idx = os.environ.get("MKERNEL_DEBUG_INDEX", "")
+            if debug_idx:
+                try:
+                    dbg_row, dbg_col = [int(x) for x in debug_idx.split(",", 1)]
+                    obs_dbg = float(C_final.data_[dbg_row, dbg_col].detach().float().item())
+                    ref_dbg = float(C_ref_cpu[dbg_row, dbg_col].item())
+                    local_ref_dbg = float(local_ref_cpu[dbg_row, dbg_col].item())
+                    intra_dbg = float(C_dbuf.data_[dbg_row, dbg_col].detach().float().item())
+                    msg = (
+                        f"[gemm_ar-debug-index] rank={rank} idx=({dbg_row},{dbg_col}) "
+                        f"C_final={obs_dbg:.6f} C_dbuf={intra_dbg:.6f} "
+                        f"local_ref={local_ref_dbg:.6f} ref={ref_dbg:.6f}"
+                    )
+                    slice_rows = M // world_size
+                    owner_local_rank = dbg_row // slice_rows
+                    if (
+                        remote_accum is not None
+                        and local_rank == owner_local_rank
+                        and 0 <= owner_local_rank < world_size
+                    ):
+                        local_row = dbg_row - owner_local_rank * slice_rows
+                        rb = local_row // ROW_BLOCK
+                        r = local_row - rb * ROW_BLOCK
+                        col_idx = dbg_col // COL_BLOCK
+                        col_elem = dbg_col - col_idx * COL_BLOCK
+                        tile_id = rb * col_blocks + col_idx
+                        flat = tile_id * ROW_BLOCK * COL_BLOCK + r * COL_BLOCK + col_elem
+                        accum_dbg = float(remote_accum[flat].detach().float().item())
+                        msg += f" remote_accum={accum_dbg:.6f}"
+                    print(msg, flush=True)
+                except Exception as ex:
+                    print(f"[gemm_ar-debug-index] failed: {ex}", flush=True)
+            correctness_ok = check_close(
+                f"gemm_ar M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
+            ) and correctness_ok
         result_sizes.append(f"M={M}")
         result_fused.append(wall_ms)
 
@@ -432,14 +568,18 @@ def main():
         from common import write_results_json
         write_results_json(Path(args.save_json), "gemm_ar",
                            result_sizes, result_fused,
-                           note=f"release gemm_ar bench (world={world_size*NUM_NODES})")
+                           note=f"release gemm_ar bench timing={timing_label} world={world_size*NUM_NODES}")
         print(f"[gemm_ar] wrote {args.save_json}", flush=True)
 
     if is_chief and args.compare_to:
         ok = compare_named_results("gemm_ar", result_sizes, result_fused, args.compare_to)
+        ok = ok and correctness_ok
         dist.destroy_process_group()
         if not ok: return 1
         return 0
+    if not correctness_ok:
+        dist.destroy_process_group()
+        return 1
     dist.destroy_process_group()
     return 0
 

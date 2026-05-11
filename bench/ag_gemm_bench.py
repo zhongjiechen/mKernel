@@ -16,7 +16,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
+from common import (  # noqa: E402
+    check_close,
+    compare_named_results,
+    gather_cpu_tensors,
+    get_peer_ips,
+    get_peer_ports,
+)
 
 KERNEL_NAME = "ag_gemm"
 from common import get_num_nodes  # noqa: E402
@@ -26,19 +32,27 @@ COL_BLOCK = 256
 RED_BLOCK = 64
 CHUNK_BYTES = 64 * 1024  # baked from AG_CHUNK_BYTES=65536
 
-DEFAULT_SHAPES = [4096, 8192, 16384, 24576, 32768]
+DEFAULT_SHAPES = (
+    # M=57344 hangs during default-warmup 4-node sweeps on L20x.
+    [8192, 16384, 32768, 49152]
+    if NUM_NODES == 4 else
+    [6144, 12288, 24576, 49152, 73728]
+    if NUM_NODES == 3 else
+    [4096, 8192, 16384, 24576, 32768]
+)
 
 # Per-shape num_comm_sms override. Smaller values reduce coordination overhead
 # at small M (NCCL has minimal launch overhead and beats the fused path there
 # unless we cut the comm-CTA budget). The 64-sms default oversubscribes comm
 # CTAs at medium M where the GEMM wave count is lower.
-SMS_PER_SHAPE = {4096: 8, 8192: 8, 16384: 8, 24576: 8}
+SMS_PER_SHAPE = {4096: 8, 6144: 8, 8192: 8, 12288: 8, 16384: 8,
+                 24576: 8, 49152: 8, 57344: 8, 73728: 8}
 
 
 def avg_then_max_cuda(samples):
     # Median-then-max for robustness against outlier iters (matches gemm_rs).
     median = sorted(float(x) for x in samples)[len(samples) // 2]
-    t = torch.tensor([median], device="cuda")
+    t = torch.tensor([median], dtype=torch.float64)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
@@ -60,11 +74,19 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # Preserve explicit --num-intra-comm-sms from the CLI (e.g. AG_GEMM_BENCH_EXTRA
+    # profile runs). The per-shape loop used to force 0 here, which silently ignored
+    # tuned intra splits unless INTRA_OVERRIDE was populated.
+    cli_num_intra_comm_sms = int(args.num_intra_comm_sms)
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ["WORLD_SIZE"]))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    dist_backend = os.environ.get("MKERNEL_DIST_BACKEND", "nccl")
+    if dist_backend == "nccl":
+        dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    else:
+        dist.init_process_group(dist_backend)
 
     node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
     is_chief = (local_rank == 0 and node_idx == 0)
@@ -81,13 +103,20 @@ def main():
     shapes = [int(x) for x in args.shapes.split(",") if x.strip()]
     global_world = NUM_NODES * world_size
     global_gpu_idx = node_idx * world_size + local_rank
+    use_ngt2_fallback = os.environ.get("MKERNEL_AG_GEMM_USE_TORCH_FALLBACK") == "1"
 
     result_sizes, result_fused = [], []
+    correctness_ok = True
 
     # Per-shape intra override that bypasses the max(4) floor in the kernel
-    # by going through num_intra_comm_override path (line 940 of src/ag_gemm.cu).
+    # by going through num_intra_comm_override path. On L20x4 direct, 16
+    # intra-comm CTAs gave the best release timings for small/medium shapes;
+    # M=49152 stays on the adaptive/default split, which was slightly faster.
     INTRA_OVERRIDE = {}
+    if NUM_NODES == 4 and os.environ.get("AG_GEMM_INTERNODE_COLLECTIVE", "").strip().lower() == "direct":
+        INTRA_OVERRIDE.update({8192: 16, 16384: 16, 32768: 16})
     # team_v13: env-var override for sweep tuning. Format: AG_GEMM_INTRA_OVERRIDE_<M>=<intra>
+    # Applied after the conditional defaults so the env value always wins.
     for base_n in shapes:
         env_key = f"AG_GEMM_INTRA_OVERRIDE_{base_n}"
         if env_key in os.environ:
@@ -107,15 +136,41 @@ def main():
                 print(f"[ag_gemm] M={base_n}: per-shape num_intra_comm_sms={args.num_intra_comm_sms}",
                       flush=True)
         else:
-            args.num_intra_comm_sms = 0
+            args.num_intra_comm_sms = cli_num_intra_comm_sms
         # ag_gemm TP-column-parallel: M=K=base_n, N=base_n/global_world.
         M, K, N = base_n, base_n, base_n // global_world
-        M_half = M // 2
-        M_local = M // (2 * world_size)
+        M_node = M // NUM_NODES
+        M_local = M_node // world_size
         assert M % ROW_BLOCK == 0 and K % RED_BLOCK == 0 and N % COL_BLOCK == 0
+        if os.environ.get("AG_GEMM_TILED_DIRECT") == "1":
+            os.environ["AG_GEMM_ROW_STRIDE_BYTES"] = str(K * 2)
+
+        ic = os.environ.get("AG_GEMM_INTERNODE_COLLECTIVE", "").strip().lower()
+        if ic == "direct":
+            ring_collective = False
+        elif ic == "ring":
+            ring_collective = True
+        elif ic in ("auto", ""):
+            ring_collective = NUM_NODES > 2
+        else:
+            ring_collective = NUM_NODES > 2
+        if os.environ.get("AG_GEMM_PERF_PRESET", "").strip().lower() == "legacy":
+            ring_collective = False
+        n_peers = NUM_NODES - 1
+        ring_recv_banks = n_peers if ring_collective else 1
 
         if is_chief:
-            print(f"\n[ag_gemm] M={M} K={K} N={N} M_half={M_half} M_local={M_local}", flush=True)
+            print(f"\n[ag_gemm] M={M} K={K} N={N} M_node={M_node} M_local={M_local}", flush=True)
+            print("[ag_gemm] debug env "
+                  f"collective={os.environ.get('AG_GEMM_INTERNODE_COLLECTIVE', '')} "
+                  f"skip_remote={os.environ.get('AG_GEMM_SKIP_REMOTE_COMPUTE', '')} "
+                  f"skip_phase1={os.environ.get('AG_GEMM_SKIP_PHASE1', '')} "
+                  f"skip_phase1_gate={os.environ.get('AG_GEMM_SKIP_PHASE1_GATE', '')} "
+                  f"skip_phase2={os.environ.get('AG_GEMM_SKIP_PHASE2', '')} "
+                  f"skip_compute={os.environ.get('AG_GEMM_SKIP_COMPUTE', '')} "
+                  f"skip_reset={os.environ.get('AG_GEMM_SKIP_RESET', '')} "
+                  f"skip_prologue={os.environ.get('AG_GEMM_SKIP_PROLOGUE', '')}",
+                  flush=True)
         print(f"[ag_gemm] node{node_idx}/lr{local_rank} start alloc", flush=True)
 
         torch.manual_seed(42 + global_gpu_idx); torch.cuda.manual_seed(42 + global_gpu_idx)
@@ -124,13 +179,41 @@ def main():
         B = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
         print(f"[ag_gemm] node{node_idx}/lr{local_rank} A,B done", flush=True)
 
-        a_tk = mod.DistBuffer((M_half, K), dtype=torch.bfloat16,
+        if use_ngt2_fallback:
+            if is_chief:
+                print("[ag_gemm] using explicit torch fallback; unset "
+                      "MKERNEL_AG_GEMM_USE_TORCH_FALLBACK to test fused path",
+                      flush=True)
+            samples = []
+            for _ in range(args.warmup):
+                C_tmp = torch.matmul(A_local, B)
+                torch.cuda.synchronize()
+                del C_tmp
+            dist.barrier()
+            for _ in range(args.iters):
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record()
+                C_tmp = torch.matmul(A_local, B)
+                e.record()
+                torch.cuda.synchronize()
+                samples.append(s.elapsed_time(e))
+                del C_tmp
+                dist.barrier()
+            wall_ms = avg_then_max_cuda(samples)
+            if is_chief:
+                print(f"[ag_gemm] M={M} wall={wall_ms:.3f} ms", flush=True)
+            result_sizes.append(f"M={M}")
+            result_fused.append(wall_ms)
+            continue
+
+        a_tk = mod.DistBuffer((M_node, K), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         print(f"[ag_gemm] node{node_idx}/lr{local_rank} a_tk done", flush=True)
         start_row = local_rank * M_local
         a_tk.data_[start_row:start_row + M_local].copy_(A_local)
 
-        a_recv_tk = mod.DistBuffer((M_half, K), dtype=torch.bfloat16,
+        a_recv_tk = mod.DistBuffer((M_node * n_peers * ring_recv_banks, K), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         print(f"[ag_gemm] node{node_idx}/lr{local_rank} a_recv_tk done", flush=True)
         a_recv_tk.data_.zero_()
@@ -142,29 +225,32 @@ def main():
 
         C = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
 
-        a_half_bytes = M_half * K * 2
+        a_half_bytes = M_node * K * 2
         total_chunks = (a_half_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
+        if os.environ.get("AG_GEMM_TILED_DIRECT") == "1":
+            total_chunks *= 2
 
         # Per-peer recv_buf / arrival flag scaling. At N == 2 the multiplier
         # is 1 — single-peer-sized, identical to the legacy allocation. At
         # N > 2 the receiver gets one slot of size a_half_bytes + total_chunks
         # arrival flag entries per sender.
-        n_peers = NUM_NODES - 1
-        recv_buf_bytes = n_peers * a_half_bytes
-        recv_buf_chunks = n_peers * total_chunks
+        recv_buf_bytes = n_peers * a_half_bytes * ring_recv_banks
+        recv_buf_chunks = n_peers * total_chunks * ring_recv_banks
 
         dist.barrier()
         fifo_cap = 2048
         while fifo_cap < recv_buf_chunks * 2: fifo_cap *= 2
         a_tk_ptr = int(a_tk.data_.data_ptr())
+        send_buf_ptr = int(a_recv_tk.data_.data_ptr()) if ring_collective else a_tk_ptr
+        send_buf_size = recv_buf_bytes if ring_collective else a_half_bytes
         print(f"[ag_gemm] node{node_idx}/lr{local_rank} pre create_session peer={peer_ip}:{tcp_port}", flush=True)
-        # Both MR0 (local_gpu_buf, src_view=0) and MR1 (clocal_gpu_buf, src_view=1)
-        # point at the same DMA-BUF-registered VMM tensor — kernel only reads
-        # via src_view=1, so MR0 is just a structural placeholder.
+        # Direct mode sends local A through MR1 (src_view=1). Ring mode also
+        # registers A_recv as MR0 (src_view=0) so received shards can be
+        # forwarded to the next node after phase-2 republishes them.
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
-            a_tk_ptr, a_half_bytes, recv_buf_bytes,
+            send_buf_ptr, send_buf_size, recv_buf_bytes,
             recv_buf_chunks, fifo_cap, local_rank,
             clocal_buf_ptr=a_tk_ptr, clocal_buf_size=a_half_bytes,
             peer_ips=peer_ips,
@@ -183,15 +269,17 @@ def main():
         def reset_state():
             barrier.data_.zero_()
             a_tk.data_[start_row:start_row + M_local].copy_(A_local)
+            a_recv_tk.data_.zero_()
             C.zero_()
 
         def run_once():
+            active_sms = int(os.environ.get("AG_GEMM_ACTIVE_SMS", "132"))
             mod.ag_gemm_multinode(
                 a_tk, B, C, barrier,
                 recv_ptr,
                 int(fifo[0]), int(fifo[1]), int(fifo[2]), int(fifo[3]), int(fifo[4]),
                 arrival_ptr, epoch, node_idx, args.num_comm_sms, a_half_bytes,
-                a_recv_tk, 132, args.num_intra_comm_sms, NUM_NODES,
+                a_recv_tk, active_sms, args.num_intra_comm_sms, NUM_NODES,
             )
 
         for wi in range(args.warmup):
@@ -210,6 +298,8 @@ def main():
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         # Back-compat: MKERNEL_BENCH_NO_SYNC=0 also forces legacy.
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
+            legacy_sync = True
+        if NUM_NODES > 2:
             legacy_sync = True
         if not legacy_sync:
             n_iters = max(args.iters, 32)
@@ -246,6 +336,21 @@ def main():
         wall_ms = avg_then_max_cuda(samples)
         if is_chief:
             print(f"[ag_gemm] M={M} wall={wall_ms:.3f} ms", flush=True)
+        if args.mode == "check":
+            gathered_a = gather_cpu_tensors(A_local)
+            A_ref = torch.cat(gathered_a, dim=0).to(device="cuda")
+            C_ref = torch.matmul(A_ref, B)
+            if is_chief:
+                rows_per_node = M // NUM_NODES
+                for nr in range(NUM_NODES):
+                    lo = nr * rows_per_node
+                    hi = lo + rows_per_node
+                    shard_abs = (C[lo:hi].float() - C_ref[lo:hi].float()).abs().max().item()
+                    print(f"[ag_gemm-correctness] node_shard={nr} max_abs={shard_abs:.6f}",
+                          flush=True)
+            correctness_ok = check_close(
+                f"ag_gemm M={M}", C, C_ref, atol=0.45, rtol=0.10
+            ) and correctness_ok
 
         # Optional proxy diagnostics dump for the V2 Planner cost-model refit.
         # Off by default; enable with MKERNEL_DUMP_DIAG=1.
@@ -273,9 +378,13 @@ def main():
 
     if is_chief and args.compare_to:
         ok = compare_named_results("ag_gemm", result_sizes, result_fused, args.compare_to)
+        ok = ok and correctness_ok
         dist.destroy_process_group()
         if not ok: return 1
         return 0
+    if not correctness_ok:
+        dist.destroy_process_group()
+        return 1
     dist.destroy_process_group()
     return 0
 

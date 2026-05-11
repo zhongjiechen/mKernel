@@ -30,6 +30,18 @@
 namespace internode {
 namespace rdma {
 
+inline int roce_gid_index() {
+    const char* env = std::getenv("MKERNEL_ROCE_GID_INDEX");
+    if (!env || !env[0]) return 0;
+    char* end = nullptr;
+    long v = std::strtol(env, &end, 10);
+    if (end == env || v < 0 || v > 255) {
+        fprintf(stderr, "rdma: ignoring invalid MKERNEL_ROCE_GID_INDEX=%s\n", env);
+        return 0;
+    }
+    return static_cast<int>(v);
+}
+
 // ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
@@ -150,8 +162,8 @@ inline void modify_qp_rtr(ibv_qp* qp, const ConnectionInfo& remote,
     if (has_gid) {
         attr.ah_attr.is_global = 1;
         memcpy(&attr.ah_attr.grh.dgid, remote.gid, 16);
-        attr.ah_attr.grh.sgid_index = 0;
-        attr.ah_attr.grh.hop_limit = 1;
+        attr.ah_attr.grh.sgid_index = roce_gid_index();
+        attr.ah_attr.grh.hop_limit = 64;
         attr.ah_attr.grh.traffic_class = 0;
     }
 
@@ -329,12 +341,18 @@ inline ConnectionInfo exchange_info_tcp(const ConnectionInfo& local,
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t)port);
         addr.sin_addr.s_addr = INADDR_ANY;
+        if (std::getenv("MKERNEL_TCP_EXCHANGE_DEBUG")) {
+            fprintf(stderr, "rdma_tcp: server listen port=%d peer=%s\n", port, peer_ip ? peer_ip : "(null)");
+        }
         RDMA_CHECK(bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) == 0,
                    "bind() failed");
         RDMA_CHECK(listen(listen_fd, 1) == 0, "listen() failed");
 
         int conn_fd = accept(listen_fd, nullptr, nullptr);
         RDMA_CHECK(conn_fd >= 0, "accept() failed");
+        if (std::getenv("MKERNEL_TCP_EXCHANGE_DEBUG")) {
+            fprintf(stderr, "rdma_tcp: server accepted port=%d peer=%s\n", port, peer_ip ? peer_ip : "(null)");
+        }
         close(listen_fd);
 
         // Send ours, recv theirs
@@ -350,6 +368,9 @@ inline ConnectionInfo exchange_info_tcp(const ConnectionInfo& local,
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t)port);
         inet_pton(AF_INET, peer_ip, &addr.sin_addr);
+        if (std::getenv("MKERNEL_TCP_EXCHANGE_DEBUG")) {
+            fprintf(stderr, "rdma_tcp: client connect peer=%s port=%d\n", peer_ip ? peer_ip : "(null)", port);
+        }
 
         // Extension rebuilds can take well over 30s on one rank while the peer
         // has already finished and started retrying the TCP bootstrap connect.
@@ -360,6 +381,10 @@ inline ConnectionInfo exchange_info_tcp(const ConnectionInfo& local,
         for (int attempt = 0; attempt < max_retries; attempt++) {
             if (connect(fd, (sockaddr*)&addr, sizeof(addr)) == 0) {
                 connected = true;
+                if (std::getenv("MKERNEL_TCP_EXCHANGE_DEBUG")) {
+                    fprintf(stderr, "rdma_tcp: client connected peer=%s port=%d attempt=%d\n",
+                            peer_ip ? peer_ip : "(null)", port, attempt);
+                }
                 break;
             }
             close(fd);
@@ -396,7 +421,7 @@ inline void fill_local_info(ConnectionInfo& info, ibv_qp* qp,
     info.lid = port_attr.lid;
 
     ibv_gid gid{};
-    ibv_query_gid(ctx, port, 0, &gid);
+    ibv_query_gid(ctx, port, roce_gid_index(), &gid);
     memcpy(info.gid, &gid, 16);
 }
 

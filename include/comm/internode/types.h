@@ -35,7 +35,7 @@ struct TransferCmd {
     uint32_t remote_offset;  // byte offset into RDMA-registered remote buffer
     uint16_t lane_id;        // logical lane / remote queue for structural routing
     uint8_t  src_view;       // 0 = staging buffer, 1 = C_local direct (DMA-BUF), 2 = C_local strided (multi-SGE gather)
-    uint8_t  reserved0;      // keep command size aligned to 8-byte chunks
+    uint8_t  reserved0;      // optional peer/GPU channel id; zero preserves legacy routing
     uint16_t row_span;       // src_view=2: bytes per row run (dst_cols * sizeof(bf16))
     uint16_t row_count;      // src_view=2: number of rows gathered (<= ROW_BLOCK)
     uint64_t enqueue_device_ns; // GPU globaltimer timestamp just before fifo.push()
@@ -43,6 +43,22 @@ struct TransferCmd {
 #pragma pack(pop)
 
 static_assert(sizeof(TransferCmd) == 32, "TransferCmd must be exactly 32 bytes");
+
+#pragma pack(push, 1)
+struct ForwardNotify {
+    uint32_t bytes;
+    uint32_t local_offset;   // offset in the receiver's local_data MR
+    uint32_t tile_id;        // arrival slot that just became ready
+    uint16_t lane_id;
+    uint8_t  reserved0;
+    uint8_t  src_view;
+    uint32_t epoch;          // written last in the source struct before RDMA
+    uint64_t reserved1;
+    uint32_t reserved2;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(ForwardNotify) == 32, "ForwardNotify must be exactly 32 bytes");
 
 __host__ __device__ inline uint8_t unpack_dst_rank(uint8_t packed) {
     return packed;
@@ -94,12 +110,12 @@ __host__ __device__ inline int peer_rank_for_slot(int node_idx,
     return r;
 }
 
-// Return THIS rank's peer slot in `peer_rank`'s "skip self" peer table.
+// Return THIS rank's peer slot in `peer_rank`'s ring-order peer table.
 //
 // Used by the sender so its inter-node WRITE lands in the right per-peer
 // slot of the receiver's recv_buf / arrival_flags array. Inverse of
 // peer_rank_for_slot from the perspective of the receiver:
-//   slot_at_peer = my_rank if my_rank < peer_rank else my_rank - 1
+//   peer_rank_for_slot(peer_rank, num_nodes, slot_at_peer) == my_rank
 //
 // For N == 2 (the validated configuration) slot_at_peer is always 0,
 // regardless of (my_rank, peer_rank). The expressions
@@ -108,8 +124,10 @@ __host__ __device__ inline int peer_rank_for_slot(int node_idx,
 // therefore add zero offsets at N == 2 and keep behavior bit-identical to
 // the legacy 2-node code. For N > 2 the offsets partition the receiver's
 // recv_buf and arrival flag array by sender slot.
-__host__ __device__ inline int slot_at_peer(int my_rank, int peer_rank) {
-    return my_rank < peer_rank ? my_rank : my_rank - 1;
+__host__ __device__ inline int slot_at_peer(int my_rank, int peer_rank, int num_nodes) {
+    int slot = my_rank - peer_rank - 1;
+    if (slot < 0) slot += num_nodes;
+    return slot;
 }
 
 // Per-rail RDMA registration keys exchanged during TCP bootstrap.
@@ -144,6 +162,11 @@ struct ConnectionInfo {
     // Remote stage barrier flags (host-pinned, RDMA-registered)
     uint32_t barrier_rkey;
     uint64_t barrier_addr;
+
+    // Optional receiver-side host-polled forward notifications.
+    uint32_t forward_notify_rkey;
+    uint64_t forward_notify_addr;
+    uint32_t forward_notify_count;
 
     // Multi-QP: extra QP nums and PSNs (indices 1..num_qps-1)
     int      num_qps;                          // total QPs (1 = single QP)
