@@ -22,7 +22,7 @@
 #   NODE1_SSH  — host this script SSHs into to launch node 1 (public or private)
 #   NODE1_SSH_PORT — optional SSH port for node 1
 #
-# Multi-node etiquette (N≥3 + MKERNEL_TOPOLOGY=l20x3|l20x4):
+# Multi-node etiquette (N≥3 + MKERNEL_TOPOLOGY=h200x3|h200x4):
 #   Point NODE0_IP / NODE{i}_SSH at GPU-idle nodes only (no shared SGLang/training).
 #   By default run.sh runs bench/check_cluster_idle.sh first. Opt out with
 #   MKERNEL_SKIP_IDLE_CHECK=1 (emergency only). Force check on other topologies:
@@ -66,8 +66,8 @@ NODE1_IP=${NODE1_IP:-172.31.11.6}
 NODE1_SSH=${NODE1_SSH:-15.164.130.63}
 BACKEND_ENV_SET=${BACKEND+x}
 BACKEND=${BACKEND:-efa}
-if [[ "${MKERNEL_TOPOLOGY:-}" == "l20x3" || "${MKERNEL_TOPOLOGY:-}" == "l20x4" ]]; then
-    if [[ "${MKERNEL_TOPOLOGY:-}" == "l20x4" ]]; then
+if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x3" || "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
+    if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
         NUM_NODES=4
     else
         NUM_NODES=3
@@ -94,7 +94,7 @@ if [[ "${MKERNEL_TOPOLOGY:-}" == "l20x3" || "${MKERNEL_TOPOLOGY:-}" == "l20x4" ]
         NODE2_SSH=root@10.53.251.56
     fi
     NODE2_SSH_PORT=${NODE2_SSH_PORT:-2222}
-    if [[ "${MKERNEL_TOPOLOGY:-}" == "l20x4" ]]; then
+    if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
         if [[ -z "$NODE3_IP_ENV_SET" ]]; then
             NODE3_IP=10.53.248.58
         fi
@@ -104,7 +104,7 @@ if [[ "${MKERNEL_TOPOLOGY:-}" == "l20x3" || "${MKERNEL_TOPOLOGY:-}" == "l20x4" ]
         NODE3_SSH_PORT=${NODE3_SSH_PORT:-2222}
     fi
     RESULT_SUFFIX=${RESULT_SUFFIX:-${MKERNEL_TOPOLOGY}}
-    # Match bench/run_l20x4_baseline.sh (BASELINE_NET=ib): NCCL bootstrap must use
+    # Match bench/run_h200x4_baseline.sh (BASELINE_NET=ib): NCCL bootstrap must use
     # RoCE-facing bonds, not eth0 — otherwise NCCL_IB fails (GID / QP setup).
     _MK_NCCL_BOND_IFS=bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7
     NCCL_SOCKET_IFNAME=${MKERNEL_BASELINE_NCCL_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME:-$_MK_NCCL_BOND_IFS}}
@@ -138,8 +138,8 @@ for ((i=0; i<NUM_NODES; i++)); do
     fi
 done
 
-# --- GPU-idle preflight (L20 3/4-node): do not bench on occupied nodes ---
-if ((NUM_NODES >= 3)) && [[ "${MKERNEL_TOPOLOGY:-}" == "l20x3" || "${MKERNEL_TOPOLOGY:-}" == "l20x4" ]]; then
+# --- GPU-idle preflight (H200 3/4-node): do not bench on occupied nodes ---
+if ((NUM_NODES >= 3)) && [[ "${MKERNEL_TOPOLOGY:-}" == "h200x3" || "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
     echo "[run] policy: NUM_NODES=${NUM_NODES} topology=${MKERNEL_TOPOLOGY:-} — use GPU-idle nodes only; set NODE0_IP to an idle chief (not a shared head)." >&2
     if [[ -n "${MKERNEL_SKIP_IDLE_CHECK:-}" ]]; then
         echo "[run] MKERNEL_SKIP_IDLE_CHECK set — skipping bench/check_cluster_idle.sh (not recommended)." >&2

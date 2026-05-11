@@ -65,7 +65,7 @@ __device__ inline void fused_inter_send_sm(const fused_globals &G) {
                 cmd.reserved0 = (uint8_t)(peer_slot * fused_globals::NUM_DEVICES + G.dev_idx);
                 internode::D2HFifoDevice fifo =
                     internode::gemm_ar_select_fifo_for_lane(
-                        G.d2h_fifos, (uint32_t)cmd.reserved0);
+                        G.d2h_fifos, (uint32_t)cmd.lane_id);
                 fifo.push(cmd);
             }
         }

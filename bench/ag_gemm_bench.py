@@ -33,7 +33,7 @@ RED_BLOCK = 64
 CHUNK_BYTES = 64 * 1024  # baked from AG_CHUNK_BYTES=65536
 
 DEFAULT_SHAPES = (
-    # M=57344 hangs during default-warmup 4-node sweeps on L20x.
+    # M=57344 hangs during default-warmup 4-node sweeps on H200x.
     [8192, 16384, 32768, 49152]
     if NUM_NODES == 4 else
     [6144, 12288, 24576, 49152, 73728]
@@ -52,7 +52,7 @@ SMS_PER_SHAPE = {4096: 8, 6144: 8, 8192: 8, 12288: 8, 16384: 8,
 def avg_then_max_cuda(samples):
     # Median-then-max for robustness against outlier iters (matches gemm_rs).
     median = sorted(float(x) for x in samples)[len(samples) // 2]
-    t = torch.tensor([median], dtype=torch.float64)
+    t = torch.tensor([median], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
@@ -109,7 +109,7 @@ def main():
     correctness_ok = True
 
     # Per-shape intra override that bypasses the max(4) floor in the kernel
-    # by going through num_intra_comm_override path. On L20x4 direct, 16
+    # by going through num_intra_comm_override path. On H200x4 direct, 16
     # intra-comm CTAs gave the best release timings for small/medium shapes;
     # M=49152 stays on the adaptive/default split, which was slightly faster.
     INTRA_OVERRIDE = {}

@@ -42,6 +42,10 @@ namespace internode {
 static constexpr int kEfaStageBarrierSlots = 2;
 // Cap total QPs per session (mirrors CX7's kMaxQPs/kMaxExchangeQPs).
 static constexpr int kEfaMaxQPs = kMaxExchangeQPs;
+// Operator session.cuh code (shared across CX7 + EFA backends) references
+// internode::kMaxQPs when sizing num_qps; EFA aliases it to kEfaMaxQPs so
+// the same code compiles against either backend.
+static constexpr int kMaxQPs = kEfaMaxQPs;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -121,6 +125,17 @@ struct SessionConfig {
 
     // Whether to pin each proxy thread to the GPU's NUMA node (default true).
     bool        pin_proxy              = true;
+
+    // Accepted for source compatibility with CX7's SessionConfig. EFA's proxy
+    // does not route by TransferCmd::reserved0, so the only effect on EFA is
+    // that operator session.cuh code bumps num_qps when the flag is true
+    // (capped to kEfaMaxQPs in create_session()).
+    bool        channelize_gpu_peers   = false;
+
+    // Accepted for source compatibility with CX7's SessionConfig. EFA's proxy
+    // does not implement the >2-node forward-notify hop, so the field is
+    // parsed but ignored on this backend.
+    bool        enable_forward_notify  = false;
 };
 
 // ---------------------------------------------------------------------------

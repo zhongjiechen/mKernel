@@ -61,7 +61,7 @@ DEFAULT_SHAPES = (
 
 def avg_then_max_cuda(samples):
     avg = sum(float(x) for x in samples) / len(samples)
-    t = torch.tensor([avg], dtype=torch.float64)
+    t = torch.tensor([avg], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 

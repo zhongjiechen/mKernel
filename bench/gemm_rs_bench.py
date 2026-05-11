@@ -60,7 +60,7 @@ SM_SPLIT = {
     16384: (120, 0, 4,  8,  4),
     32768: (120, 0, 4,  8,  8),
     65536: (124, 0, 2,  6,  32),
-    # L20x3 shapes. M=24576 benefits from smaller RDMA chunks; small shapes
+    # H200x3 shapes. M=24576 benefits from smaller RDMA chunks; small shapes
     # regressed correctness with chunk_tiles=2, and larger M overfills QPs.
     6144:  (116, 0, 8,  8,  4),
     12288: (118, 0, 6,  8,  4),
@@ -104,7 +104,7 @@ def poll_tuning(m: int) -> tuple[int, int]:
 
 def median_then_max_cuda(samples):
     median = sorted(float(x) for x in samples)[len(samples) // 2]
-    t = torch.tensor([median], dtype=torch.float64)
+    t = torch.tensor([median], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 

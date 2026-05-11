@@ -41,7 +41,7 @@ DEFAULT_SHAPES = [768, 1536, 3072, 6144, 12288]
 
 def median_then_max_cuda(samples):
     median = sorted(float(x) for x in samples)[len(samples) // 2]
-    t = torch.tensor([median], dtype=torch.float64)
+    t = torch.tensor([median], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 

@@ -12,7 +12,7 @@ os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
 os.environ.setdefault("GEMM_AR_ARRIVAL_QUEUE", "1")
 os.environ.setdefault("GEMM_AR_DISABLE_SEND_COALESCE", "1")
 if not (
-    os.environ.get("MKERNEL_TOPOLOGY") == "l20x4"
+    os.environ.get("MKERNEL_TOPOLOGY") == "h200x4"
     and os.environ.get("NUM_NODES") == "4"
 ):
     os.environ.setdefault("GEMM_AR_INTER_SEND_SMS", "4")
@@ -43,7 +43,7 @@ ROW_BLOCK = 128
 COL_BLOCK = 256
 
 DEFAULT_SHAPES = (
-    # 4-node L20x release sweep: use the largest verified natural multiples.
+    # 4-node H200x release sweep: use the largest verified natural multiples.
     # 22528 passes with the inter-heavy split; larger shapes still deadlock.
     [8192, 12288, 16384, 20480, 22528]
     if NUM_NODES == 4 else
@@ -61,7 +61,7 @@ INTRA_OVERRIDE_AR = {2048: 4}
 def median_then_max_cuda(samples):
     sorted_samples = sorted(float(x) for x in samples)
     median = sorted_samples[len(sorted_samples) // 2]
-    t = torch.tensor([median], dtype=torch.float64)
+    t = torch.tensor([median], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
@@ -194,9 +194,9 @@ def pick_sm_split(M, N, world_size, num_comm_sms_total, num_intra_override, num_
     effective_comm_sms = min(num_comm_sms_total, max(adaptive_comm, 16))
     env_intra = os.environ.get("GEMM_AR_NUM_INTRA_COMM_SMS")
     env_inter_send = os.environ.get("GEMM_AR_INTER_SEND_SMS")
-    l20x4_default_tune = (
+    h200x4_default_tune = (
         NUM_NODES == 4
-        and os.environ.get("MKERNEL_TOPOLOGY") == "l20x4"
+        and os.environ.get("MKERNEL_TOPOLOGY") == "h200x4"
         and num_intra_override is None
         and env_intra is None
         and num_inter_send_override is None
@@ -206,8 +206,8 @@ def pick_sm_split(M, N, world_size, num_comm_sms_total, num_intra_override, num_
         num_intra_comm_sms = max(4, num_intra_override)
     elif env_intra:
         num_intra_comm_sms = max(4, int(env_intra))
-    elif l20x4_default_tune:
-        # L20x4 direct-fanout AR needs inter-heavy progress; balanced splits
+    elif h200x4_default_tune:
+        # H200x4 direct-fanout AR needs inter-heavy progress; balanced splits
         # helped debug smoke tests but lost in release warmup/10-iter timing.
         num_intra_comm_sms = 4
     else:
@@ -220,7 +220,7 @@ def pick_sm_split(M, N, world_size, num_comm_sms_total, num_intra_override, num_
         inter_send_override = num_inter_send_override
     elif env_inter_send:
         inter_send_override = int(env_inter_send)
-    elif l20x4_default_tune:
+    elif h200x4_default_tune:
         inter_send_override = 20
     else:
         inter_send_override = None
@@ -452,7 +452,7 @@ def main():
                 cross_node_barrier_ptr=barrier_device_ptr,
                 use_acquire_poll=kernel_use_acquire_poll,
                 num_nodes=NUM_NODES,
-                remote_accum_ptr=remote_accum.data_ptr() if remote_accum is not None else 0,
+                **({"remote_accum_ptr": remote_accum.data_ptr()} if remote_accum is not None else {}),
             )
             torch.cuda.synchronize()
         # One-shot cross-node align before timed loop (steady_state requires).
@@ -493,7 +493,7 @@ def main():
                 cross_node_barrier_ptr=barrier_device_ptr,
                 use_acquire_poll=kernel_use_acquire_poll,
                 num_nodes=NUM_NODES,
-                remote_accum_ptr=remote_accum.data_ptr() if remote_accum is not None else 0,
+                **({"remote_accum_ptr": remote_accum.data_ptr()} if remote_accum is not None else {}),
             )
             e.record()
             if not steady_state:

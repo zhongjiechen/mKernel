@@ -725,16 +725,22 @@ private:
             return cfg_.fifo;
         };
 
-        // Map a command's lane_id to the local QP index this proxy owns.
-        // Returns -1 if the lane routes to a QP outside this proxy's slice
-        // (which should not happen when the kernel uses gemm_ar_select_fifo_for_lane
-        // to pick the right FIFO first).
+        // Map a command's lane_id to one of THIS proxy's local QPs.
+        //
+        // Kernels route commands to a proxy via `gemm_ar_select_fifo_for_lane`,
+        // and may use either `cmd.lane_id` or `cmd.reserved0` as the routing
+        // key — both schemes coexist (gemm_ar / ring_attention use lane_id;
+        // dispatch_gemm / gemm_rs / ag_gemm use reserved0 to keep work for the
+        // same source GPU on one proxy and reduce cross-proxy FIFO contention).
+        //
+        // The proxy should therefore accept any command that lands in its
+        // FIFO and pick a local QP via lane_id-mod-num_qps, rather than
+        // validating against a global slice (which only matched the lane_id
+        // routing scheme and dropped commands from the reserved0 scheme,
+        // causing deadlocks).
         auto map_to_local_qp = [this](const TransferCmd& cmd) -> int {
-            const int global_qp = (cfg_.global_num_qps > 0)
-                ? (int)(cmd.lane_id % (uint32_t)cfg_.global_num_qps) : 0;
-            const int local_qp = global_qp - cfg_.qp_base_idx;
-            if (local_qp < 0 || local_qp >= cfg_.num_qps) return -1;
-            return local_qp;
+            if (cfg_.num_qps <= 0) return 0;
+            return (int)(cmd.lane_id % (uint32_t)cfg_.num_qps);
         };
 
         while (running_.load(std::memory_order_relaxed)) {

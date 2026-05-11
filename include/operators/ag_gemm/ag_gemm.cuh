@@ -305,7 +305,7 @@ __device__ inline void post_merge_wrs_for_intra_row(
                 cmd.reserved0 = (uint8_t)(peer_slot * globals::NUM_DEVICES + G.dev_idx);
                 internode::D2HFifoDevice fifo =
                     internode::gemm_ar_select_fifo_for_lane(
-                        G.d2h_fifos, (uint32_t)cmd.reserved0);
+                        G.d2h_fifos, (uint32_t)cmd.lane_id);
                 fifo.push(cmd);
             }
         } else {
@@ -332,7 +332,7 @@ __device__ inline void post_merge_wrs_for_intra_row(
                     cmd.reserved0 = (uint8_t)(peer_slot * globals::NUM_DEVICES + G.dev_idx);
                     internode::D2HFifoDevice fifo =
                         internode::gemm_ar_select_fifo_for_lane(
-                            G.d2h_fifos, (uint32_t)cmd.reserved0);
+                            G.d2h_fifos, (uint32_t)cmd.lane_id);
                     fifo.push(cmd);
                 }
             }
@@ -384,7 +384,7 @@ __device__ inline void post_tiled_direct_wrs_for_intra_row(
                 cmd.row_count = half_tile_rows;
                 internode::D2HFifoDevice fifo =
                     internode::gemm_ar_select_fifo_for_lane(
-                        G.d2h_fifos, (uint32_t)cmd.reserved0);
+                        G.d2h_fifos, (uint32_t)cmd.lane_id);
                 fifo.push(cmd);
             }
         }
@@ -443,7 +443,7 @@ __device__ inline void post_ring_forward_wrs_for_intra_row(
             cmd.reserved0 = (uint8_t)(0 * globals::NUM_DEVICES + G.dev_idx);
             internode::D2HFifoDevice fifo =
                 internode::gemm_ar_select_fifo_for_lane(
-                    G.d2h_fifos, (uint32_t)cmd.reserved0);
+                    G.d2h_fifos, (uint32_t)cmd.lane_id);
             fifo.push(cmd);
         }
     }
