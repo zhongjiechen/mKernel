@@ -12,6 +12,8 @@
 - **Persistent kernel with SM specialization.** CTAs are assigned roles, such as compute / intra-comm / inter-send / inter-reduce. 
 - **GPU-driven networking, built from scratch.** Directly implement communication over Libibverbs (without NCCL/NVSHMEM) for maximal performance.
 
+_mKernel is under active development, including optimizing for larger scale, different GPUs, and network topologies. The goal is to have a library for commonly used multi-node/GPU distributed kernels._
+
 ## Roadmap
 - ✅ Fused, GPU-driven multi-node kernels
 - ✅ Add CX7 and EFA backend
