@@ -292,10 +292,10 @@ __device__ inline void intra_comm_sm(const globals& G) {
 // for L2 locality. Keeping local and remote phases separate gives RDMA more
 // time to complete before remote tile consumption.
 //
-// Encoding: total_local_tiles = half_row_blocks*col_blocks.
-//   task_id < total_local_tiles           → local tile at flat=task_id
-//   task_id >= total_local_tiles          → remote tile at flat=task_id - total
-// flat then indexes the (half_row_blocks × col_blocks) grid under SUPER_M.
+// `task_id` is logical, not global-shard ordered: shard_step=0 maps to this
+// node's local shard on every node, then later shard_steps walk remote shards.
+// This avoids node_idx>0 consuming remote tiles first and stalling on RDMA
+// before doing independent local GEMM work.
 
 __device__ inline comp_task decode_comp_task(int task_id,
                                              int super_rows,
@@ -320,6 +320,12 @@ __device__ inline comp_task decode_comp_task(int task_id,
         t.col_idx = rem / fr_safe;
     }
     return t;
+}
+
+__device__ __forceinline__ int ag_gemm_shard_rank_for_step(
+    int node_idx, int num_nodes, int shard_step
+) {
+    return (node_idx + shard_step) % num_nodes;
 }
 
 // ============================================================================
@@ -386,8 +392,10 @@ __device__ inline void fused_comp_sm(const globals& G) {
         if (warp_id == 0 && lane_id == 0) {
             // TMA load warp — CTA-stride over super-tile-swizzled tiles
             for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
-                const int shard_rank = task_id / num_node_blocks;
-                const int shard_task_id = task_id - shard_rank * num_node_blocks;
+                const int shard_step = task_id / num_node_blocks;
+                const int shard_rank = ag_gemm_shard_rank_for_step(
+                    G.node_idx, G.num_nodes, shard_step);
+                const int shard_task_id = task_id - shard_step * num_node_blocks;
                 const comp_task t = decode_comp_task(
                     shard_task_id, super_rows, final_rows, super_blocks, col_blocks,
                     num_node_blocks);
@@ -468,8 +476,10 @@ __device__ inline void fused_comp_sm(const globals& G) {
             // TMA store warp — same super-tile-swizzled task order as loader
             for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
                 const unsigned long long trace_start = ag_gemm_globaltimer();
-                const int shard_rank = task_id / num_node_blocks;
-                const int shard_task_id = task_id - shard_rank * num_node_blocks;
+                const int shard_step = task_id / num_node_blocks;
+                const int shard_rank = ag_gemm_shard_rank_for_step(
+                    G.node_idx, G.num_nodes, shard_step);
+                const int shard_task_id = task_id - shard_step * num_node_blocks;
                 const comp_task t = decode_comp_task(
                     shard_task_id, super_rows, final_rows, super_blocks, col_blocks,
                     num_node_blocks);
@@ -500,7 +510,9 @@ __device__ inline void fused_comp_sm(const globals& G) {
         warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
 
         for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
-            const int shard_rank = task_id / num_node_blocks;
+            const int shard_step = task_id / num_node_blocks;
+            const int shard_rank = ag_gemm_shard_rank_for_step(
+                G.node_idx, G.num_nodes, shard_step);
             if (shard_rank != G.node_idx && G.debug_skip_remote_compute != 0) {
                 continue;
             }

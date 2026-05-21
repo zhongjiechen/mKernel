@@ -104,6 +104,15 @@ def poll_tuning(m: int) -> tuple[int, int]:
 
 def median_then_max_cuda(samples):
     median = sorted(float(x) for x in samples)[len(samples) // 2]
+    if os.environ.get("MKERNEL_BENCH_DUMP_RANK_MS") == "1":
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, {
+            "rank": dist.get_rank(),
+            "ms": median,
+            "host": os.uname().nodename,
+        })
+        if dist.get_rank() == 0:
+            print(f"[gemm_rs-rank-ms] {gathered}", flush=True)
     t = torch.tensor([median], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())

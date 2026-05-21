@@ -508,6 +508,16 @@ __device__ inline unsigned long long gemm_rs_globaltimer() {
 }
 
 template <typename G>
+__device__ inline bool gemm_rs_activity_enabled(const G& Gv) {
+    return Gv.activity_buf != nullptr && Gv.activity_counts != nullptr;
+}
+
+template <typename G>
+__device__ inline unsigned long long gemm_rs_activity_timestamp(const G& Gv) {
+    return gemm_rs_activity_enabled(Gv) ? gemm_rs_globaltimer() : 0ull;
+}
+
+template <typename G>
 __device__ inline void gemm_rs_record_activity_event(
     const G& Gv, int kind, int work_id,
     unsigned long long start_ns, unsigned long long end_ns

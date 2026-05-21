@@ -155,8 +155,9 @@ elif ((NUM_NODES >= 3)) && [[ "${MKERNEL_CLUSTER_IDLE_CHECK:-}" == "1" ]]; then
 fi
 
 # Python venv with torch installed (EFS-shared, both nodes see this path).
-PY=${PY:-/home/ubuntu/efs/yzhou/uccl/.venv/bin/python3}
-TORCHRUN=${TORCHRUN:-/home/ubuntu/efs/yzhou/uccl/.venv/bin/torchrun}
+# Default to the repo-local release env; callers can still override PY/TORCHRUN.
+PY=${PY:-$RELEASE/ziming/bin/python}
+TORCHRUN=${TORCHRUN:-$RELEASE/ziming/bin/torchrun}
 
 # === Common env propagated to both nodes ===
 COMMON_ENV=(
@@ -321,10 +322,19 @@ run_one_2node() {
     local best_of_env=" MKERNEL_BENCH_BEST_OF_N=${MKERNEL_BENCH_BEST_OF_N:-0}"
     local broker_key="${DIST_BROKER_KEY:-mkernel_${kernel}_${master_port}_${tcp_port_base}}"
     local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port DIST_BROKER_KEY=$broker_key MKERNEL_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
+    local allow_profiler_logging=1
+    if [[ "$MODE" == "bench" && "${MKERNEL_ALLOW_PROFILER_LOGGING:-0}" != "1" ]]; then
+        # Plot-generating benchmark runs should not carry trace/profiler output
+        # from the caller's shell; opt in explicitly for diagnostic runs.
+        allow_profiler_logging=0
+    fi
     # Optional: forward MKERNEL_DUMP_DIAG so the bench scripts can dump
     # per-proxy diagnostics.
-    if [[ -n "${MKERNEL_DUMP_DIAG:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${MKERNEL_DUMP_DIAG:-}" ]]; then
         env_str="$env_str MKERNEL_DUMP_DIAG=$MKERNEL_DUMP_DIAG"
+    fi
+    if [[ "$allow_profiler_logging" == "1" && -n "${MKERNEL_EFA_PROXY_DIAG:-}" ]]; then
+        env_str="$env_str MKERNEL_EFA_PROXY_DIAG=$MKERNEL_EFA_PROXY_DIAG"
     fi
     # No-sync (steady-state) timing is the canonical default. Forward
     # MKERNEL_BENCH_NO_SYNC if explicitly set (back-compat) and
@@ -334,6 +344,9 @@ run_one_2node() {
     fi
     if [[ -n "${MKERNEL_BENCH_LEGACY_SYNC:-}" ]]; then
         env_str="$env_str MKERNEL_BENCH_LEGACY_SYNC=$MKERNEL_BENCH_LEGACY_SYNC"
+    fi
+    if [[ "$allow_profiler_logging" == "1" && -n "${MKERNEL_BENCH_DUMP_RANK_MS:-}" ]]; then
+        env_str="$env_str MKERNEL_BENCH_DUMP_RANK_MS=$MKERNEL_BENCH_DUMP_RANK_MS"
     fi
     if [[ -n "${MKERNEL_GEMM_AR_ITERS:-}" ]]; then
         env_str="$env_str MKERNEL_GEMM_AR_ITERS=$MKERNEL_GEMM_AR_ITERS"
@@ -377,25 +390,25 @@ run_one_2node() {
     if [[ -n "${GEMM_RS_RECV_PROGRESS_SMS:-}" ]]; then
         env_str="$env_str GEMM_RS_RECV_PROGRESS_SMS=$GEMM_RS_RECV_PROGRESS_SMS"
     fi
-    if [[ -n "${GEMM_RS_ACTIVITY_TRACE_OUT:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_RS_ACTIVITY_TRACE_OUT:-}" ]]; then
         env_str="$env_str GEMM_RS_ACTIVITY_TRACE_OUT=$GEMM_RS_ACTIVITY_TRACE_OUT"
     fi
-    if [[ -n "${GEMM_RS_ACTIVITY_TRACE_ALL_RANKS:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_RS_ACTIVITY_TRACE_ALL_RANKS:-}" ]]; then
         env_str="$env_str GEMM_RS_ACTIVITY_TRACE_ALL_RANKS=$GEMM_RS_ACTIVITY_TRACE_ALL_RANKS"
     fi
-    if [[ -n "${GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
         env_str="$env_str GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS=$GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS"
     fi
-    if [[ -n "${GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
         env_str="$env_str GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES=$GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES"
     fi
-    if [[ -n "${GEMM_AR_ACTIVITY_TRACE_OUT:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_AR_ACTIVITY_TRACE_OUT:-}" ]]; then
         env_str="$env_str GEMM_AR_ACTIVITY_TRACE_OUT=$GEMM_AR_ACTIVITY_TRACE_OUT"
     fi
-    if [[ -n "${GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
         env_str="$env_str GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES=$GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES"
     fi
-    if [[ -n "${GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
         env_str="$env_str GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS=$GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS"
     fi
     if [[ -n "${AG_GEMM_INTERNODE_COLLECTIVE:-}" ]]; then
@@ -449,16 +462,16 @@ run_one_2node() {
     if [[ -n "${AG1_ADAPTIVE_COMM_SMS:-}" ]]; then
         env_str="$env_str AG1_ADAPTIVE_COMM_SMS=$AG1_ADAPTIVE_COMM_SMS"
     fi
-    if [[ -n "${AG_GEMM_ACTIVITY_TRACE_OUT:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${AG_GEMM_ACTIVITY_TRACE_OUT:-}" ]]; then
         env_str="$env_str AG_GEMM_ACTIVITY_TRACE_OUT=$AG_GEMM_ACTIVITY_TRACE_OUT"
     fi
-    if [[ -n "${AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
         env_str="$env_str AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS=$AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS"
     fi
-    if [[ -n "${AG_GEMM_ACTIVITY_TRACE_ALL_RANKS:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${AG_GEMM_ACTIVITY_TRACE_ALL_RANKS:-}" ]]; then
         env_str="$env_str AG_GEMM_ACTIVITY_TRACE_ALL_RANKS=$AG_GEMM_ACTIVITY_TRACE_ALL_RANKS"
     fi
-    if [[ -n "${AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
+    if [[ "$allow_profiler_logging" == "1" && -n "${AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
         env_str="$env_str AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES=$AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES"
     fi
     if [[ -n "${MKERNEL_PREP_EPOCH_FAST:-}" ]]; then

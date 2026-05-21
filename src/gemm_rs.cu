@@ -68,7 +68,8 @@ __device__ inline void compute_tile_impl(
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
         } else if (w_id == 1 && l_id == 0) {
-            const unsigned long long trace_start = gemm_rs_globaltimer();
+            const unsigned long long trace_start =
+                gemm_rs_activity_timestamp(Gv);
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
             update_phasebit<0>(phasebits, 0);
             #pragma unroll
@@ -93,12 +94,11 @@ __device__ inline void compute_tile_impl(
                 }
             }
             tma::store_async_read_wait();
-            __threadfence_system();
             signal_ready(Gv.ready, ready_idx);
             arrive(outputs_finished);
             gemm_rs_record_activity_event(
                 Gv, fused_globals::ACTIVITY_COMPUTE, ready_idx,
-                trace_start, gemm_rs_globaltimer());
+                trace_start, gemm_rs_activity_timestamp(Gv));
         }
     } else {
         rt_fl<G::ROW_BLOCK / 8, G::COL_BLOCK> C_accum;
@@ -247,7 +247,7 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
     __shared__ int shared_found_idx;
     while (posted < my_chunks_total) {
         const unsigned long long wait_start = (threadIdx.x == 0)
-            ? gemm_rs_globaltimer() : 0ull;
+            ? gemm_rs_activity_timestamp(I) : 0ull;
         if (threadIdx.x == 0) {
             shared_found_idx = -1;
             const int queue_words = gemm_rs_send_ready_bitmap_words_per_queue(
@@ -300,8 +300,9 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
         if (threadIdx.x == 0) {
             gemm_rs_record_activity_event(
                 I, fused_globals::ACTIVITY_INTER_SEND_WAIT, global_chunk_id,
-                wait_start, gemm_rs_globaltimer());
-            const unsigned long long push_start = gemm_rs_globaltimer();
+                wait_start, gemm_rs_activity_timestamp(I));
+            const unsigned long long push_start =
+                gemm_rs_activity_timestamp(I);
             if (Rt.use_incremental_peer_reduce != 0) {
                 __threadfence_system();
             }
@@ -348,7 +349,7 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
             }
             gemm_rs_record_activity_event(
                 I, fused_globals::ACTIVITY_INTER_SEND_PUSH, global_chunk_id,
-                push_start, gemm_rs_globaltimer());
+                push_start, gemm_rs_activity_timestamp(I));
         }
         __syncthreads();
         posted++;
@@ -451,7 +452,8 @@ __device__ inline void gemm_rs_recv_progress_loop(
     const G &Gv, int progress_id, int progress_stride, int total_chunks
 ) {
     auto &Rt = *Gv.rt;
-    const unsigned long long start = (threadIdx.x == 0) ? gemm_rs_globaltimer() : 0ull;
+    const unsigned long long start = (threadIdx.x == 0)
+        ? gemm_rs_activity_timestamp(Gv.intra) : 0ull;
     if (threadIdx.x == 0) {
         const int done_target = Rt.use_receiver_owner_rs != 0
             ? Rt.owner_chunks_total : total_chunks;
@@ -464,7 +466,7 @@ __device__ inline void gemm_rs_recv_progress_loop(
     if (threadIdx.x == 0) {
         gemm_rs_record_activity_event(
             Gv.intra, fused_globals::ACTIVITY_INTER_RECV_PROGRESS, progress_id,
-            start, gemm_rs_globaltimer());
+            start, gemm_rs_activity_timestamp(Gv.intra));
     }
 }
 
@@ -572,7 +574,7 @@ __device__ inline bool gemm_rs_process_peer_accum_work(
     const int col_elem = vec_lane * ELEMS_PER_VEC;
 
     const unsigned long long accum_start = (threadIdx.x == 0)
-        ? gemm_rs_globaltimer() : 0ull;
+        ? gemm_rs_activity_timestamp(Gv.intra) : 0ull;
     const int single_peer_tiles = row_blocks_per_dev * col_blocks;
     for (int ti = 0; ti < cols_this_chunk; ++ti) {
         for (int r = row_lane; r < G::ROW_BLOCK; r += ROWS_PER_WAVE) {
@@ -609,7 +611,7 @@ __device__ inline bool gemm_rs_process_peer_accum_work(
     if (threadIdx.x == 0) {
         gemm_rs_record_activity_event(
             Gv.intra, fused_globals::ACTIVITY_INTER_PEER_ACCUM, chunk_id,
-            accum_start, gemm_rs_globaltimer());
+            accum_start, gemm_rs_activity_timestamp(Gv.intra));
         __threadfence_system();
         gemm_rs_release_store_u32(Rt.chunk_accum_lock + chunk_id, 0u);
         const uint32_t done =
@@ -725,7 +727,8 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
         if (Rt.use_incremental_peer_reduce != 0) {
             while (true) {
                 if (threadIdx.x == 0) {
-                    _ws_red_wait_start = gemm_rs_globaltimer();
+                    _ws_red_wait_start =
+                        gemm_rs_activity_timestamp(Gv.intra);
                     _ws_red_chunk = -1;
                     gemm_rs_recv_progress_once<G>(Rt, 0, 1);
                     const int ready_chunk = gemm_rs_ready_reduce_queue_pop<G>(Rt);
@@ -744,7 +747,7 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
                 __syncthreads();
             }
         } else if (threadIdx.x == 0) {
-            _ws_red_wait_start = gemm_rs_globaltimer();
+            _ws_red_wait_start = gemm_rs_activity_timestamp(Gv.intra);
             if (Rt.use_ready_reduce_queue != 0) {
                 _ws_red_chunk = -1;
                 while (_ws_red_chunk < 0) {
@@ -820,7 +823,7 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
         if (threadIdx.x == 0) {
             gemm_rs_record_activity_event(
                 Gv.intra, fused_globals::ACTIVITY_INTER_REDUCE_WAIT, chunk_id,
-                wait_start, gemm_rs_globaltimer());
+                wait_start, gemm_rs_activity_timestamp(Gv.intra));
         }
 
         constexpr int ELEMS_PER_VEC = 8;
@@ -831,7 +834,7 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
         const int col_elem = vec_lane * ELEMS_PER_VEC;
 
         const unsigned long long accum_start = (threadIdx.x == 0)
-            ? gemm_rs_globaltimer() : 0ull;
+            ? gemm_rs_activity_timestamp(Gv.intra) : 0ull;
         for (int ti = 0; ti < cols_this_chunk; ++ti) {
             for (int r = row_lane; r < G::ROW_BLOCK; r += ROWS_PER_WAVE) {
                 const int si = (rb * G::ROW_BLOCK + r) * Rt.N
@@ -873,7 +876,7 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
         if (threadIdx.x == 0) {
             gemm_rs_record_activity_event(
                 Gv.intra, fused_globals::ACTIVITY_INTER_REDUCE_ACCUM, chunk_id,
-                accum_start, gemm_rs_globaltimer());
+                accum_start, gemm_rs_activity_timestamp(Gv.intra));
             if (Rt.use_ready_reduce_queue != 0) {
                 atomicAdd(Rt.chunks_processed, 1u);
             }
@@ -940,7 +943,6 @@ __device__ inline void fused_kernel(const fused_globals &G) {
                                               inputs, outputs, inputs_arrived, inputs_finished,
                                               outputs_arrived, outputs_finished, stage, phasebits,
                                               row_blocks, col_blocks, num_iters);
-            __syncthreads();
             // Compute-side chunk-ready signal. When this GPU finishes all
             // tiles in a chunk, emit a "I'm done contributing" edge so the
             // owner's send CTA knows this GPU's partials have landed in

@@ -52,6 +52,15 @@ SMS_PER_SHAPE = {4096: 8, 6144: 8, 8192: 8, 12288: 8, 16384: 8,
 def avg_then_max_cuda(samples):
     # Median-then-max for robustness against outlier iters (matches gemm_rs).
     median = sorted(float(x) for x in samples)[len(samples) // 2]
+    if os.environ.get("MKERNEL_BENCH_DUMP_RANK_MS") == "1":
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, {
+            "rank": dist.get_rank(),
+            "ms": median,
+            "host": os.uname().nodename,
+        })
+        if dist.get_rank() == 0:
+            print(f"[ag_gemm-rank-ms] {gathered}", flush=True)
     t = torch.tensor([median], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
@@ -142,8 +151,11 @@ def main():
         M_node = M // NUM_NODES
         M_local = M_node // world_size
         assert M % ROW_BLOCK == 0 and K % RED_BLOCK == 0 and N % COL_BLOCK == 0
-        if os.environ.get("AG_GEMM_TILED_DIRECT") == "1":
+        tiled_direct_enabled = os.environ.get("AG_GEMM_TILED_DIRECT") == "1"
+        if tiled_direct_enabled:
             os.environ["AG_GEMM_ROW_STRIDE_BYTES"] = str(K * 2)
+        else:
+            os.environ.pop("AG_GEMM_ROW_STRIDE_BYTES", None)
 
         ic = os.environ.get("AG_GEMM_INTERNODE_COLLECTIVE", "").strip().lower()
         if ic == "direct":

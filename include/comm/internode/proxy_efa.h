@@ -1043,7 +1043,8 @@ private:
             }
         }
 
-        if (diag_total_loops_ > 0) {
+        const char* diag_env = std::getenv("MKERNEL_EFA_PROXY_DIAG");
+        if (diag_total_loops_ > 0 && diag_env != nullptr && diag_env[0] == '1') {
             double avg_batch = diag_post_calls_ > 0
                 ? static_cast<double>(diag_total_cmds_) / static_cast<double>(diag_post_calls_)
                 : 0.0;

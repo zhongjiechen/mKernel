@@ -55,12 +55,21 @@ DEFAULT_SHAPES = (
 # (n=6, σ=0.005/0.007, σ-overlap 0.72, statistically separated). At small M
 # there isn't much intra-AR work to parallelize, so freeing those CTAs to the
 # compute role is the win.
-INTRA_OVERRIDE_AR = {2048: 4}
+INTRA_OVERRIDE_AR = {2048: 4, 32768: 24}
 
 
 def median_then_max_cuda(samples):
     sorted_samples = sorted(float(x) for x in samples)
     median = sorted_samples[len(sorted_samples) // 2]
+    if os.environ.get("MKERNEL_BENCH_DUMP_RANK_MS") == "1":
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, {
+            "rank": dist.get_rank(),
+            "ms": median,
+            "host": os.uname().nodename,
+        })
+        if dist.get_rank() == 0:
+            print(f"[gemm_ar-rank-ms] {gathered}", flush=True)
     t = torch.tensor([median], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
