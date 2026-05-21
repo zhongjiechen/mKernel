@@ -20,7 +20,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
+from common import (  # noqa: E402
+    check_close,
+    compare_named_results,
+    get_peer_ips,
+    get_peer_ports,
+)
 
 KERNEL_NAME = "gemm_rs"
 from common import get_num_nodes  # noqa: E402
@@ -28,8 +33,15 @@ NUM_NODES = get_num_nodes()
 ROW_BLOCK = 128
 COL_BLOCK = 256
 
-# Sweep matches the bar chart (5 shapes; M=N=base_n, K=base_n/world_size = base_n/16).
-DEFAULT_SHAPES = [2048, 4096, 8192, 16384, 32768]
+# Sweep matches the 2-node bar chart. On N>2, scale M=N so
+# K=M/(NUM_NODES*8) preserves the same aligned K values.
+DEFAULT_SHAPES = (
+    [3072, 6144, 12288, 24576, 49152]
+    if NUM_NODES == 3 else
+    [4096, 8192, 16384, 32768, 65536]
+    if NUM_NODES == 4 else
+    [2048, 4096, 8192, 16384, 32768]
+)
 # Note: M=65536 is in published bar chart but requires GEMM_RS_SEND_READY_BITMAP+FUSE_COMPUTE_INTRA
 # which hangs on this hardware. Excluded from default sweep.
 
@@ -48,10 +60,40 @@ SM_SPLIT = {
     16384: (120, 0, 4,  8,  4),
     32768: (120, 0, 4,  8,  8),
     65536: (124, 0, 2,  6,  32),
+    # H200x3 shapes. M=24576 benefits from smaller RDMA chunks; small shapes
+    # regressed correctness with chunk_tiles=2, and larger M overfills QPs.
+    6144:  (116, 0, 8,  8,  4),
+    12288: (118, 0, 6,  8,  4),
+    24576: (120, 0, 4,  8,  2),
+    49152: (120, 0, 4,  8,  4),
 }
 
 
+def split_for_shape(m: int) -> tuple[int, int, int, int, int]:
+    split = SM_SPLIT.get(m, (118, 0, 6, 8, 4))
+    if NUM_NODES == 4 and m == 4096 and "GEMM_RS_SPLIT" not in os.environ:
+        split = (116, 0, 8, 8, 2)
+    override = os.environ.get("GEMM_RS_SPLIT")
+    if override:
+        parts = [int(x) for x in override.replace(":", ",").split(",") if x.strip()]
+        if len(parts) != 5:
+            raise ValueError(
+                "GEMM_RS_SPLIT must be comp,intra,send,reduce,chunk_tiles"
+            )
+        split = tuple(parts)
+
+    n_comp, n_intra, n_send, n_reduce, chunk_tiles = split
+    n_comp = int(os.environ.get("GEMM_RS_NUM_COMP_SMS", n_comp))
+    n_intra = int(os.environ.get("GEMM_RS_NUM_INTRA_COMM_SMS", n_intra))
+    n_send = int(os.environ.get("GEMM_RS_NUM_SEND_SMS", n_send))
+    n_reduce = int(os.environ.get("GEMM_RS_NUM_REDUCE_SMS", n_reduce))
+    chunk_tiles = int(os.environ.get("GEMM_RS_CHUNK_TILES", chunk_tiles))
+    return n_comp, n_intra, n_send, n_reduce, chunk_tiles
+
+
 def poll_tuning(m: int) -> tuple[int, int]:
+    if NUM_NODES > 2:
+        return (1, 100)
     # Relaxed poll across all shapes. Acquire polling (`use_acquire_poll=1`)
     # was historically enabled at M=4096 under per-iter-sync timing; under the
     # canonical no-sync methodology it costs ~50 µs/iter and amplifies a
@@ -62,7 +104,16 @@ def poll_tuning(m: int) -> tuple[int, int]:
 
 def median_then_max_cuda(samples):
     median = sorted(float(x) for x in samples)[len(samples) // 2]
-    t = torch.tensor([median], device="cuda")
+    if os.environ.get("MKERNEL_BENCH_DUMP_RANK_MS") == "1":
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, {
+            "rank": dist.get_rank(),
+            "ms": median,
+            "host": os.uname().nodename,
+        })
+        if dist.get_rank() == 0:
+            print(f"[gemm_rs-rank-ms] {gathered}", flush=True)
+    t = torch.tensor([median], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
@@ -86,10 +137,22 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ["WORLD_SIZE"]))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    dist_backend = os.environ.get("MKERNEL_DIST_BACKEND", "nccl")
+    if dist_backend == "nccl":
+        dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    else:
+        dist.init_process_group(dist_backend)
 
     node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
     is_chief = (local_rank == 0 and node_idx == 0)
+    node_groups = [
+        dist.new_group([node * world_size + lr for lr in range(world_size)])
+        for node in range(NUM_NODES)
+    ]
+    same_local_rank_groups = [
+        dist.new_group([node * world_size + lr for node in range(NUM_NODES)])
+        for lr in range(world_size)
+    ]
 
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
@@ -107,15 +170,17 @@ def main():
     global_gpu_idx = node_idx * world_size + local_rank
 
     result_sizes, result_fused = [], []
+    correctness_ok = True
 
     for m in shapes:
         n = m
         k = m // (NUM_NODES * world_size)
         m_local = m // world_size  # each rank owns M/8 rows after intra-RS
 
-        n_comp, n_intra, n_send, n_reduce, chunk_tiles = SM_SPLIT.get(
-            m, (118, 0, 6, 8, 4))
+        n_comp, n_intra, n_send, n_reduce, chunk_tiles = split_for_shape(m)
         # team_v8 sweep override: MKERNEL_GEMM_RS_SPLIT_<M>="comp,intra,send,reduce,ct"
+        # Layered on top of split_for_shape so per-shape env wins over the
+        # global GEMM_RS_SPLIT / GEMM_RS_NUM_*_SMS knobs handled there.
         _ovr = os.environ.get(f"MKERNEL_GEMM_RS_SPLIT_{m}")
         if _ovr:
             _vals = [int(x) for x in _ovr.split(",")]
@@ -126,7 +191,6 @@ def main():
             print(f"\n[gemm_rs] M={m} K={k} N={n} m_local={m_local} "
                   f"split=({n_comp},{n_intra},{n_send},{n_reduce}) ct={chunk_tiles}",
                   flush=True)
-        print(f"[gemm_rs] node{node_idx}/lr{local_rank} alloc start", flush=True)
 
         torch.manual_seed(42 + global_gpu_idx)
         torch.cuda.manual_seed(42 + global_gpu_idx)
@@ -188,7 +252,6 @@ def main():
             fifo_cap *= 2
 
         dist.barrier()
-        print(f"[gemm_rs] node{node_idx}/lr{local_rank} pre create_session peer={peer_ip}:{tcp_port}", flush=True)
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
@@ -197,7 +260,6 @@ def main():
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
-        print(f"[gemm_rs] node{node_idx}/lr{local_rank} post create_session", flush=True)
         fifo = mod.get_fifo_handles()
         arrival_ptr = mod.get_arrival_flags_ptr()
         recv_ptr = mod.get_recv_buf_ptr()
@@ -212,6 +274,18 @@ def main():
             workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
             barrier.data_.zero_(); ready_chunk.data_.zero_()
             staging_dbuf.data_.zero_()
+            if NUM_NODES > 2 and hasattr(mod, "zero_recv_buf"):
+                mod.zero_recv_buf()
+
+        def advance_epoch(next_epoch: int):
+            # Queue-mode arrivals carry packed work, not an epoch value. Keep
+            # all nodes quiesced before any rank clears arrival slots.
+            if NUM_NODES > 2 and hasattr(mod, "prepare_epoch"):
+                mod.prepare_epoch()
+                dist.barrier()
+                mod.commit_epoch(next_epoch)
+            else:
+                mod.set_epoch(next_epoch)
 
         def run_once():
             mod.gemm_rs_fused(
@@ -226,12 +300,23 @@ def main():
                 num_nodes=NUM_NODES,
             )
 
+        def start_iter():
+            nonlocal epoch
+            if NUM_NODES > 2 and hasattr(mod, "prepare_epoch"):
+                epoch += 1
+                advance_epoch(epoch)
+                reset_state()
+            else:
+                # Match the original 2-node no-sync benchmark ordering: clear
+                # local state before publishing the next epoch to the session.
+                reset_state()
+                epoch += 1
+                advance_epoch(epoch)
+
         for wi in range(args.warmup):
-            reset_state(); epoch += 1; mod.set_epoch(epoch)
+            start_iter()
             dist.barrier(); time.sleep(0.1)
-            print(f"[gemm_rs] node{node_idx}/lr{local_rank} warmup{wi} pre-launch", flush=True)
             run_once(); torch.cuda.synchronize()
-            print(f"[gemm_rs] node{node_idx}/lr{local_rank} warmup{wi} done", flush=True)
             dist.barrier()
 
         samples = []
@@ -241,6 +326,10 @@ def main():
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
             legacy_sync = True
+        if NUM_NODES > 2 and os.environ.get("MKERNEL_ALLOW_NOSYNC_NGT2") != "1":
+            if not legacy_sync and is_chief:
+                print("[gemm_rs] forcing legacy-sync timing for NUM_NODES > 2", flush=True)
+            legacy_sync = True
         if not legacy_sync:
             # No-sync (steady-state): per-iter reset_state + epoch bump (which
             # internally syncs the proxy-side via set_epoch) but skip the
@@ -249,7 +338,7 @@ def main():
             # gemm_ar's GEMM_AR_STEADY_STATE_BENCH path).
             samples_pairs = []
             for _ in range(args.iters):
-                reset_state(); epoch += 1; mod.set_epoch(epoch)
+                start_iter()
                 # NO dist.barrier + sleep here — that's the sync this fix removes.
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
@@ -263,7 +352,7 @@ def main():
                       flush=True)
         else:
             for _ in range(args.iters):
-                reset_state(); epoch += 1; mod.set_epoch(epoch)
+                start_iter()
                 dist.barrier(); time.sleep(0.05)
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
@@ -274,6 +363,97 @@ def main():
         wall_ms = median_then_max_cuda(samples)
         if is_chief:
             print(f"[gemm_rs] M={m} wall={wall_ms:.3f} ms", flush=True)
+        if args.mode == "check":
+            C_ref = None
+            for target_lr in range(world_size):
+                row_lo = target_lr * m_local
+                row_hi = row_lo + m_local
+                # Mirror the kernel topology: first reduce this row slice across
+                # all 8 local GPUs in the node, then reduce the owning local-rank
+                # slice across nodes.
+                ref_slice = torch.matmul(A[row_lo:row_hi], B).cpu()
+                dist.all_reduce(
+                    ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
+                )
+                if local_rank == target_lr:
+                    node_refs = [torch.empty_like(ref_slice) for _ in range(NUM_NODES)]
+                    dist.all_gather(
+                        node_refs, ref_slice,
+                        group=same_local_rank_groups[target_lr],
+                    )
+                    C_ref = node_refs[0]
+                    for node_ref in node_refs[1:]:
+                        C_ref = C_ref + node_ref
+                    if os.environ.get("GEMM_RS_RECEIVER_OWNER_RS", "0") == "1":
+                        # Receiver-owner RS: each tile chunk is owned by exactly
+                        # one node, so this rank's output buffer contains only
+                        # chunks where chunk_id % NUM_NODES == node_idx.
+                        sparse_ref = torch.zeros_like(C_ref)
+                        chunks_per_row = (n // COL_BLOCK + chunk_tiles - 1) // chunk_tiles
+                        for rb in range(m_local // ROW_BLOCK):
+                            row_lo2 = rb * ROW_BLOCK
+                            row_hi2 = row_lo2 + ROW_BLOCK
+                            for ci in range(chunks_per_row):
+                                chunk_id = rb * chunks_per_row + ci
+                                if chunk_id % NUM_NODES != node_idx:
+                                    continue
+                                col_lo = ci * chunk_tiles * COL_BLOCK
+                                col_hi = min(n, col_lo + chunk_tiles * COL_BLOCK)
+                                sparse_ref[row_lo2:row_hi2, col_lo:col_hi] = \
+                                    C_ref[row_lo2:row_hi2, col_lo:col_hi]
+                        C_ref = sparse_ref
+                    if os.environ.get("GEMM_RS_DEBUG_REF", "0") == "1":
+                        obs = output.data_.float()
+                        combos = []
+                        for mask in range(1, 1 << NUM_NODES):
+                            ref = None
+                            label_parts = []
+                            for ref_node, node_ref in enumerate(node_refs):
+                                if mask & (1 << ref_node):
+                                    label_parts.append(str(ref_node))
+                                    ref = node_ref if ref is None else ref + node_ref
+                            diff = (obs - ref.to("cuda").float()).abs().max().item()
+                            combos.append(("+".join(label_parts), diff))
+                        combos_s = " ".join(
+                            f"{label}:{diff:.4f}" for label, diff in combos
+                        )
+                        print(
+                            f"[gemm_rs-refdiag] rank={rank} node={node_idx} "
+                            f"lr={local_rank} {combos_s}",
+                            flush=True,
+                        )
+                        sparse_obs = output.data_.float()
+                        sparse_exp = C_ref.to("cuda").float()
+                        sparse_diff = (sparse_obs - sparse_exp).abs()
+                        if sparse_diff.numel() and float(sparse_diff.max().item()) > 0.75:
+                            flat_idx = int(sparse_diff.argmax().item())
+                            dbg_row = flat_idx // n
+                            dbg_col = flat_idx - dbg_row * n
+                            dbg_rb = dbg_row // ROW_BLOCK
+                            dbg_ci = (dbg_col // COL_BLOCK) // chunk_tiles
+                            dbg_chunk = dbg_rb * chunks_per_row + dbg_ci
+                            comps = [
+                                float(node_ref[dbg_row, dbg_col].item())
+                                for node_ref in node_refs
+                            ]
+                            print(
+                                f"[gemm_rs-sparse-refdiag] rank={rank} node={node_idx} "
+                                f"lr={local_rank} idx=({dbg_row},{dbg_col}) "
+                                f"chunk={dbg_chunk} owner={dbg_chunk % NUM_NODES} "
+                                f"obs={float(sparse_obs[dbg_row, dbg_col].item()):.6f} "
+                                f"exp={float(sparse_exp[dbg_row, dbg_col].item()):.6f} "
+                                f"components={','.join(f'{x:.6f}' for x in comps)}",
+                                flush=True,
+                            )
+            # Only the destination local-rank owns this reduce-scatter shard.
+            # Non-owners still participate in the distributed check_close()
+            # collective, but compare against themselves so only owner ranks
+            # determine the global correctness result.
+            if C_ref is None:
+                C_ref = output.data_
+            correctness_ok = check_close(
+                f"gemm_rs M={m}", output.data_, C_ref, atol=0.75, rtol=0.15
+            ) and correctness_ok
         result_sizes.append(f"M={m}")
         result_fused.append(wall_ms)
 
@@ -282,14 +462,18 @@ def main():
         from common import write_results_json
         write_results_json(Path(args.save_json), "gemm_rs",
                            result_sizes, result_fused,
-                           note=f"release gemm_rs bench (world={world_size*NUM_NODES})")
+                           note=f"release gemm_rs bench timing={'legacy_sync' if legacy_sync else 'steady_state'} world={world_size*NUM_NODES}")
         print(f"[gemm_rs] wrote {args.save_json}", flush=True)
 
     if is_chief and args.compare_to:
         ok = compare_named_results("gemm_rs", result_sizes, result_fused, args.compare_to)
+        ok = ok and correctness_ok
         dist.destroy_process_group()
         if not ok: return 1
         return 0
+    if not correctness_ok:
+        dist.destroy_process_group()
+        return 1
 
     dist.destroy_process_group()
     return 0

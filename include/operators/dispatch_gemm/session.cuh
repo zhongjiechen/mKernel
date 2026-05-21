@@ -60,8 +60,15 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     // Round 24 (dispatch_gemm cross-kernel port from gemm_ar round 13 / ag_gemm round 23):
     // multi-QP lets the proxy post WRs in parallel.
     cfg.num_qps = 4;
+    const char* channelize_env = std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS");
+    if (cfg.num_peers > 1 && channelize_env != nullptr && std::atoi(channelize_env) != 0) {
+        cfg.num_qps = std::min(internode::kMaxQPs, cfg.num_peers * 8);
+        cfg.channelize_gpu_peers = true;
+    }
     if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
-        cfg.num_qps = std::atoi(env_num_qps);
+        cfg.num_qps = cfg.channelize_gpu_peers
+            ? std::max(cfg.num_qps, std::atoi(env_num_qps))
+            : std::atoi(env_num_qps);
     }
     // Allow override of CPU proxy thread count (default = max(1,num_rails)=2).
     // More threads parallelize ibv_post_send across QP slices.

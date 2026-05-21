@@ -58,102 +58,230 @@ __device__ inline void intra_comm_sm(const globals& G) {
 
         // ========== Phase 1: sender-side intra-AG ==========
         // Gather own M_local shard from A[dev_idx] into A (multicast).
-        for (int task_id = comm_sm_id * globals::NUM_COMM_CHUNKS + warp_id;
-             task_id < num_local_blocks;
-             task_id += G.num_intra_comm * globals::NUM_COMM_CHUNKS) {
+        if (G.debug_skip_phase1 == 0) {
+            for (int task_id = comm_sm_id * globals::NUM_COMM_CHUNKS + warp_id;
+                 task_id < num_local_blocks;
+                 task_id += G.num_intra_comm * globals::NUM_COMM_CHUNKS) {
 
-            const int row_idx = task_id / col_blocks;
-            const int global_row_idx = row_idx + G.dev_idx * local_row_blocks;
-            const int col_idx = task_id % col_blocks;
+                const unsigned long long trace_start = ag_gemm_globaltimer();
+                const int row_idx = task_id / col_blocks;
+                const int global_row_idx = row_idx + G.dev_idx * local_row_blocks;
+                const int col_idx = task_id % col_blocks;
 
-            tma::expect_bytes(inputs_arrived[warp_id], sizeof(globals::A_comm_tile));
-            tma::load_async(A_smem[warp_id], G.A[G.dev_idx], {global_row_idx, col_idx},
-                            inputs_arrived[warp_id]);
+                tma::expect_bytes(inputs_arrived[warp_id], sizeof(globals::A_comm_tile));
+                tma::load_async(A_smem[warp_id], G.A[G.dev_idx], {global_row_idx, col_idx},
+                                inputs_arrived[warp_id]);
 
-            wait(inputs_arrived[warp_id], get_phasebit<0>(phasebits, warp_id));
-            update_phasebit<0>(phasebits, warp_id);
-            tma::store_async(G.A, A_smem[warp_id], {global_row_idx, col_idx});
-            tma::store_async_wait();
+                wait(inputs_arrived[warp_id], get_phasebit<0>(phasebits, warp_id));
+                update_phasebit<0>(phasebits, warp_id);
+                tma::store_async(G.A, A_smem[warp_id], {global_row_idx, col_idx});
+                tma::store_async_wait();
 
-            // Plane 0 [row,col]: per-K-strip, count=1. Compute waits per red_idx
-            // so it can stream tiles as cols arrive, not per whole row block.
-            // Per-(row,col) count is 1 because each task_id is processed by
-            // exactly one intra worker under the round-robin stripe.
-            signal_all(G.barrier, {0, global_row_idx, col_idx}, 1);
-        }
-
-        // ========== Phase 2: receiver-side fan-out (#8) ==========
-        // intra_comm_sm ranks r on the peer node have each RDMA-written their
-        // M_local-row slice of peer A_half into THIS rank's recv_buf at the
-        // corresponding A_half row offset [r*M_local, (r+1)*M_local). Exactly
-        // one rank r's slice landed at each offset; OUR rank r's phase-2
-        // workers fan out OUR slice via multicast into A_recv on all 8 ranks.
-        //
-        // Phase-2 task range mirrors phase-1: same (row_idx, col_idx) grid,
-        // just indexing a different (source, dest) pair:
-        //   source: G.A_recv_local_tensor (recv_buf unicast view, with A_comm_tile desc)
-        //   dest:   G.A_recv    (multicast dbuf; writes fan out to all 8 ranks)
-        // Signal plane 2[global_row_idx, col_idx] with count=1 to unblock
-        // fused_comp_sm's remote-tile wait.
-
-        const int K_val = G.A_recv_local_tensor.cols();
-        const int chunks_per_inter_rb = max(1,
-            (globals::ROW_BLOCK * K_val * (int)sizeof(bf16)) / CHUNK_BYTES);
-
-        for (int task_id = comm_sm_id * globals::NUM_COMM_CHUNKS + warp_id;
-             task_id < num_local_blocks;
-             task_id += G.num_intra_comm * globals::NUM_COMM_CHUNKS) {
-
-            const int row_idx = task_id / col_blocks;
-            const int global_row_idx = row_idx + G.dev_idx * local_row_blocks;
-            const int col_idx = task_id % col_blocks;
-
-            // Wait for the 2 underlying 128-row inter WRs that together fill
-            // this 256-row intra_rb. post_merge_wrs_for_intra_row posts in
-            // 128-row (ROW_BLOCK) rb units; global_row_idx is in 256-row
-            // (ROW_BLOCK*2) units, so the two inter rbs are 2*global_row_idx
-            // and 2*global_row_idx+1.
-            //
-            // Only wait once per intra_rb (on the first col task). Subsequent
-            // col tasks for the same row land after the arrival flag already
-            // cleared so the wait returns immediately, but hoisting is a
-            // cheap correctness safeguard and matches how plane-0 flags on
-            // col=0 already ratchet visibility for later cols.
-            //
-            // #1 streaming: inter-comm pushes per-chunk WRs striped across
-            // 4 QPs. Cross-QP arrival is unordered so poll every chunk flag
-            // in each inter rb. Under the non-streaming path one big WR per
-            // rb sets the first_chunk flag only, so poll just first_chunk.
-            // One intra tile is 256 rows, but RDMA arrivals are tracked in
-            // 128-row blocks, so wait for the lower and upper halves.
-            const int first_chunk_a = (2 * global_row_idx)     * chunks_per_inter_rb;
-            const int first_chunk_b = (2 * global_row_idx + 1) * chunks_per_inter_rb;
-            // Poll the same sub-flags that the sender publishes for this
-            // row block.
-            const int wait_split = 1;
-            const int wait_chunks_per_sub = chunks_per_inter_rb;
-            for (int sw = 0; sw < wait_split; ++sw) {
-                const int ck_a = first_chunk_a + sw * wait_chunks_per_sub;
-                const int ck_b = first_chunk_b + sw * wait_chunks_per_sub;
-                ag_gemm_wait_arrival(G, ck_a);
-                ag_gemm_wait_arrival(G, ck_b);
+                // Plane 0 [row,col]: per-K-strip, count=1. Compute waits per red_idx
+                // so it can stream tiles as cols arrive, not per whole row block.
+                // Per-(row,col) count is 1 because each task_id is processed by
+                // exactly one intra worker under the round-robin stripe.
+                signal_all(G.barrier, {0, global_row_idx, col_idx}, 1);
+                ag_gemm_record_activity_event(
+                    G, globals::ACTIVITY_LOCAL_GATHER, task_id,
+                    trace_start, ag_gemm_globaltimer());
             }
-            __threadfence_system();
-
-            tma::expect_bytes(inputs_arrived[warp_id], sizeof(globals::A_comm_tile));
-            tma::load_async(A_smem[warp_id], G.A_recv_local_tensor, {global_row_idx, col_idx},
-                            inputs_arrived[warp_id]);
-            wait(inputs_arrived[warp_id], get_phasebit<0>(phasebits, warp_id));
-            update_phasebit<0>(phasebits, warp_id);
-            tma::store_async(G.A_recv, A_smem[warp_id], {global_row_idx, col_idx});
-            tma::store_async_wait();
-
-            // Signal plane 2[row, 0] per task: each of col_blocks col tasks
-            // increments the row's slot by 1. Compute waits on slot value
-            // col_blocks for the whole remote row.
-            signal_all(G.barrier, {2, global_row_idx, 0}, 1);
         }
     }
+
+    // Wait until every intra CTA has finished phase-1 multicast gather.
+    // Must run outside the lane_id==0 branch so all threads in this CTA
+    // execute __syncthreads (CUDA requires full-block participation).
+    if (G.debug_skip_phase1_gate == 0 && threadIdx.x == 0) {
+        int* counter = (int*)&G.barrier[G.dev_idx][{0, 1023, 1021}];
+        const int my_arrival = atomicAdd(counter, 1);
+        const int target = ((my_arrival / G.num_intra_comm) + 1) * G.num_intra_comm;
+        while (atomicAdd(counter, 0) < target) {
+            __nanosleep(50);
+        }
+    }
+    __syncthreads();
+
+    if (G.debug_skip_phase2 != 0) {
+        return;
+    }
+
+    // ========== Phase 2: receiver-side fan-out (#8) ==========
+    // intra_comm_sm ranks r on the peer node have each RDMA-written their
+    // M_local-row slice of peer A_half into THIS rank's recv_buf at the
+    // corresponding A_half row offset [r*M_local, (r+1)*M_local). Exactly
+    // one rank r's slice landed at each offset; OUR rank r's phase-2
+    // workers fan out OUR slice via multicast into A_recv on all 8 ranks.
+    //
+    // Phase-2 task range mirrors phase-1: same (row_idx, col_idx) grid,
+    // just indexing a different (source, dest) pair:
+    //   source: G.A_recv_local_tensor (recv_buf unicast view, with A_comm_tile desc)
+    //   dest:   G.A_recv    (multicast dbuf; writes fan out to all 8 ranks)
+    // Signal plane 2[global_row_idx, col_idx] with count=1 to unblock
+    // fused_comp_sm's remote-tile wait.
+
+    const int K_val = G.A_recv_local_tensor.cols();
+    const int chunks_per_inter_rb = max(1,
+        (globals::ROW_BLOCK * K_val * (int)sizeof(bf16)) / CHUNK_BYTES);
+    const int n_peers = G.num_nodes - 1;
+    const int ring_steps = n_peers;
+    const int rows_per_peer_slot = global_row_blocks;
+
+#ifdef AG_GEMM_DEBUG_WAIT_TIMEOUT
+    if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
+        if (blockIdx.x == 0 && warp_id == 0 && lane_id == 0) {
+            printf("AG_STAGE node=%d dev=%d phase1_done epoch=%u mode=%d\n",
+                   G.node_idx, G.dev_idx, G.epoch, G.collective_mode);
+        }
+    }
+#endif
+
+    // Drain every recv_buf peer slot. Ring uses ring_step as hop order
+    // (origin = node - 1 - step); direct uses ring_step as peer_slot
+    // (phase-0 already sent to all peers).
+    for (int ring_step = 0; ring_step < ring_steps; ++ring_step) {
+#ifdef AG_GEMM_DEBUG_WAIT_TIMEOUT
+        if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
+            if (blockIdx.x == 0 && warp_id == 0 && lane_id == 0) {
+                printf("AG_STAGE node=%d dev=%d ring_step=%d begin epoch=%u\n",
+                       G.node_idx, G.dev_idx, ring_step, G.epoch);
+            }
+        }
+#endif
+        const int peer_slot = (G.collective_mode == 1)
+            ? internode::slot_at_peer(
+                ag_gemm_ring_origin_for_step(G.node_idx, G.num_nodes, ring_step),
+                G.node_idx, G.num_nodes)
+            : ring_step;
+        const int origin_rank = (G.collective_mode == 1)
+            ? ag_gemm_ring_origin_for_step(G.node_idx, G.num_nodes, ring_step)
+            : internode::peer_rank_for_slot(G.node_idx, G.num_nodes, peer_slot);
+        const int virt_arrival_slot =
+            (G.collective_mode == 1) ? (peer_slot + n_peers * ring_step) : peer_slot;
+
+        if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
+            for (int task_id = comm_sm_id * globals::NUM_COMM_CHUNKS + warp_id;
+                 task_id < num_local_blocks;
+                 task_id += G.num_intra_comm * globals::NUM_COMM_CHUNKS) {
+
+                const int row_idx = task_id / col_blocks;
+                const int global_row_idx = row_idx + G.dev_idx * local_row_blocks;
+                const int col_idx = task_id % col_blocks;
+                const unsigned long long trace_start = ag_gemm_globaltimer();
+                const int slot_row_store =
+                    peer_slot * rows_per_peer_slot + global_row_idx;
+                const int slot_row_load = slot_row_store +
+                    (G.collective_mode == 1 ? ring_step * (n_peers * rows_per_peer_slot) : 0);
+                const int tiled_tile_idx =
+                    (global_row_idx * col_blocks + col_idx) * 2;
+                const int tiled_recv_row =
+                    (peer_slot * G.total_chunks + tiled_tile_idx) / 2;
+
+                // Wait for the 2 underlying 128-row inter WRs that together fill
+                // this 256-row intra_rb. post_merge_wrs_for_intra_row posts in
+                // 128-row (ROW_BLOCK) rb units; global_row_idx is in 256-row
+                // (ROW_BLOCK*2) units, so the two inter rbs are 2*global_row_idx
+                // and 2*global_row_idx+1.
+                //
+                // Only wait once per intra_rb (on the first col task). Subsequent
+                // col tasks for the same row land after the arrival flag already
+                // cleared so the wait returns immediately, but hoisting is a
+                // cheap correctness safeguard and matches how plane-0 flags on
+                // col=0 already ratchet visibility for later cols.
+                //
+                // #1 streaming: inter-comm pushes per-chunk WRs striped across
+                // 4 QPs. Cross-QP arrival is unordered so poll every chunk flag
+                // in each inter rb. Under the non-streaming path one big WR per
+                // rb sets the first_chunk flag only, so poll just first_chunk.
+                // One intra tile is 256 rows, but RDMA arrivals are tracked in
+                // 128-row blocks, so wait for the lower and upper halves.
+                if (G.tiled_direct != 0) {
+                    ag_gemm_wait_arrival_slot(G, virt_arrival_slot,
+                                              tiled_tile_idx);
+                    ag_gemm_wait_arrival_slot(G, virt_arrival_slot,
+                                              tiled_tile_idx + 1);
+                } else {
+                    const int first_chunk_a = (2 * global_row_idx)     * chunks_per_inter_rb;
+                    const int first_chunk_b = (2 * global_row_idx + 1) * chunks_per_inter_rb;
+                    // Poll the same sub-flags that the sender publishes for this
+                    // row block.
+                    const int wait_split = 1;
+                    const int wait_chunks_per_sub = chunks_per_inter_rb;
+                    for (int sw = 0; sw < wait_split; ++sw) {
+                        const int ck_a = first_chunk_a + sw * wait_chunks_per_sub;
+                        const int ck_b = first_chunk_b + sw * wait_chunks_per_sub;
+                        ag_gemm_wait_arrival_slot(G, virt_arrival_slot, ck_a);
+                        ag_gemm_wait_arrival_slot(G, virt_arrival_slot, ck_b);
+                    }
+                }
+                __threadfence_system();
+
+                tma::expect_bytes(inputs_arrived[warp_id], sizeof(globals::A_comm_tile));
+                if (G.tiled_direct != 0) {
+                    tma::load_async(A_smem[warp_id], G.A_recv_local_tensor,
+                                    {tiled_recv_row, 0}, inputs_arrived[warp_id]);
+                } else {
+                    tma::load_async(A_smem[warp_id], G.A_recv_local_tensor,
+                                    {slot_row_load, col_idx}, inputs_arrived[warp_id]);
+                }
+                wait(inputs_arrived[warp_id], get_phasebit<0>(phasebits, warp_id));
+                update_phasebit<0>(phasebits, warp_id);
+                tma::store_async(G.A_recv, A_smem[warp_id], {slot_row_store, col_idx});
+                tma::store_async_wait();
+                __threadfence_system();
+
+                if (G.remote_ready_per_col != 0) {
+                    // Experimental: signal each republished A k-chunk. Remote
+                    // compute waits on the matching chunk inside its red_idx loop.
+                    signal_all(G.barrier, {2, slot_row_store, col_idx}, 1);
+                } else {
+                    // Default: count all k-chunks at row slot 0; remote compute
+                    // waits for the whole row before consuming it.
+                    signal_all(G.barrier, {2, slot_row_store, 0}, 1);
+                }
+
+                ag_gemm_record_activity_event(
+                    G, globals::ACTIVITY_REMOTE_PUBLISH,
+                    ring_step * num_local_blocks + task_id,
+                    trace_start, ag_gemm_globaltimer());
+            }
+        }
+
+        // Join all warps in this CTA before the ring cross-CTA gate (comm
+        // subset runs TMA above; other warps must not enter that gate first).
+        __syncthreads();
+
+        // Each CTA forwards only the rows it owns after finishing its own
+        // phase-2 task loop. Rows are disjoint in the ring receive bank, so an
+        // unrelated CTA still publishing row Y does not block forwarding row X.
+
+        if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
+            if (G.collective_mode == 1 && G.ring_proxy_forward == 0 &&
+                ring_step + 1 < n_peers) {
+                const int intra_col_blocks =
+                    G.A_recv.cols() / (globals::RED_BLOCK * 2);
+                for (int lr = comm_sm_id; lr < local_row_blocks;
+                     lr += G.num_intra_comm) {
+                    const int global_row_idx = lr + G.dev_idx * local_row_blocks;
+                    const int slot_row_store =
+                        peer_slot * rows_per_peer_slot + global_row_idx;
+                    if (G.remote_ready_per_col != 0) {
+                        for (int c = 0; c < intra_col_blocks; ++c) {
+                            wait(G.barrier, {2, slot_row_store, c}, G.dev_idx, 1);
+                        }
+                    } else {
+                        wait(G.barrier, {2, slot_row_store, 0}, G.dev_idx,
+                             intra_col_blocks);
+                    }
+                    __threadfence_system();
+                    post_ring_forward_wrs_for_intra_row(
+                        G, peer_slot, origin_rank,
+                        global_row_idx, chunks_per_inter_rb, ring_step + 1);
+                }
+            }
+        }
+    }
+
 }
 
 // ============================================================================
@@ -164,10 +292,10 @@ __device__ inline void intra_comm_sm(const globals& G) {
 // for L2 locality. Keeping local and remote phases separate gives RDMA more
 // time to complete before remote tile consumption.
 //
-// Encoding: total_local_tiles = half_row_blocks*col_blocks.
-//   task_id < total_local_tiles           → local tile at flat=task_id
-//   task_id >= total_local_tiles          → remote tile at flat=task_id - total
-// flat then indexes the (half_row_blocks × col_blocks) grid under SUPER_M.
+// `task_id` is logical, not global-shard ordered: shard_step=0 maps to this
+// node's local shard on every node, then later shard_steps walk remote shards.
+// This avoids node_idx>0 consuming remote tiles first and stalling on RDMA
+// before doing independent local GEMM work.
 
 __device__ inline comp_task decode_comp_task(int task_id,
                                              int super_rows,
@@ -194,11 +322,21 @@ __device__ inline comp_task decode_comp_task(int task_id,
     return t;
 }
 
+__device__ __forceinline__ int ag_gemm_shard_rank_for_step(
+    int node_idx, int num_nodes, int shard_step
+) {
+    return (node_idx + shard_step) % num_nodes;
+}
+
 // ============================================================================
 // Comp SM: GEMM on both local and remote halves
 // ============================================================================
 
 __device__ inline void fused_comp_sm(const globals& G) {
+    if (G.debug_skip_compute != 0) {
+        return;
+    }
+
     extern __shared__ int __shm[];
     tma_swizzle_allocator allocator((int*)&__shm[0]);
 
@@ -228,16 +366,16 @@ __device__ inline void fused_comp_sm(const globals& G) {
     int stage = 0;
     uint32_t phasebits = 0xFFFF0000;
 
-    const int half_row_blocks = G.A_local.rows() / globals::ROW_BLOCK;
+    const int node_row_blocks = G.A_local.rows() / globals::ROW_BLOCK;
     const int col_blocks = G.B.cols() / globals::COL_BLOCK;
     const int num_iters = G.A_local.cols() / globals::RED_BLOCK;
 
-    const int super_rows = (half_row_blocks / globals::SUPER_M) * globals::SUPER_M;
-    const int final_rows = half_row_blocks - super_rows;
+    const int super_rows = (node_row_blocks / globals::SUPER_M) * globals::SUPER_M;
+    const int final_rows = node_row_blocks - super_rows;
     const int super_blocks = globals::SUPER_M * col_blocks;
 
-    const int num_local_blocks = half_row_blocks * col_blocks;
-    const int total_blocks = num_local_blocks * 2;  // local + remote
+    const int num_node_blocks = node_row_blocks * col_blocks;
+    const int total_blocks = num_node_blocks * G.num_nodes;
 
     const int K_val = G.A_local.cols();
     const int chunks_per_rb = max(1, (globals::ROW_BLOCK * K_val * (int)sizeof(bf16)) / CHUNK_BYTES);
@@ -254,14 +392,22 @@ __device__ inline void fused_comp_sm(const globals& G) {
         if (warp_id == 0 && lane_id == 0) {
             // TMA load warp — CTA-stride over super-tile-swizzled tiles
             for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
+                const int shard_step = task_id / num_node_blocks;
+                const int shard_rank = ag_gemm_shard_rank_for_step(
+                    G.node_idx, G.num_nodes, shard_step);
+                const int shard_task_id = task_id - shard_step * num_node_blocks;
                 const comp_task t = decode_comp_task(
-                    task_id, super_rows, final_rows, super_blocks, col_blocks,
-                    num_local_blocks);
+                    shard_task_id, super_rows, final_rows, super_blocks, col_blocks,
+                    num_node_blocks);
                 const int rb = t.rb;
                 const int col_idx = t.col_idx;
-                const bool is_remote = t.is_remote;
+                const bool is_remote = (shard_rank != G.node_idx);
+                if (is_remote && G.debug_skip_remote_compute != 0) {
+                    continue;
+                }
                 int row_idx;
-                int shard_rb = 0;
+                int shard_rb = rb;
+                int recv_peer_slot = 0;
 
                 if (!is_remote) {
                     row_idx = rb;
@@ -270,8 +416,9 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     // red_idx/2 since 1 intra col_chunk = 2 compute K-strips).
                     // No coarse per-row wait here for local tiles.
                 } else {
-                    shard_rb = rb;
-                    row_idx = rb;
+                    recv_peer_slot = internode::slot_at_peer(
+                        shard_rank, G.node_idx, G.num_nodes);
+                    row_idx = recv_peer_slot * node_row_blocks + rb;
 
                     // Plan federated-weaving-ocean #8: remote data is now
                     // landed in recv_buf (sharded, rank-local) AND republished
@@ -279,15 +426,14 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     // multicast-backed G.A_recv and waits on plane 2, which
                     // signals once phase-2 has stored the row's tiles.
                     //
-                    // Plane 2 is per-(row,col) count=1 from each of col_blocks
-                    // phase-2 workers per intra_rb. intra_rb = rb / 2 (256-row
-                    // intra tile covers 2 128-row inter rbs). Wait for the WHOLE
-                    // row to be published before consuming any tile. Col-wise
-                    // granularity refinement left for a future iteration.
-                    const int intra_rb = rb / 2;
-                    const int intra_col_blocks = G.A_recv.cols() / (globals::RED_BLOCK * 2);
-                    wait(G.barrier, {2, intra_rb, 0}, G.dev_idx, intra_col_blocks);
-                    __threadfence_system();
+                    if (G.remote_ready_per_col == 0) {
+                        // Plane 2 default is per-row count=col_blocks from all
+                        // phase-2 workers for this intra row.
+                        const int intra_rb = row_idx / 2;
+                        const int intra_col_blocks = G.A_recv.cols() / (globals::RED_BLOCK * 2);
+                        wait(G.barrier, {2, intra_rb, 0}, G.dev_idx, intra_col_blocks);
+                        __threadfence_system();
+                    }
                 }
 
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
@@ -296,6 +442,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     if (!is_remote && (red_idx & 1) == 0) {
                         wait(G.barrier, {0, row_idx / 2, red_idx / 2},
                              G.dev_idx, 1);
+                    }
+                    if (is_remote && G.remote_ready_per_col != 0 && (red_idx & 1) == 0) {
+                        wait(G.barrier, {2, row_idx / 2, red_idx / 2},
+                             G.dev_idx, 1);
+                        __threadfence_system();
                     }
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
@@ -311,7 +462,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
                             // A_recv dbuf after phase-2. Read from this rank's
                             // unicast view (G.A_recv[dev_idx]).
                             tma::load_async(inputs[stage].A[i], G.A_recv[G.dev_idx],
-                                            {shard_rb * 2 + i, red_idx}, inputs_arrived[stage]);
+                                            {(recv_peer_slot * node_row_blocks + shard_rb) * 2 + i, red_idx}, inputs_arrived[stage]);
                         } else {
                             tma::load_async(inputs[stage].A[i], G.A_local,
                                             {row_idx * 2 + i, red_idx}, inputs_arrived[stage]);
@@ -324,17 +475,19 @@ __device__ inline void fused_comp_sm(const globals& G) {
         } else if (warp_id == 1 && lane_id == 0) {
             // TMA store warp — same super-tile-swizzled task order as loader
             for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
+                const unsigned long long trace_start = ag_gemm_globaltimer();
+                const int shard_step = task_id / num_node_blocks;
+                const int shard_rank = ag_gemm_shard_rank_for_step(
+                    G.node_idx, G.num_nodes, shard_step);
+                const int shard_task_id = task_id - shard_step * num_node_blocks;
                 const comp_task t = decode_comp_task(
-                    task_id, super_rows, final_rows, super_blocks, col_blocks,
-                    num_local_blocks);
+                    shard_task_id, super_rows, final_rows, super_blocks, col_blocks,
+                    num_node_blocks);
                 const int rb = t.rb;
                 const int col_idx = t.col_idx;
-                const bool is_remote = t.is_remote;
-                int row_idx;
-                if (!is_remote) {
-                    row_idx = rb + G.node_idx * half_row_blocks;
-                } else {
-                    row_idx = rb + (1 - G.node_idx) * half_row_blocks;
+                const int row_idx = shard_rank * node_row_blocks + rb;
+                if (shard_rank != G.node_idx && G.debug_skip_remote_compute != 0) {
+                    continue;
                 }
 
                 wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
@@ -344,6 +497,12 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     tma::store_async(G.C, outputs.C[i], {row_idx * 2 + i, col_idx});
                 tma::store_async_read_wait();
                 arrive(outputs_finished);
+                ag_gemm_record_activity_event(
+                    G,
+                    shard_rank == G.node_idx
+                        ? globals::ACTIVITY_COMPUTE_LOCAL
+                        : globals::ACTIVITY_COMPUTE_REMOTE,
+                    task_id, trace_start, ag_gemm_globaltimer());
             }
         }
     } else {
@@ -351,6 +510,12 @@ __device__ inline void fused_comp_sm(const globals& G) {
         warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
 
         for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
+            const int shard_step = task_id / num_node_blocks;
+            const int shard_rank = ag_gemm_shard_rank_for_step(
+                G.node_idx, G.num_nodes, shard_step);
+            if (shard_rank != G.node_idx && G.debug_skip_remote_compute != 0) {
+                continue;
+            }
             rt_fl<globals::ROW_BLOCK / 8, globals::COL_BLOCK> C_accum;
             warp::zero(C_accum);
 
@@ -408,6 +573,9 @@ __device__ inline void fused_kernel(const globals& G) {
     // separate CUDA launch. Grid-sync
     // first so no CTA writes 0 to a flag plane while another CTA is still
     // doing primary work that signals it.
+    if (G.debug_skip_reset != 0) {
+        return;
+    }
     grid_sync_at_epoch(G);
     barrier_reset(G);
 }
@@ -415,8 +583,8 @@ __device__ inline void fused_kernel(const globals& G) {
 __device__ inline void barrier_reset(const globals& G) {
     // Plan federated-weaving-ocean #4 + #8: barrier uses two active planes.
     //   plane 0: [row_blocks, col_blocks] per-(row,col), count=1
-    //   plane 2: [row_blocks,          1] per-row,       count=col_blocks_intra
-    //                                                    (#8 phase-2 done)
+    //   plane 2 default: [row_blocks,          1] per-row,       count=num_cols
+    //   plane 2 experiment: [row_blocks, num_cols] per-(row,col), count=1
     // Reset used planes.
     const int num_rows = G.A.rows() / (globals::ROW_BLOCK * 2);
     const int num_cols = G.A.cols() / (globals::RED_BLOCK * 2);
@@ -428,8 +596,16 @@ __device__ inline void barrier_reset(const globals& G) {
         int c = i % num_cols;
         G.barrier[G.dev_idx][{0, r, c}] = 0;
     }
-    for (int i = offset; i < num_rows; i += stride) {
-        G.barrier[G.dev_idx][{2, i, 0}] = 0;
+    const int total_p2 = num_rows * (G.num_nodes - 1) *
+        (G.remote_ready_per_col != 0 ? num_cols : 1);
+    for (int i = offset; i < total_p2; i += stride) {
+        if (G.remote_ready_per_col != 0) {
+            const int r = i / num_cols;
+            const int c = i % num_cols;
+            G.barrier[G.dev_idx][{2, r, c}] = 0;
+        } else {
+            G.barrier[G.dev_idx][{2, i, 0}] = 0;
+        }
     }
     // Iter-end cross-device sync uses a slot outside the active data planes
     // (max shape is (num_rows<=128, num_cols<=1024) under validate_shapes).
@@ -439,7 +615,13 @@ __device__ inline void barrier_reset(const globals& G) {
 
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
 void ag_gemm_fused_kernel_stub(const __grid_constant__ globals G) {
+    if (blockIdx.x == 0 && threadIdx.x == 0 && G.kernel_start_ns != nullptr) {
+        *G.kernel_start_ns = ag_gemm_globaltimer();
+    }
     fused_kernel(G);
+    if (blockIdx.x == 0 && threadIdx.x == 0 && G.kernel_end_ns != nullptr) {
+        *G.kernel_end_ns = ag_gemm_globaltimer();
+    }
 }
 
 // ============================================================================
@@ -465,8 +647,12 @@ __device__ inline void phase0_post_wrs(const globals& G) {
     if (warp_id == 0 && lane_id == 0) {
         for (int lr = comm_sm_id; lr < local_row_blocks; lr += G.num_intra_comm) {
             const int global_row_idx = lr + G.dev_idx * local_row_blocks;
-            post_merge_wrs_for_intra_row(
-                G, global_row_idx, chunks_per_rb_for_merge);
+            if (G.tiled_direct != 0) {
+                post_tiled_direct_wrs_for_intra_row(G, global_row_idx);
+            } else {
+                post_merge_wrs_for_intra_row(
+                    G, global_row_idx, chunks_per_rb_for_merge);
+            }
         }
     }
 }
@@ -517,6 +703,35 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
     }
 
     const int prologue_blocks = G.num_intra_comm > 0 ? G.num_intra_comm : 1;
+    const bool skip_prologue =
+        std::getenv("AG_GEMM_SKIP_PROLOGUE") != nullptr &&
+        std::getenv("AG_GEMM_SKIP_PROLOGUE")[0] == '1';
+    if (skip_prologue) {
+        ag_gemm_fused_kernel_stub<<<active_sms, config::NUM_THREADS,
+                                    dynamic_shared_memory, stream>>>(G);
+        return;
+    }
+    // Ring internode (collective_mode==1): post phase-0 merge WRs on the same
+    // stream as the fused kernel so the prologue kernel fully completes before
+    // intra_comm_sm begins. Side-stream overlap lets the main kernel start while
+    // prologue CTAs may still be pushing FIFO entries — fine for direct fanout
+    // but it can starve or reorder the ring merge vs phase-2 arrival waits.
+    // Opt back to side-stream overlap with AG_GEMM_PROLOGUE_SIDE_STREAM=1.
+    const bool force_side_stream =
+        std::getenv("AG_GEMM_PROLOGUE_SIDE_STREAM") != nullptr &&
+        std::getenv("AG_GEMM_PROLOGUE_SIDE_STREAM")[0] == '1';
+    const bool prologue_main_stream =
+        !force_side_stream &&
+        (G.collective_mode == 1 ||
+         (std::getenv("AG_GEMM_PROLOGUE_MAIN_STREAM") != nullptr &&
+          std::getenv("AG_GEMM_PROLOGUE_MAIN_STREAM")[0] == '1'));
+    if (prologue_main_stream) {
+        ag_gemm_phase0_prologue_kernel<<<prologue_blocks, WARP_THREADS, 0,
+                                         stream>>>(G);
+        ag_gemm_fused_kernel_stub<<<active_sms, config::NUM_THREADS,
+                                    dynamic_shared_memory, stream>>>(G);
+        return;
+    }
     // 1. Capture prior main-stream state.
     MKERNEL_CUDACHECK(cudaEventRecord(main_pre_event, stream));
     // 2. Prologue stream waits on it.

@@ -7,6 +7,8 @@
 // Session management (same as v1)
 // ============================================================================
 #include "comm/internode/session_py.cuh"
+#include <algorithm>
+#include <cstdlib>
 
 static internode::Session* g_session = nullptr;
 static std::vector<std::string> g_peer_ips_storage;
@@ -39,6 +41,10 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     // (51e19e8). Multi-NIC striping is also enabled by default via the
     // round-18 cluster default MKERNEL_EFA_NUM_NICS=2 in session_fi.h.
     cfg.num_qps = 4;
+    if (cfg.num_peers > 1 && std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS") != nullptr) {
+        cfg.num_qps = std::min(internode::kMaxQPs, cfg.num_peers * 8);
+        cfg.channelize_gpu_peers = true;
+    }
     if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
         cfg.num_qps = std::atoi(env_num_qps);
     }
@@ -58,6 +64,17 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     } else if (const char* env_lq = std::getenv("GEMM_RS_LOGICAL_QUEUES_PER_QP")) {
         cfg.logical_queues_per_qp = std::atoi(env_lq);
     }
+    auto env_flag = [](const char* name, bool default_value) -> bool {
+        const char* e = std::getenv(name);
+        if (e == nullptr) return default_value;
+        return e[0] == '1';
+    };
+    const bool use_receiver_owner_rs =
+        env_flag("GEMM_RS_RECEIVER_OWNER_RS", false);
+    const bool use_incremental_peer_reduce =
+        env_flag("GEMM_RS_INCREMENTAL_PEER_REDUCE", use_receiver_owner_rs);
+    cfg.use_arrival_queue =
+        env_flag("GEMM_RS_TRANSPORT_ARRIVAL_QUEUE", use_incremental_peer_reduce);
     g_session = internode::create_session(cfg);
 }
 
@@ -66,6 +83,17 @@ void destroy_session_py() {
 }
 void set_epoch_py(int epoch) {
     internode::py::set_epoch(g_session, epoch);
+}
+void prepare_epoch_py() {
+    if (g_session) internode::prepare_epoch(g_session);
+}
+void commit_epoch_py(int epoch) {
+    if (g_session) internode::commit_epoch(g_session, static_cast<uint32_t>(epoch));
+}
+void zero_recv_buf_py() {
+    if (g_session && g_session->recv_buf.gpu_ptr && g_session->recv_buf.size > 0) {
+        cudaMemset(g_session->recv_buf.gpu_ptr, 0, g_session->recv_buf.size);
+    }
 }
 std::tuple<int64_t, int64_t, int64_t, int64_t, int> get_fifo_handles_py() {
     return internode::py::get_fifo_handles(g_session);
@@ -94,6 +122,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("peer_tcp_ports") = std::vector<int>{});
     m.def("destroy_session", &destroy_session_py);
     m.def("set_epoch", &set_epoch_py);
+    m.def("prepare_epoch", &prepare_epoch_py);
+    m.def("commit_epoch", &commit_epoch_py);
+    m.def("zero_recv_buf", &zero_recv_buf_py);
     m.def("get_fifo_handles", &get_fifo_handles_py);
     m.def("get_arrival_flags_ptr", &get_arrival_flags_ptr_py);
     m.def("get_recv_buf_ptr", &get_recv_buf_ptr_py);

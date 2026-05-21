@@ -32,7 +32,10 @@
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
+#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 using namespace kittens;
@@ -169,9 +172,16 @@ __device__ inline void slice_super_m_decode(
 }
 
 __host__ __device__ inline int gemm_ar_chunk_tiles(int col_blocks) {
-    // Coarsen large rows to reduce per-WR overhead; keep smaller rows finer
-    // grained for the receiver pipeline.
-    int chunk_tiles = (col_blocks >= 128) ? 32 : 4;
+    // Keep RDMA chunks at 256 KiB. The previous col_blocks>=128 path used
+    // 32 tiles (2 MiB) per WR; on 4-node L20x this can leave the receiver
+    // waiting forever at M=32768+.
+    int chunk_tiles = 4;
+#ifndef __CUDA_ARCH__
+    if (const char* env = std::getenv("GEMM_AR_CHUNK_TILES")) {
+        const int override_tiles = std::atoi(env);
+        if (override_tiles > 0) chunk_tiles = override_tiles;
+    }
+#endif
     return (chunk_tiles < col_blocks) ? chunk_tiles : col_blocks;
 }
 
@@ -229,6 +239,7 @@ struct fused_globals {
     bf16* C_local;            // raw pointer to C.data_ (intra-reduced result)
     bf16* C_recv;             // RDMA recv buffer (peer node's slice)
     bf16* staging_buf;        // RDMA-registered staging (my slice only)
+    bf16* C_remote_accum;     // optional local accumulator for early remote reduction
 
     internode::D2HFifoDeviceBundle d2h_fifos;
     volatile uint32_t* arrival_flags;  // row/chunk/tile arrival flags, depending on transport mode
@@ -280,6 +291,7 @@ struct fused_globals {
     uint32_t* remote_rq_head;          // consumer CAS to dequeue
     uint32_t* remote_rq_tail;          // producer reserve/publish cursor
     int remote_rq_capacity;            // power-of-2
+    int recv_ready_queue_enabled;       // recv-progress CTAs enqueue ready chunks for reducers
     int* owner_pending_entries;        // per-owner MPSC ring of chunk IDs (+1 encoded)
     uint32_t* owner_pending_head;      // single-consumer head per owner queue
     uint32_t* owner_pending_tail;      // producer reserve/publish cursor per owner queue
@@ -294,6 +306,7 @@ struct fused_globals {
     // Sized `total_chunks` each. Allocated from the ar_done scratch buffer.
     uint32_t* local_done_flag;         // set to 1 by intra_ar owner after local AR done
     uint32_t* remote_arrived_flag;     // set to 1 by recv_progress owner after RDMA arrival
+    uint32_t* remote_arrived_peer_mask; // per-chunk bitmask of arrived remote peer slots
     uint32_t* intra_started_flag;      // GEMM_AR_STAGGER_INTRA: up to 16 entries (stride/2);
                                        // primary CTA[i] sets 1 after passing its first tile barrier;
                                        // secondary CTA[i+half] polls this (L2-cached) before its own
@@ -328,10 +341,15 @@ struct fused_globals {
     int remote_queue_stride;
     int defer_final_multicast_finish;
     int work_steal_enabled;
+    int single_remote_peer;
+    int ring_experiment;
+    int ring_rs_experiment;
+    int intra_ready_multimem;
     // When true, intra-AR xdev barrier waits use acquire loads instead of
     // relaxed loads. The branch is outside the spin body.
     bool use_acquire_poll = false;
     uint32_t r8_warp_spec = 0;
+    int early_remote_accum = 0;
     int total_chunks;
     int total_tiles_per_device;       // row_blocks_per_slice * col_blocks (tiles this device reduces)
     int chunk_tiles;
@@ -344,6 +362,32 @@ struct fused_globals {
                                       // sets local_done_flag. Size = total_chunks.
     // remaining CTAs = inter-reduce-and-publish
     unsigned int* epilogue_blocks_done;
+
+    enum activity_kind : int {
+        ACTIVITY_COMPUTE = 0,
+        ACTIVITY_INTRA_AR_WAIT = 1,
+        ACTIVITY_INTRA_AR_REDUCE = 2,
+        ACTIVITY_INTER_SEND_WAIT = 3,
+        ACTIVITY_INTER_SEND_PUSH = 4,
+        ACTIVITY_INTER_REDUCE_WAIT = 5,
+        ACTIVITY_INTER_REDUCE_PUBLISH = 6,
+        ACTIVITY_INTER_RECV_PROGRESS = 7,
+        ACTIVITY_COMPUTE_SIGNAL = 8,
+        ACTIVITY_INTER_REDUCE_ACCUM = 9,
+        ACTIVITY_INTER_FINAL_WAIT = 10,
+        ACTIVITY_INTER_PUBLISH_COPY = 11,
+    };
+    struct activity_event {
+        unsigned long long start_ns;
+        unsigned long long end_ns;
+        int work_id;
+        int kind;
+    };
+    activity_event* activity_buf = nullptr;
+    uint32_t* activity_counts = nullptr;
+    unsigned long long* kernel_start_ns = nullptr;
+    unsigned long long* kernel_end_ns = nullptr;
+    int activity_max_events = 0;
 
 
 
@@ -373,7 +417,11 @@ __device__ __forceinline__ void gemm_ar_post_send_cmd(
     const internode::TransferCmd& cmd
 ) {
     (void)send_id;
-    gemm_ar_send_fifo_for_lane(G, (uint32_t)target_rx_id).push(cmd);
+    const uint32_t fifo_lane =
+        (G.num_nodes > 2 && cmd.cmd_type == internode::CmdType::WRITE)
+            ? (uint32_t)cmd.reserved0
+            : (uint32_t)target_rx_id;
+    gemm_ar_send_fifo_for_lane(G, fifo_lane).push(cmd);
 }
 
 // Batched-flush variant: enqueue WQE only (no fence, no DB). Pair with
@@ -695,8 +743,10 @@ __device__ inline bool gemm_ar_drain_arrival_queue_publish_flags(
 
         int first_tile = (int)internode::unpack_arrival_first_tile(flag_val);
         if (first_tile < 0) first_tile = 0;
-        const int rb = first_tile / G.col_blocks;
-        int col_start = first_tile - rb * G.col_blocks;
+        const int peer_slot = first_tile / G.total_tiles_per_device;
+        const int local_first_tile = first_tile - peer_slot * G.total_tiles_per_device;
+        const int rb = local_first_tile / G.col_blocks;
+        int col_start = local_first_tile - rb * G.col_blocks;
         int work_tiles = (int)internode::unpack_arrival_num_tiles(flag_val);
         if (work_tiles < 1) work_tiles = 1;
         work_tiles = min(work_tiles, G.col_blocks - col_start);
@@ -707,12 +757,19 @@ __device__ inline bool gemm_ar_drain_arrival_queue_publish_flags(
             const int tiles_this_chunk = min(G.chunk_tiles, G.col_blocks - col_start);
             const int consumed_tiles = min(work_tiles, tiles_this_chunk);
             if (consumed_tiles <= 0) break;
-            // Idempotent: setting flag twice is fine; counter only counts first.
-            if (G.chunk_remote_arrived[chunk_id] == 0) {
-                G.chunk_remote_arrived[chunk_id] = 1;
+            const uint32_t peer_bit =
+                (peer_slot >= 0 && peer_slot < 31) ? (1u << peer_slot) : 0u;
+            const uint32_t old_mask = atomicOr(
+                reinterpret_cast<unsigned int*>(G.remote_arrived_peer_mask + chunk_id),
+                peer_bit);
+            const uint32_t new_mask = old_mask | peer_bit;
+            const int needed_peers =
+                (G.single_remote_peer != 0 || G.ring_experiment != 0 || G.ring_rs_experiment != 0)
+                    ? 1 : (G.num_nodes - 1);
+            if (__popc(old_mask) < needed_peers && __popc(new_mask) >= needed_peers) {
                 atomicAdd(G.remote_arrived_chunks, 1u);
+                gemm_ar_release_store_u32(G.remote_arrived_flag + chunk_id, 1u);
             }
-            gemm_ar_release_store_u32(G.remote_arrived_flag + chunk_id, 1u);
             col_start += consumed_tiles;
             work_tiles -= consumed_tiles;
         }
@@ -744,6 +801,22 @@ __device__ inline bool gemm_ar_deadlock_debug_enabled(const fused_globals& G) {
 
 __device__ inline unsigned long long gemm_ar_globaltimer() {
     return comm::globaltimer();
+}
+
+__device__ inline void gemm_ar_record_activity_event(
+    const fused_globals& G, int kind, int work_id,
+    unsigned long long start_ns, unsigned long long end_ns
+) {
+    if (G.activity_buf == nullptr || G.activity_counts == nullptr) return;
+    uint32_t idx = atomicAdd(&G.activity_counts[blockIdx.x], 1u);
+    if (idx < (uint32_t)G.activity_max_events) {
+        auto& ev = G.activity_buf[
+            (size_t)blockIdx.x * (size_t)G.activity_max_events + (size_t)idx];
+        ev.start_ns = start_ns;
+        ev.end_ns = end_ns;
+        ev.work_id = work_id;
+        ev.kind = kind;
+    }
 }
 
 
@@ -807,6 +880,99 @@ __device__ inline void gemm_ar_publish_final_vec8(
     comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(ptr1, packed.y);
     comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(ptr2, packed.z);
     comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(ptr3, packed.w);
+}
+
+__device__ inline uint4 gemm_ar_sum_local_and_remote_vec8(
+    const fused_globals& G,
+    int tile_id,
+    int tile_row,
+    int col_elem,
+    const uint4& local_vec
+) {
+    __nv_bfloat162 acc0 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.x);
+    __nv_bfloat162 acc1 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.y);
+    __nv_bfloat162 acc2 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.z);
+    __nv_bfloat162 acc3 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.w);
+    const int n_peers =
+        (G.single_remote_peer != 0 || G.ring_experiment != 0 || G.ring_rs_experiment != 0)
+            ? 1 : (G.num_nodes - 1);
+    for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+        const bf16* recv = G.C_recv
+            + ((long)peer_slot * G.total_tiles_per_device + tile_id)
+                * fused_globals::TILE_ELEMS;
+        const uint4 rv = *reinterpret_cast<const uint4*>(
+            recv + tile_row * fused_globals::COL_BLOCK + col_elem);
+        acc0 = __hadd2(acc0, *reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+        acc1 = __hadd2(acc1, *reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+        acc2 = __hadd2(acc2, *reinterpret_cast<const __nv_bfloat162*>(&rv.z));
+        acc3 = __hadd2(acc3, *reinterpret_cast<const __nv_bfloat162*>(&rv.w));
+    }
+    uint4 out;
+    out.x = *reinterpret_cast<unsigned int*>(&acc0);
+    out.y = *reinterpret_cast<unsigned int*>(&acc1);
+    out.z = *reinterpret_cast<unsigned int*>(&acc2);
+    out.w = *reinterpret_cast<unsigned int*>(&acc3);
+    return out;
+}
+
+__device__ inline uint4 gemm_ar_sum_local_and_accum_vec8(
+    const fused_globals& G,
+    int tile_id,
+    int tile_row,
+    int col_elem,
+    const uint4& local_vec
+) {
+    __nv_bfloat162 acc0 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.x);
+    __nv_bfloat162 acc1 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.y);
+    __nv_bfloat162 acc2 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.z);
+    __nv_bfloat162 acc3 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.w);
+    const bf16* remote_accum = G.C_remote_accum + (long)tile_id * fused_globals::TILE_ELEMS;
+    const uint4 rv = *reinterpret_cast<const uint4*>(
+        remote_accum + tile_row * fused_globals::COL_BLOCK + col_elem);
+    acc0 = __hadd2(acc0, *reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+    acc1 = __hadd2(acc1, *reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+    acc2 = __hadd2(acc2, *reinterpret_cast<const __nv_bfloat162*>(&rv.z));
+    acc3 = __hadd2(acc3, *reinterpret_cast<const __nv_bfloat162*>(&rv.w));
+    uint4 out;
+    out.x = *reinterpret_cast<unsigned int*>(&acc0);
+    out.y = *reinterpret_cast<unsigned int*>(&acc1);
+    out.z = *reinterpret_cast<unsigned int*>(&acc2);
+    out.w = *reinterpret_cast<unsigned int*>(&acc3);
+    return out;
+}
+
+__device__ inline void gemm_ar_accumulate_remote_peer_vec8(
+    const fused_globals& G,
+    int peer_slot,
+    int tile_id,
+    int tile_row,
+    int col_elem,
+    bool first_peer_for_chunk
+) {
+    bf16* accum = G.C_remote_accum + (long)tile_id * fused_globals::TILE_ELEMS;
+    const bf16* recv = G.C_recv
+        + ((long)peer_slot * G.total_tiles_per_device + tile_id)
+            * fused_globals::TILE_ELEMS;
+    const uint4 rv = *reinterpret_cast<const uint4*>(
+        recv + tile_row * fused_globals::COL_BLOCK + col_elem);
+    uint4 out = rv;
+    if (!first_peer_for_chunk) {
+        const uint4 av = *reinterpret_cast<const uint4*>(
+            accum + tile_row * fused_globals::COL_BLOCK + col_elem);
+        __nv_bfloat162 acc0 = *reinterpret_cast<const __nv_bfloat162*>(&av.x);
+        __nv_bfloat162 acc1 = *reinterpret_cast<const __nv_bfloat162*>(&av.y);
+        __nv_bfloat162 acc2 = *reinterpret_cast<const __nv_bfloat162*>(&av.z);
+        __nv_bfloat162 acc3 = *reinterpret_cast<const __nv_bfloat162*>(&av.w);
+        acc0 = __hadd2(acc0, *reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+        acc1 = __hadd2(acc1, *reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+        acc2 = __hadd2(acc2, *reinterpret_cast<const __nv_bfloat162*>(&rv.z));
+        acc3 = __hadd2(acc3, *reinterpret_cast<const __nv_bfloat162*>(&rv.w));
+        out.x = *reinterpret_cast<unsigned int*>(&acc0);
+        out.y = *reinterpret_cast<unsigned int*>(&acc1);
+        out.z = *reinterpret_cast<unsigned int*>(&acc2);
+        out.w = *reinterpret_cast<unsigned int*>(&acc3);
+    }
+    *reinterpret_cast<uint4*>(accum + tile_row * fused_globals::COL_BLOCK + col_elem) = out;
 }
 
 
@@ -933,6 +1099,7 @@ struct gemm_ar_scratch_layout {
     // Phase 2 static-ownership flag arrays (u32, one entry per chunk)
     int local_done_flag_offset;
     int remote_arrived_flag_offset;
+    int remote_arrived_peer_mask_offset;
     // GEMM_AR_STAGGER_INTRA: per-primary-CTA started signal (max 4 entries).
     // Primary intra CTAs (offset < num_intra_ar_sms/2) set these after passing
     // their first tile barrier; secondary CTAs poll these (L2-cached, no NVSwitch).
@@ -950,26 +1117,279 @@ struct gemm_ar_scratch_layout {
     int remote_queue_stride;
 };
 
-__host__ inline gemm_ar_role_split gemm_ar_compute_role_split(int num_intra_comm_sms, int num_inter_comm_sms) {
+static fused_globals::activity_event* g_gemm_ar_trace_buf[fused_globals::NUM_DEVICES] = {};
+static uint32_t* g_gemm_ar_trace_counts[fused_globals::NUM_DEVICES] = {};
+static unsigned long long* g_gemm_ar_trace_start[fused_globals::NUM_DEVICES] = {};
+static unsigned long long* g_gemm_ar_trace_end[fused_globals::NUM_DEVICES] = {};
+static size_t g_gemm_ar_trace_buf_cap[fused_globals::NUM_DEVICES] = {};
+
+__host__ inline const char* gemm_ar_activity_kind_name(int kind) {
+    switch (kind) {
+        case fused_globals::ACTIVITY_COMPUTE: return "compute";
+        case fused_globals::ACTIVITY_INTRA_AR_WAIT: return "intra_ar_wait";
+        case fused_globals::ACTIVITY_INTRA_AR_REDUCE: return "intra_ar_reduce";
+        case fused_globals::ACTIVITY_INTER_SEND_WAIT: return "inter_send_wait";
+        case fused_globals::ACTIVITY_INTER_SEND_PUSH: return "inter_send_push";
+        case fused_globals::ACTIVITY_INTER_REDUCE_WAIT: return "inter_reduce_wait";
+        case fused_globals::ACTIVITY_INTER_REDUCE_PUBLISH: return "inter_reduce_publish";
+        case fused_globals::ACTIVITY_INTER_RECV_PROGRESS: return "inter_recv_progress";
+        case fused_globals::ACTIVITY_COMPUTE_SIGNAL: return "compute_signal";
+        case fused_globals::ACTIVITY_INTER_REDUCE_ACCUM: return "inter_reduce_accum";
+        case fused_globals::ACTIVITY_INTER_FINAL_WAIT: return "inter_final_wait";
+        case fused_globals::ACTIVITY_INTER_PUBLISH_COPY: return "inter_publish_copy";
+        default: return "unknown";
+    }
+}
+
+__host__ inline const char* gemm_ar_block_role_name(
+    int block_idx, const gemm_ar_role_split& split
+) {
+    if (block_idx < split.num_comp_sms) return "compute";
+    if (block_idx < split.num_comp_sms + split.num_intra_ar_sms) return "intra_ar";
+    if (block_idx < split.num_comp_sms + split.num_intra_ar_sms + split.num_inter_send_sms) {
+        return "inter_send";
+    }
+    if (block_idx < split.num_comp_sms + split.num_intra_ar_sms + split.num_inter_send_sms
+                    + split.num_inter_recv_progress_sms) {
+        return "inter_recv_progress";
+    }
+    return "inter_reduce";
+}
+
+__host__ inline bool gemm_ar_trace_dump_enabled(int node_idx, int dev_idx) {
+    const char* all_ranks = std::getenv("GEMM_AR_ACTIVITY_TRACE_ALL_RANKS");
+    if (all_ranks != nullptr && all_ranks[0] == '1') return true;
+    const char* all_local = std::getenv("GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS");
+    if (all_local != nullptr && all_local[0] == '1') return node_idx == 0;
+    const char* all_nodes = std::getenv("GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES");
+    if (all_nodes != nullptr && all_nodes[0] == '1') return dev_idx == 0;
+    return node_idx == 0 && dev_idx == 0;
+}
+
+__host__ inline void gemm_ar_trace_dump_path(
+    int node_idx, int dev_idx, const char* base_path,
+    char* out_path, size_t out_path_size
+) {
+    const char* all_ranks = std::getenv("GEMM_AR_ACTIVITY_TRACE_ALL_RANKS");
+    if (all_ranks != nullptr && all_ranks[0] == '1') {
+        std::snprintf(out_path, out_path_size, "%s.node%d_rank%d.json",
+                      base_path, node_idx, dev_idx);
+        return;
+    }
+    const char* all_local = std::getenv("GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS");
+    if (all_local != nullptr && all_local[0] == '1') {
+        std::snprintf(out_path, out_path_size, "%s.node%d_rank%d.json",
+                      base_path, node_idx, dev_idx);
+        return;
+    }
+    const char* all_nodes = std::getenv("GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES");
+    if (all_nodes != nullptr && all_nodes[0] == '1') {
+        std::snprintf(out_path, out_path_size, "%s.node%d_rank%d.json",
+                      base_path, node_idx, dev_idx);
+        return;
+    }
+    std::snprintf(out_path, out_path_size, "%s", base_path);
+}
+
+__host__ inline void gemm_ar_alloc_activity_trace(
+    fused_globals& G, const gemm_ar_role_split& split,
+    const gemm_ar_scratch_layout& scratch
+) {
+    const char* out_path = std::getenv("GEMM_AR_ACTIVITY_TRACE_OUT");
+    if (out_path == nullptr || out_path[0] == '\0') return;
+    const int dev = G.dev_idx;
+    const int compute_max = (split.num_comp_sms > 0)
+        ? (scratch.total_tiles + split.num_comp_sms - 1) / split.num_comp_sms
+        : 0;
+    const int intra_max = (split.num_intra_ar_sms > 0)
+        ? (scratch.slice_tiles + split.num_intra_ar_sms - 1) / split.num_intra_ar_sms
+        : 0;
+    const int send_max = (split.num_inter_send_sms > 0)
+        ? (scratch.total_chunks + split.num_inter_send_sms - 1) / split.num_inter_send_sms
+        : 0;
+    const int reduce_max = (split.num_inter_reduce_store_sms > 0)
+        ? (scratch.total_chunks + split.num_inter_reduce_store_sms - 1) / split.num_inter_reduce_store_sms
+        : 0;
+    // Some roles emit wait+useful sub-events for the same logical work item.
+    G.activity_max_events = std::max(64, 5 * std::max(std::max(compute_max, intra_max),
+                                                      std::max(send_max, reduce_max)) + 64);
+
+    const size_t event_bytes =
+        (size_t)config::NUM_BLOCKS * (size_t)G.activity_max_events
+        * sizeof(fused_globals::activity_event);
+    const size_t count_bytes = (size_t)config::NUM_BLOCKS * sizeof(uint32_t);
+
+    if (g_gemm_ar_trace_buf_cap[dev] < event_bytes) {
+        if (g_gemm_ar_trace_buf[dev] != nullptr) cudaFree(g_gemm_ar_trace_buf[dev]);
+        cudaMalloc(&g_gemm_ar_trace_buf[dev], event_bytes);
+        g_gemm_ar_trace_buf_cap[dev] = event_bytes;
+    }
+    if (g_gemm_ar_trace_counts[dev] == nullptr) cudaMalloc(&g_gemm_ar_trace_counts[dev], count_bytes);
+    if (g_gemm_ar_trace_start[dev] == nullptr) cudaMalloc(&g_gemm_ar_trace_start[dev], sizeof(unsigned long long));
+    if (g_gemm_ar_trace_end[dev] == nullptr) cudaMalloc(&g_gemm_ar_trace_end[dev], sizeof(unsigned long long));
+
+    cudaMemset(g_gemm_ar_trace_buf[dev], 0, event_bytes);
+    cudaMemset(g_gemm_ar_trace_counts[dev], 0, count_bytes);
+    cudaMemset(g_gemm_ar_trace_start[dev], 0, sizeof(unsigned long long));
+    cudaMemset(g_gemm_ar_trace_end[dev], 0, sizeof(unsigned long long));
+
+    G.activity_buf = g_gemm_ar_trace_buf[dev];
+    G.activity_counts = g_gemm_ar_trace_counts[dev];
+    G.kernel_start_ns = g_gemm_ar_trace_start[dev];
+    G.kernel_end_ns = g_gemm_ar_trace_end[dev];
+}
+
+__host__ inline void gemm_ar_dump_activity_trace(
+    fused_globals& G, int M, int N, int node_idx, int dev_idx,
+    const gemm_ar_role_split& split, const gemm_ar_scratch_layout& scratch
+) {
+    if (G.activity_buf == nullptr || G.activity_counts == nullptr) return;
+
+    std::vector<fused_globals::activity_event> host_events(
+        (size_t)config::NUM_BLOCKS * (size_t)G.activity_max_events);
+    std::vector<uint32_t> host_counts(config::NUM_BLOCKS, 0);
+    unsigned long long kernel_start_ns = 0;
+    unsigned long long kernel_end_ns = 0;
+
+    cudaDeviceSynchronize();
+    cudaMemcpy(host_events.data(), G.activity_buf,
+               host_events.size() * sizeof(fused_globals::activity_event),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_counts.data(), G.activity_counts,
+               host_counts.size() * sizeof(uint32_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(&kernel_start_ns, G.kernel_start_ns,
+               sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&kernel_end_ns, G.kernel_end_ns,
+               sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+
+    unsigned long long min_event_start = ~0ull;
+    unsigned long long max_event_end = 0;
+    for (int b = 0; b < config::NUM_BLOCKS; ++b) {
+        const uint32_t count = std::min(host_counts[b], (uint32_t)G.activity_max_events);
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& ev = host_events[(size_t)b * (size_t)G.activity_max_events + i];
+            if (ev.start_ns != 0 && ev.start_ns < min_event_start) min_event_start = ev.start_ns;
+            if (ev.end_ns > max_event_end) max_event_end = ev.end_ns;
+        }
+    }
+    if (min_event_start != ~0ull && (kernel_start_ns == 0 || kernel_start_ns > min_event_start)) {
+        kernel_start_ns = min_event_start;
+    }
+    if (kernel_end_ns < max_event_end) kernel_end_ns = max_event_end;
+
+    G.activity_buf = nullptr;
+    G.activity_counts = nullptr;
+    G.kernel_start_ns = nullptr;
+    G.kernel_end_ns = nullptr;
+
+    const char* base_out_path = std::getenv("GEMM_AR_ACTIVITY_TRACE_OUT");
+    if (base_out_path == nullptr || base_out_path[0] == '\0') return;
+    if (!gemm_ar_trace_dump_enabled(node_idx, dev_idx)) return;
+
+    char out_path[4096];
+    gemm_ar_trace_dump_path(node_idx, dev_idx, base_out_path, out_path, sizeof(out_path));
+    FILE* f = std::fopen(out_path, "w");
+    if (f == nullptr) {
+        std::fprintf(stderr, "[GEMM_AR_ACTIVITY_TRACE] failed to open %s\n", out_path);
+        return;
+    }
+
+    const int total_gemm_tiles = (M / fused_globals::ROW_BLOCK) * (N / fused_globals::COL_BLOCK);
+    std::fprintf(f,
+        "{\n"
+        "  \"kernel\": \"gemm_ar\",\n"
+        "  \"node_idx\": %d,\n"
+        "  \"dev_idx\": %d,\n"
+        "  \"M\": %d,\n"
+        "  \"N\": %d,\n"
+        "  \"num_blocks\": %d,\n"
+        "  \"num_comp_sms\": %d,\n"
+        "  \"num_intra_ar_sms\": %d,\n"
+        "  \"num_inter_send_sms\": %d,\n"
+        "  \"num_inter_recv_progress_sms\": %d,\n"
+        "  \"num_inter_reduce_sms\": %d,\n"
+        "  \"total_chunks\": %d,\n"
+        "  \"total_gemm_tiles\": %d,\n"
+        "  \"kernel_start_ns\": %llu,\n"
+        "  \"kernel_end_ns\": %llu,\n"
+        "  \"activity_max_events\": %d,\n"
+        "  \"blocks\": [\n",
+        node_idx, dev_idx, M, N, config::NUM_BLOCKS,
+        split.num_comp_sms, split.num_intra_ar_sms, split.num_inter_send_sms,
+        split.num_inter_recv_progress_sms, split.num_inter_reduce_store_sms,
+        scratch.total_chunks, total_gemm_tiles,
+        kernel_start_ns, kernel_end_ns, G.activity_max_events);
+
+    for (int b = 0; b < config::NUM_BLOCKS; ++b) {
+        const uint32_t count = std::min(host_counts[b], (uint32_t)G.activity_max_events);
+        std::fprintf(f,
+            "    {\n"
+            "      \"block\": %d,\n"
+            "      \"role\": \"%s\",\n"
+            "      \"events\": [",
+            b, gemm_ar_block_role_name(b, split));
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& ev = host_events[(size_t)b * (size_t)G.activity_max_events + i];
+            if (i != 0) std::fprintf(f, ",");
+            std::fprintf(f,
+                "\n        {\"kind\":\"%s\",\"work_id\":%d,\"start_ns\":%llu,\"end_ns\":%llu}",
+                gemm_ar_activity_kind_name(ev.kind), ev.work_id, ev.start_ns, ev.end_ns);
+        }
+        if (count != 0) std::fprintf(f, "\n");
+        std::fprintf(f, "      ]\n    }%s\n", (b + 1 == config::NUM_BLOCKS) ? "" : ",");
+    }
+    std::fprintf(f, "  ]\n}\n");
+    std::fclose(f);
+    std::printf("[GEMM_AR_ACTIVITY_TRACE rank=%d node=%d M=%d N=%d file=%s]\n",
+                dev_idx, node_idx, M, N, out_path);
+}
+
+__host__ inline gemm_ar_role_split gemm_ar_compute_role_split(
+    int num_intra_comm_sms, int num_inter_comm_sms, int row_blocks_per_slice = 0
+) {
     gemm_ar_role_split split{};
     split.num_intra_ar_sms = num_intra_comm_sms;
+    int requested_send_sms = 0;
+    const char* send_env = std::getenv("GEMM_AR_INTER_SEND_SMS");
+    if (send_env != nullptr && send_env[0] != '\0') {
+        requested_send_sms = std::atoi(send_env);
+    }
 #ifdef GEMM_AR_INTER_SEND_SMS
-    split.num_inter_send_sms = max(2, std::min(num_inter_comm_sms - 2, (int)GEMM_AR_INTER_SEND_SMS));
+    if (requested_send_sms <= 0) requested_send_sms = (int)GEMM_AR_INTER_SEND_SMS;
 #else
-    split.num_inter_send_sms = max(2, num_inter_comm_sms / 2);
+    if (requested_send_sms <= 0) requested_send_sms = num_inter_comm_sms / 2;
 #endif
-    split.num_inter_reduce_publish_sms = num_inter_comm_sms - split.num_inter_send_sms;
-    // Unified inter-reduce path: every inter-reduce CTA both polls arrival
-    // flags and performs reduction.
-    split.num_inter_recv_progress_sms = 0;
-    split.num_inter_reduce_store_sms = split.num_inter_reduce_publish_sms;
+    requested_send_sms = max(1, std::min(num_inter_comm_sms - 1, requested_send_sms));
+    if (row_blocks_per_slice > 0) {
+        requested_send_sms = std::min(requested_send_sms, row_blocks_per_slice);
+    }
+    split.num_inter_send_sms = requested_send_sms;
+    int requested_recv_progress_sms = 0;
+    const char* recv_env = std::getenv("GEMM_AR_RECV_PROGRESS_SMS");
+    if (recv_env != nullptr && recv_env[0] != '\0') {
+        requested_recv_progress_sms = std::atoi(recv_env);
+    }
+    const int remaining_after_send = num_inter_comm_sms - split.num_inter_send_sms;
+    if (requested_recv_progress_sms > 0) {
+        requested_recv_progress_sms =
+            std::min(requested_recv_progress_sms, std::max(0, config::NUM_BLOCKS
+                - num_intra_comm_sms - num_inter_comm_sms));
+    } else {
+        requested_recv_progress_sms = 0;
+    }
+    split.num_inter_recv_progress_sms = requested_recv_progress_sms;
+    split.num_inter_reduce_store_sms = remaining_after_send;
+    split.num_inter_reduce_publish_sms = split.num_inter_reduce_store_sms;
     split.num_comp_sms = config::NUM_BLOCKS - num_intra_comm_sms
-                       - split.num_inter_send_sms - split.num_inter_reduce_publish_sms;
+                       - split.num_inter_send_sms - split.num_inter_recv_progress_sms
+                       - split.num_inter_reduce_publish_sms;
     return split;
 }
 
 __host__ inline gemm_ar_scratch_layout gemm_ar_compute_scratch_layout(
-    int M, int N, int num_remote_queues, int num_allocated_remote_queues
+    int M, int N, int num_remote_queues, int num_allocated_remote_queues,
+    int num_nodes = 2
 ) {
     gemm_ar_scratch_layout scratch{};
     scratch.slice_rows = M / fused_globals::NUM_DEVICES;
@@ -1038,11 +1458,13 @@ __host__ inline gemm_ar_scratch_layout gemm_ar_compute_scratch_layout(
         scratch.owner_pending_pop_count_offset + num_remote_queues;
     scratch.remote_arrived_flag_offset =
         scratch.local_done_flag_offset + scratch.total_chunks;
+    scratch.remote_arrived_peer_mask_offset =
+        scratch.remote_arrived_flag_offset + scratch.total_chunks;
     // GEMM_AR_STAGGER_INTRA: up to 16 u32 entries (one per primary intra CTA,
     // max stride/2=16 — see fused_prelude.cuh:111). Allocate 16 to match the
     // Python-side _compute_scratch_ints_needed layout exactly.
     scratch.intra_started_flag_offset =
-        scratch.remote_arrived_flag_offset + scratch.total_chunks;
+        scratch.remote_arrived_peer_mask_offset + scratch.total_chunks;
     // GEMM_AR_INTER_REDUCE_WORKSTEAL: cursor (1 u32) + per-chunk claimed flags.
     // Always allocated regardless of compile flag for stable scratch sizing.
     scratch.reduce_cursor_offset =
@@ -1065,8 +1487,10 @@ __host__ inline gemm_ar_scratch_layout gemm_ar_compute_scratch_layout(
         scratch.intra_chunk_tiles_done_offset + scratch.total_chunks;
     scratch.scratch_ints_needed =
         scratch.xnode_ready_offset + 1;
+    const int n_peers = std::max(1, num_nodes - 1);
     scratch.remote_queue_stride =
-        std::max(1, (scratch.total_tiles + num_allocated_remote_queues - 1) / num_allocated_remote_queues);
+        std::max(1, (scratch.total_tiles * n_peers + num_allocated_remote_queues - 1)
+                     / num_allocated_remote_queues);
     return scratch;
 }
 
@@ -1104,6 +1528,7 @@ __host__ inline fused_globals gemm_ar_make_globals(
     dist::ParallelBuffer& C_final,
     int64_t staging_buf_ptr, int64_t recv_buf_ptr,
     const internode::D2HFifoDeviceBundle& fifo_bundle,
+    int64_t remote_accum_ptr,
     int64_t arrival_flags_ptr, int64_t arrival_tails_ptr, int epoch, int node_idx,
     int64_t ar_done_ptr,
     int num_qps, int num_remote_queues,
@@ -1121,6 +1546,7 @@ __host__ inline fused_globals gemm_ar_make_globals(
         .C_local = reinterpret_cast<bf16*>(C.data_.data_ptr()),
         .C_recv = reinterpret_cast<bf16*>(recv_buf_ptr),
         .staging_buf = reinterpret_cast<bf16*>(staging_buf_ptr),
+        .C_remote_accum = reinterpret_cast<bf16*>(remote_accum_ptr),
         .d2h_fifos = fifo_bundle,
         .arrival_flags = reinterpret_cast<volatile uint32_t*>(arrival_flags_ptr),
         .arrival_tails = reinterpret_cast<volatile uint32_t*>(arrival_tails_ptr),
@@ -1179,6 +1605,7 @@ __host__ inline fused_globals gemm_ar_make_globals(
         .remote_rq_tail =
             reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.remote_rq_tail_offset,
         .remote_rq_capacity = scratch.remote_rq_capacity,
+        .recv_ready_queue_enabled = 0,
         .owner_pending_entries =
             reinterpret_cast<int*>(ar_done_ptr) + scratch.owner_pending_entries_offset,
         .owner_pending_head =
@@ -1196,6 +1623,8 @@ __host__ inline fused_globals gemm_ar_make_globals(
             reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.local_done_flag_offset,
         .remote_arrived_flag =
             reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.remote_arrived_flag_offset,
+        .remote_arrived_peer_mask =
+            reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.remote_arrived_peer_mask_offset,
         .intra_started_flag =
             reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.intra_started_flag_offset,
         .reduce_cursor =
@@ -1220,6 +1649,10 @@ __host__ inline fused_globals gemm_ar_make_globals(
         .remote_queue_stride = scratch.remote_queue_stride,
         .defer_final_multicast_finish = 0,
         .work_steal_enabled = 0,
+        .single_remote_peer = 0,
+        .ring_experiment = 0,
+        .ring_rs_experiment = 0,
+        .intra_ready_multimem = 0,
         .total_chunks = scratch.total_chunks,
         .total_tiles_per_device = scratch.slice_tiles,
         .chunk_tiles = scratch.chunk_tiles,
@@ -1240,6 +1673,22 @@ __host__ inline fused_globals gemm_ar_make_globals(
         reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.comp_chunk_tiles_done_offset;
     G.intra_chunk_tiles_done =
         reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.intra_chunk_tiles_done_offset;
+    if (const char* env_single_peer = std::getenv("GEMM_AR_SINGLE_REMOTE_PEER")) {
+        G.single_remote_peer =
+            (env_single_peer[0] != '\0' && env_single_peer[0] != '0') ? 1 : 0;
+    }
+    if (const char* env_ring = std::getenv("GEMM_AR_RING_EXPERIMENT")) {
+        G.ring_experiment =
+            (env_ring[0] != '\0' && env_ring[0] != '0' && remote_accum_ptr != 0) ? 1 : 0;
+    }
+    if (const char* env_ring_rs = std::getenv("GEMM_AR_RING_RS_EXPERIMENT")) {
+        G.ring_rs_experiment =
+            (env_ring_rs[0] != '\0' && env_ring_rs[0] != '0' && remote_accum_ptr != 0) ? 1 : 0;
+    }
+    if (const char* env_multimem = std::getenv("GEMM_AR_INTRA_READY_MULTIMEM")) {
+        G.intra_ready_multimem =
+            (env_multimem[0] != '\0' && env_multimem[0] != '0') ? 1 : 0;
+    }
     return G;
 }
 
@@ -1271,7 +1720,8 @@ void entrypoint(
     int trace_slot = -1,
     // Select acquire vs relaxed loads for the intra-AR xdev barrier wait.
     bool use_acquire_poll = false,
-    int num_nodes = 2
+    int num_nodes = 2,
+    int64_t remote_accum_ptr = 0
 ) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -1281,16 +1731,18 @@ void entrypoint(
     if (num_allocated_remote_queues <= 0) num_allocated_remote_queues = num_remote_queues;
     if (num_allocated_remote_queues < num_remote_queues) num_allocated_remote_queues = num_remote_queues;
 
-    const gemm_ar_role_split split = gemm_ar_compute_role_split(num_intra_comm_sms, num_inter_comm_sms);
+    const gemm_ar_scratch_layout scratch =
+        gemm_ar_compute_scratch_layout(
+            M, N, num_remote_queues, num_allocated_remote_queues, num_nodes);
+    const gemm_ar_role_split split =
+        gemm_ar_compute_role_split(
+            num_intra_comm_sms, num_inter_comm_sms, scratch.row_blocks_per_slice);
     const int num_inter_reduce_publish = split.num_inter_reduce_publish_sms;
     const int num_inter_reduce_store = split.num_inter_reduce_store_sms;
     const int num_comp_sms = split.num_comp_sms;
     TORCH_CHECK(num_comp_sms > 0, "num_comp_sms must be > 0");
     TORCH_CHECK(num_inter_reduce_publish > 0, "num_inter_reduce_publish must be > 0");
     TORCH_CHECK(num_inter_reduce_store > 0, "num_inter_reduce_store must be > 0");
-
-    const gemm_ar_scratch_layout scratch =
-        gemm_ar_compute_scratch_layout(M, N, num_remote_queues, num_allocated_remote_queues);
     // scratch_ints == 0 means caller did not pass an explicit size; fall back
     // to total_tiles. Otherwise use the actual provided buffer size.
     const int ar_done_buf_size = (scratch_ints > 0) ? scratch_ints : scratch.total_tiles;
@@ -1306,7 +1758,7 @@ void entrypoint(
 
     fused_globals G = gemm_ar_make_globals(
         A, B, C, barrier, C_final,
-        staging_buf_ptr, recv_buf_ptr, fifo_bundle,
+        staging_buf_ptr, recv_buf_ptr, fifo_bundle, remote_accum_ptr,
         arrival_flags_ptr, arrival_tails_ptr, epoch, node_idx, ar_done_ptr,
         num_qps, num_remote_queues, split, scratch,
         cross_node_barrier_ptr, num_nodes);
@@ -1323,6 +1775,12 @@ void entrypoint(
         G.r8_warp_spec = (r8_env != nullptr && r8_env[0] == '1') ? 1u : 0u;
     }
     G.use_acquire_poll = use_acquire_poll;
+    {
+        const char* accum_env = std::getenv("GEMM_AR_EARLY_REMOTE_ACCUM");
+        G.early_remote_accum =
+            (remote_accum_ptr != 0 && accum_env != nullptr && accum_env[0] == '1') ? 1 : 0;
+    }
+    gemm_ar_alloc_activity_trace(G, split, scratch);
 
 
 
@@ -1334,6 +1792,7 @@ void entrypoint(
         launch_fused_gemm_ar_epilogue(G);
         gemm_ar_host_debug_log(node_idx, dev_idx, "entrypoint after launch_epilogue_kernel");
     }
+    gemm_ar_dump_activity_trace(G, M, N, node_idx, dev_idx, split, scratch);
 
 }
 // -- END inlined from gemm_ar_multinode_host_entrypoint.cuh

@@ -68,6 +68,8 @@ __device__ inline void compute_tile_impl(
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
         } else if (w_id == 1 && l_id == 0) {
+            const unsigned long long trace_start =
+                gemm_rs_activity_timestamp(Gv);
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
             update_phasebit<0>(phasebits, 0);
             #pragma unroll
@@ -94,6 +96,9 @@ __device__ inline void compute_tile_impl(
             tma::store_async_read_wait();
             signal_ready(Gv.ready, ready_idx);
             arrive(outputs_finished);
+            gemm_rs_record_activity_event(
+                Gv, fused_globals::ACTIVITY_COMPUTE, ready_idx,
+                trace_start, gemm_rs_activity_timestamp(Gv));
         }
     } else {
         rt_fl<G::ROW_BLOCK / 8, G::COL_BLOCK> C_accum;
@@ -163,8 +168,9 @@ __device__ inline void fused_comm_tile_impl(
         }
         tma::store_async_read_wait();
         // The TMA store-add and the downstream barrier signal target the same
-        // peer GPU; store_async_read_wait plus a GPU-scope fence orders them.
-        __threadfence();
+        // peer GPU; store_async_read_wait plus a system fence orders them for
+        // both peer GPUs and the NIC read path.
+        __threadfence_system();
 
         if (G.rt != nullptr && G.num_send_sms > 0) {
             // Chunk barrier: batch per-tile signals into per-chunk (matches gemm_ar).
@@ -240,6 +246,8 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
     int posted = 0;
     __shared__ int shared_found_idx;
     while (posted < my_chunks_total) {
+        const unsigned long long wait_start = (threadIdx.x == 0)
+            ? gemm_rs_activity_timestamp(I) : 0ull;
         if (threadIdx.x == 0) {
             shared_found_idx = -1;
             const int queue_words = gemm_rs_send_ready_bitmap_words_per_queue(
@@ -287,9 +295,18 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
         const int col_start = ci * chunk_tiles;
         const int cols_this_chunk = min(chunk_tiles, col_blocks - col_start);
         const int chunk_first_tile = first_tile_rb + col_start;
+        const int global_chunk_id = first_chunk_rb + ci;
 
         if (threadIdx.x == 0) {
-            gemm_rs_release_store_u32(Rt.sender_done + first_chunk_rb + ci, 1u);
+            gemm_rs_record_activity_event(
+                I, fused_globals::ACTIVITY_INTER_SEND_WAIT, global_chunk_id,
+                wait_start, gemm_rs_activity_timestamp(I));
+            const unsigned long long push_start =
+                gemm_rs_activity_timestamp(I);
+            if (Rt.use_incremental_peer_reduce != 0) {
+                __threadfence_system();
+            }
+            gemm_rs_release_store_u32(Rt.sender_done + global_chunk_id, 1u);
 
             const uint32_t chunk_bytes = (uint32_t)((long)cols_this_chunk * TILE_BYTES);
             const uint32_t offset = (uint32_t)((long)chunk_first_tile * TILE_BYTES);
@@ -299,10 +316,19 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
                 (long)row_blocks_per_dev * (long)col_blocks * TILE_BYTES;
             const int  single_peer_tiles = row_blocks_per_dev * col_blocks;
             const int n_peers = Rt.num_nodes - 1;
+            const int queues_per_peer =
+                max(1, Rt.num_remote_queues / max(1, n_peers));
             for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                 const int peer_rank = internode::peer_rank_for_slot(
                     Rt.node_idx, Rt.num_nodes, peer_slot);
-                const int sap = internode::slot_at_peer(Rt.node_idx, peer_rank);
+                if (Rt.use_receiver_owner_rs != 0) {
+                    const int owner_node = global_chunk_id % Rt.num_nodes;
+                    if (owner_node == Rt.node_idx || peer_rank != owner_node) {
+                        continue;
+                    }
+                }
+                const int sap = internode::slot_at_peer(Rt.node_idx, peer_rank, Rt.num_nodes);
+                const int logical_q = (rb * chunks_per_row + ci) % queues_per_peer;
                 internode::TransferCmd cmd{};
                 cmd.cmd_type = internode::CmdType::WRITE;
                 cmd.dst_rank = (uint8_t)peer_rank;
@@ -310,12 +336,20 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
                 cmd.bytes    = chunk_bytes;
                 cmd.local_offset = offset;
                 cmd.remote_offset = (uint32_t)((long)sap * single_peer_bytes) + offset;
-                cmd.lane_id  = (uint16_t)(rb * chunks_per_row + ci);
+                cmd.lane_id  = (uint16_t)(
+                    Rt.use_transport_arrival_queue != 0
+                        ? (peer_slot * queues_per_peer + logical_q)
+                        : (rb * chunks_per_row + ci));
+                cmd.reserved0 = (uint8_t)(peer_slot * fused_globals::NUM_DEVICES + I.dev_idx);
                 __threadfence();
                 internode::D2HFifoDevice fifo =
-                    internode::gemm_ar_select_fifo_for_lane(Rt.d2h_fifos, (uint32_t)cmd.lane_id);
+                    internode::gemm_ar_select_fifo_for_lane(
+                        Rt.d2h_fifos, (uint32_t)cmd.lane_id);
                 fifo.push(cmd);
             }
+            gemm_rs_record_activity_event(
+                I, fused_globals::ACTIVITY_INTER_SEND_PUSH, global_chunk_id,
+                push_start, gemm_rs_activity_timestamp(I));
         }
         __syncthreads();
         posted++;
@@ -323,6 +357,357 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
 }
 
 // Any CTA that finishes its primary role can claim reduce chunks from this pool.
+__device__ __forceinline__ bool gemm_rs_receiver_owns_chunk(
+    const fused_globals::runtime_state &Rt, int chunk_id
+) {
+    return Rt.use_receiver_owner_rs == 0 || (chunk_id % Rt.num_nodes) == Rt.node_idx;
+}
+
+template <typename G>
+__device__ inline void gemm_rs_enqueue_peer_accum_work(
+    typename G::runtime_state &Rt, int peer_slot, int chunk_id
+);
+
+template <typename G>
+__device__ inline bool gemm_rs_drain_arrival_queue_publish_flags(
+    typename G::runtime_state &Rt, int q
+) {
+    if (q < 0 || q >= Rt.num_remote_queues) return false;
+    bool any = false;
+    while (true) {
+        uint32_t q_head = gemm_rs_acquire_load_u32(Rt.arrival_queue_head + q);
+        if ((int)q_head >= Rt.remote_queue_stride) break;
+        const uint32_t flag_val = comm::atomic_u32::volatile_load(
+            &Rt.arrival_flags[q * Rt.remote_queue_stride + q_head]);
+        if (flag_val == 0u) break;
+        const uint32_t claimed = atomicCAS(
+            reinterpret_cast<unsigned int*>(Rt.arrival_queue_head + q),
+            q_head, q_head + 1u);
+        if (claimed != q_head) continue;
+
+        int first_tile = (int)internode::unpack_arrival_first_tile(flag_val);
+        if (first_tile < 0) first_tile = 0;
+        const int single_peer_tiles = Rt.row_blocks_per_slice * Rt.col_blocks_val;
+        const int peer_slot = first_tile / single_peer_tiles;
+        const int local_first_tile = first_tile - peer_slot * single_peer_tiles;
+        const int rb = local_first_tile / Rt.col_blocks_val;
+        int col_start = local_first_tile - rb * Rt.col_blocks_val;
+        int work_tiles = (int)internode::unpack_arrival_num_tiles(flag_val);
+        if (work_tiles < 1) work_tiles = 1;
+        work_tiles = min(work_tiles, Rt.col_blocks_val - col_start);
+
+        // Data WR precedes the packed arrival write on the same QP. Fence before
+        // publishing per-chunk readiness consumed by reducer CTAs.
+        __threadfence_system();
+        while (work_tiles > 0 && col_start < Rt.col_blocks_val) {
+            const int chunk_col = col_start / Rt.chunk_tiles_val;
+            const int chunk_id = rb * Rt.chunks_per_row + chunk_col;
+            const int chunk_start = chunk_col * Rt.chunk_tiles_val;
+            const int tiles_this_chunk = min(
+                Rt.chunk_tiles_val, Rt.col_blocks_val - chunk_start);
+            const int consumed_tiles = min(work_tiles, tiles_this_chunk);
+            if (consumed_tiles <= 0) break;
+            if (!gemm_rs_receiver_owns_chunk(Rt, chunk_id)) {
+                col_start += consumed_tiles;
+                work_tiles -= consumed_tiles;
+                continue;
+            }
+            const uint32_t peer_bit =
+                (peer_slot >= 0 && peer_slot < 31) ? (1u << peer_slot) : 0u;
+            const uint32_t old_mask = atomicOr(
+                reinterpret_cast<unsigned int*>(Rt.remote_arrived_peer_mask + chunk_id),
+                peer_bit);
+            const uint32_t new_mask = old_mask | peer_bit;
+            const int needed_peers = Rt.num_nodes - 1;
+            if (Rt.use_incremental_peer_reduce != 0) {
+                if ((old_mask & peer_bit) == 0u) {
+                    gemm_rs_enqueue_peer_accum_work<G>(Rt, peer_slot, chunk_id);
+                }
+            } else if (__popc(old_mask) < needed_peers && __popc(new_mask) >= needed_peers) {
+                atomicAdd(Rt.remote_arrived_chunks, 1u);
+                gemm_rs_release_store_u32(Rt.remote_arrived_flag + chunk_id, 1u);
+            }
+            col_start += consumed_tiles;
+            work_tiles -= consumed_tiles;
+        }
+        any = true;
+    }
+    return any;
+}
+
+template <typename G>
+__device__ inline void gemm_rs_recv_progress_once(
+    typename G::runtime_state &Rt, int progress_id, int progress_stride
+) {
+    if (Rt.use_transport_arrival_queue == 0) return;
+    if (progress_id < 0) return;
+    const int stride = max(1, progress_stride);
+    for (int q = progress_id; q < Rt.num_remote_queues; q += stride) {
+        gemm_rs_drain_arrival_queue_publish_flags<G>(Rt, q);
+    }
+}
+
+template <typename G>
+__device__ inline void gemm_rs_recv_progress_loop(
+    const G &Gv, int progress_id, int progress_stride, int total_chunks
+) {
+    auto &Rt = *Gv.rt;
+    const unsigned long long start = (threadIdx.x == 0)
+        ? gemm_rs_activity_timestamp(Gv.intra) : 0ull;
+    if (threadIdx.x == 0) {
+        const int done_target = Rt.use_receiver_owner_rs != 0
+            ? Rt.owner_chunks_total : total_chunks;
+        while ((int)gemm_rs_acquire_load_u32(Rt.chunks_processed) < done_target) {
+            gemm_rs_recv_progress_once<G>(Rt, progress_id, progress_stride);
+            __nanosleep(50);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        gemm_rs_record_activity_event(
+            Gv.intra, fused_globals::ACTIVITY_INTER_RECV_PROGRESS, progress_id,
+            start, gemm_rs_activity_timestamp(Gv.intra));
+    }
+}
+
+__device__ __forceinline__ uint32_t gemm_rs_encode_peer_accum_work(
+    int peer_slot, int chunk_id
+) {
+    return ((uint32_t)(peer_slot & 0x7f) << 24) | (uint32_t)(chunk_id + 1);
+}
+
+__device__ __forceinline__ void gemm_rs_decode_peer_accum_work(
+    uint32_t encoded, int& peer_slot, int& chunk_id
+) {
+    peer_slot = (int)((encoded >> 24) & 0x7f);
+    chunk_id = (int)(encoded & 0x00ffffffu) - 1;
+}
+
+template <typename G>
+__device__ inline void gemm_rs_enqueue_peer_accum_work(
+    typename G::runtime_state &Rt, int peer_slot, int chunk_id
+) {
+    const int total_chunks = Rt.row_blocks_per_slice * Rt.chunks_per_row;
+    const int n_peers = Rt.num_nodes - 1;
+    const uint32_t slot = atomicAdd(Rt.peer_accum_tail, 1u);
+    const uint32_t cap = (uint32_t)(total_chunks * max(1, n_peers));
+    if (slot < cap) {
+        gemm_rs_release_store_u32(
+            Rt.peer_accum_queue + slot,
+            gemm_rs_encode_peer_accum_work(peer_slot, chunk_id));
+    }
+}
+
+template <typename G>
+__device__ inline bool gemm_rs_process_peer_accum_work(
+    const G &Gv
+) {
+    auto &Rt = *Gv.rt;
+    __shared__ uint32_t s_encoded_work;
+    if (threadIdx.x == 0) {
+        s_encoded_work = 0u;
+        const uint32_t head = gemm_rs_acquire_load_u32(Rt.peer_accum_head);
+        const uint32_t tail = gemm_rs_acquire_load_u32(Rt.peer_accum_tail);
+        if (head < tail) {
+            const uint32_t old = atomicCAS(
+                reinterpret_cast<unsigned int*>(Rt.peer_accum_head), head, head + 1u);
+            if (old == head) {
+                uint32_t encoded = 0u;
+                while (encoded == 0u) {
+                    encoded = gemm_rs_acquire_load_u32(Rt.peer_accum_queue + head);
+                    if (encoded == 0u) __nanosleep(32);
+                }
+                s_encoded_work = encoded;
+            }
+        }
+    }
+    __syncthreads();
+    const uint32_t encoded = s_encoded_work;
+    if (encoded == 0u) return false;
+
+    int peer_slot = 0;
+    int chunk_id = -1;
+    gemm_rs_decode_peer_accum_work(encoded, peer_slot, chunk_id);
+    const int col_blocks = Rt.col_blocks_val;
+    const int row_blocks_per_dev = Rt.row_blocks_per_slice;
+    const int chunks_per_row = Rt.chunks_per_row;
+    const int chunk_tiles = Rt.chunk_tiles_val;
+    const int total_chunks = row_blocks_per_dev * chunks_per_row;
+    const int n_peers = Rt.num_nodes - 1;
+    if (chunk_id < 0 || chunk_id >= total_chunks ||
+        peer_slot < 0 || peer_slot >= n_peers) {
+        return true;
+    }
+    if (!gemm_rs_receiver_owns_chunk(Rt, chunk_id)) {
+        return true;
+    }
+
+    // Arrival queue draining and peer accumulation can run on different CTAs.
+    // Re-fence on the consumer side before reading RDMA-written recv_buf data.
+    __threadfence_system();
+
+    while (gemm_rs_acquire_load_u32(Rt.sender_done + chunk_id) == 0u) {
+        __nanosleep(32);
+    }
+
+    const int rb = chunk_id / chunks_per_row;
+    const int ci = chunk_id % chunks_per_row;
+    const int col_start = ci * chunk_tiles;
+    const int cols_this_chunk = min(chunk_tiles, col_blocks - col_start);
+    const int first_tile = rb * col_blocks + col_start;
+    const int total_elems = G::ROW_BLOCK * G::COL_BLOCK;
+
+    if (threadIdx.x == 0) {
+        while (atomicCAS(
+            reinterpret_cast<unsigned int*>(Rt.chunk_accum_lock + chunk_id),
+            0u, 1u) != 0u) {
+            __nanosleep(32);
+        }
+    }
+    __syncthreads();
+
+    constexpr int ELEMS_PER_VEC = 8;
+    constexpr int VECS_PER_ROW = G::COL_BLOCK / ELEMS_PER_VEC;
+    constexpr int ROWS_PER_WAVE = config::NUM_THREADS / VECS_PER_ROW;
+    const int vec_lane = threadIdx.x % VECS_PER_ROW;
+    const int row_lane = threadIdx.x / VECS_PER_ROW;
+    const int col_elem = vec_lane * ELEMS_PER_VEC;
+
+    const unsigned long long accum_start = (threadIdx.x == 0)
+        ? gemm_rs_activity_timestamp(Gv.intra) : 0ull;
+    const int single_peer_tiles = row_blocks_per_dev * col_blocks;
+    for (int ti = 0; ti < cols_this_chunk; ++ti) {
+        for (int r = row_lane; r < G::ROW_BLOCK; r += ROWS_PER_WAVE) {
+            bf16 *accum = Rt.staging_buf
+                + (long)(first_tile + ti) * total_elems
+                + (long)r * G::COL_BLOCK + col_elem;
+            const bf16 *peer_recv = Rt.recv_buf
+                + ((long)peer_slot * single_peer_tiles + first_tile + ti)
+                    * total_elems
+                + (long)r * G::COL_BLOCK + col_elem;
+            const uint4 av = *reinterpret_cast<const uint4*>(accum);
+            const uint4 rv = *reinterpret_cast<const uint4*>(peer_recv);
+            __nv_bfloat162 o0 = __hadd2(
+                *reinterpret_cast<const __nv_bfloat162*>(&av.x),
+                *reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+            __nv_bfloat162 o1 = __hadd2(
+                *reinterpret_cast<const __nv_bfloat162*>(&av.y),
+                *reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+            __nv_bfloat162 o2 = __hadd2(
+                *reinterpret_cast<const __nv_bfloat162*>(&av.z),
+                *reinterpret_cast<const __nv_bfloat162*>(&rv.z));
+            __nv_bfloat162 o3 = __hadd2(
+                *reinterpret_cast<const __nv_bfloat162*>(&av.w),
+                *reinterpret_cast<const __nv_bfloat162*>(&rv.w));
+            uint4 ov;
+            ov.x = *reinterpret_cast<unsigned int*>(&o0);
+            ov.y = *reinterpret_cast<unsigned int*>(&o1);
+            ov.z = *reinterpret_cast<unsigned int*>(&o2);
+            ov.w = *reinterpret_cast<unsigned int*>(&o3);
+            *reinterpret_cast<uint4*>(accum) = ov;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        gemm_rs_record_activity_event(
+            Gv.intra, fused_globals::ACTIVITY_INTER_PEER_ACCUM, chunk_id,
+            accum_start, gemm_rs_activity_timestamp(Gv.intra));
+        __threadfence_system();
+        gemm_rs_release_store_u32(Rt.chunk_accum_lock + chunk_id, 0u);
+        const uint32_t done =
+            atomicAdd(Rt.peer_accum_done_count + chunk_id, 1u) + 1u;
+        if (done == (uint32_t)n_peers) {
+            gemm_rs_release_store_u32(Rt.chunk_reduce_done + chunk_id, 1u);
+            const uint32_t slot = atomicAdd(Rt.ready_reduce_tail, 1u);
+            if (slot < (uint32_t)total_chunks) {
+                gemm_rs_release_store_u32(Rt.ready_reduce_queue + slot,
+                                          (uint32_t)(chunk_id + 1));
+            }
+        }
+    }
+    __syncthreads();
+    return true;
+}
+
+template <typename G>
+__device__ inline bool gemm_rs_chunk_prereqs_ready(
+    typename G::runtime_state &Rt, int chunk_id
+) {
+    const int col_blocks = Rt.col_blocks_val;
+    const int row_blocks_per_dev = Rt.row_blocks_per_slice;
+    const int chunks_per_row = Rt.chunks_per_row;
+    const int chunk_tiles = Rt.chunk_tiles_val;
+    const int rb = chunk_id / chunks_per_row;
+    const int ci = chunk_id % chunks_per_row;
+    const int col_start = ci * chunk_tiles;
+    const int first_tile = rb * col_blocks + col_start;
+    if (gemm_rs_acquire_load_u32(Rt.sender_done + chunk_id) == 0u) return false;
+    if (Rt.use_transport_arrival_queue != 0) {
+        return gemm_rs_acquire_load_u32(Rt.remote_arrived_flag + chunk_id) == 1u;
+    }
+    const int single_peer_tiles = row_blocks_per_dev * col_blocks;
+    const int n_peers = Rt.num_nodes - 1;
+    for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+        volatile uint32_t* flag_ptr =
+            &Rt.arrival_flags[peer_slot * single_peer_tiles + first_tile];
+        if (gemm_rs_poll_arrival_acquire(flag_ptr) != Rt.epoch) return false;
+    }
+    return true;
+}
+
+template <typename G>
+__device__ inline void gemm_rs_ready_reduce_queue_progress(
+    typename G::runtime_state &Rt, int total_chunks
+) {
+    constexpr int kScansPerProgress = 8;
+    if (Rt.use_incremental_peer_reduce != 0) {
+        gemm_rs_recv_progress_once<G>(Rt, 0, 1);
+        return;
+    }
+    for (int i = 0; i < kScansPerProgress; ++i) {
+        const uint32_t scan = atomicAdd(Rt.ready_reduce_scan, 1u);
+        const int chunk_id = (int)(scan % (uint32_t)total_chunks);
+        const uint32_t state = gemm_rs_acquire_load_u32(Rt.remote_arrived_flag + chunk_id);
+        if ((Rt.use_transport_arrival_queue != 0 && state == 2u) ||
+            (Rt.use_transport_arrival_queue == 0 && state != 0u)) {
+            continue;
+        }
+        gemm_rs_recv_progress_once<G>(Rt, (int)(scan % (uint32_t)max(1, Rt.num_recv_progress_sms)),
+                                      max(1, Rt.num_recv_progress_sms));
+        if (!gemm_rs_chunk_prereqs_ready<G>(Rt, chunk_id)) continue;
+        const uint32_t expected = (Rt.use_transport_arrival_queue != 0) ? 1u : 0u;
+        const uint32_t old = atomicCAS(
+            reinterpret_cast<unsigned int*>(Rt.remote_arrived_flag + chunk_id),
+            expected, 2u);
+        if (old != expected) continue;
+        const uint32_t slot = atomicAdd(Rt.ready_reduce_tail, 1u);
+        if (slot < (uint32_t)total_chunks) {
+            gemm_rs_release_store_u32(Rt.ready_reduce_queue + slot,
+                                      (uint32_t)(chunk_id + 1));
+        }
+    }
+}
+
+template <typename G>
+__device__ inline int gemm_rs_ready_reduce_queue_pop(
+    typename G::runtime_state &Rt
+) {
+    while (true) {
+        const uint32_t head = gemm_rs_acquire_load_u32(Rt.ready_reduce_head);
+        const uint32_t tail = gemm_rs_acquire_load_u32(Rt.ready_reduce_tail);
+        if (head >= tail) return -1;
+        const uint32_t old = atomicCAS(
+            reinterpret_cast<unsigned int*>(Rt.ready_reduce_head), head, head + 1u);
+        if (old != head) continue;
+        uint32_t encoded = 0u;
+        while (encoded == 0u) {
+            encoded = gemm_rs_acquire_load_u32(Rt.ready_reduce_queue + head);
+            if (encoded == 0u) __nanosleep(32);
+        }
+        return (int)encoded - 1;
+    }
+}
+
 template <typename G>
 __device__ inline void reduce_tiles_ws(const G &Gv) {
     if (Gv.rt == nullptr) return;
@@ -333,15 +718,58 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
     const int chunks_per_row = Rt.chunks_per_row;
     const int chunk_tiles = Rt.chunk_tiles_val;
     const int total_chunks = row_blocks_per_dev * chunks_per_row;
+    const int done_target = Rt.use_receiver_owner_rs != 0
+        ? Rt.owner_chunks_total : total_chunks;
 
     while (true) {
         __shared__ int _ws_red_chunk;
-        if (threadIdx.x == 0) {
-            _ws_red_chunk = (int)atomicAdd(Rt.next_reduce, 1u);
+        __shared__ unsigned long long _ws_red_wait_start;
+        if (Rt.use_incremental_peer_reduce != 0) {
+            while (true) {
+                if (threadIdx.x == 0) {
+                    _ws_red_wait_start =
+                        gemm_rs_activity_timestamp(Gv.intra);
+                    _ws_red_chunk = -1;
+                    gemm_rs_recv_progress_once<G>(Rt, 0, 1);
+                    const int ready_chunk = gemm_rs_ready_reduce_queue_pop<G>(Rt);
+                    if (ready_chunk >= 0) {
+                        _ws_red_chunk = ready_chunk;
+                    } else if ((int)gemm_rs_acquire_load_u32(Rt.chunks_processed) >= done_target) {
+                        _ws_red_chunk = -2;
+                    }
+                }
+                __syncthreads();
+                if (_ws_red_chunk >= 0 || _ws_red_chunk == -2) break;
+                const bool did_peer_accum = gemm_rs_process_peer_accum_work<G>(Gv);
+                if (!did_peer_accum && threadIdx.x == 0) {
+                    __nanosleep(Rt.reduce_poll_sleep_ns);
+                }
+                __syncthreads();
+            }
+        } else if (threadIdx.x == 0) {
+            _ws_red_wait_start = gemm_rs_activity_timestamp(Gv.intra);
+            if (Rt.use_ready_reduce_queue != 0) {
+                _ws_red_chunk = -1;
+                while (_ws_red_chunk < 0) {
+                    gemm_rs_ready_reduce_queue_progress<G>(Rt, total_chunks);
+                    _ws_red_chunk = gemm_rs_ready_reduce_queue_pop<G>(Rt);
+                    if (_ws_red_chunk >= 0) break;
+                    if ((int)gemm_rs_acquire_load_u32(Rt.chunks_processed) >= done_target) {
+                        break;
+                    }
+                    __nanosleep(Rt.reduce_poll_sleep_ns);
+                }
+            } else {
+                _ws_red_chunk = (int)atomicAdd(Rt.next_reduce, 1u);
+            }
         }
         __syncthreads();
         const int chunk_id = _ws_red_chunk;
         if (chunk_id >= total_chunks) break;
+        if (chunk_id < 0) break;
+        if (!gemm_rs_receiver_owns_chunk(Rt, chunk_id)) {
+            continue;
+        }
 
         const int rb = chunk_id / chunks_per_row;
         const int ci = chunk_id % chunks_per_row;
@@ -353,21 +781,32 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
         // Wait for both prerequisites in parallel: thread 0 tracks the remote
         // RDMA arrival, while warp 1 lane 0 tracks local sender completion.
         // Keeping the polls in separate warps avoids SIMT serialization.
-        if (threadIdx.x == 0) {
+        const unsigned long long wait_start = _ws_red_wait_start;
+        if (Rt.use_incremental_peer_reduce != 0 && threadIdx.x == 0) {
+            while (gemm_rs_acquire_load_u32(Rt.chunk_reduce_done + chunk_id) == 0u) {
+                gemm_rs_recv_progress_once<G>(Rt, 0, 1);
+                __nanosleep(Rt.reduce_poll_sleep_ns);
+            }
+        } else if (threadIdx.x == 0) {
             if (gemm_rs_acquire_load_u32(Rt.remote_arrived_flag + chunk_id) == 0u) {
-                volatile uint32_t* flag_ptr = &Rt.arrival_flags[first_tile];
                 const uint32_t sleep_ns = Rt.reduce_poll_sleep_ns;
                 constexpr int kTightSpin = 64;
-                int spin = 0;
-                if (Rt.use_acquire_poll) {
-                    while (gemm_rs_poll_arrival_acquire(flag_ptr) != Rt.epoch) {
-                        if (spin < kTightSpin) { ++spin; }
-                        else { __nanosleep(sleep_ns); }
-                    }
-                } else {
-                    while (gemm_rs_poll_arrival_relaxed(flag_ptr) != Rt.epoch) {
-                        if (spin < kTightSpin) { ++spin; }
-                        else { __nanosleep(sleep_ns); }
+                const int single_peer_tiles = row_blocks_per_dev * col_blocks;
+                const int n_peers = Rt.num_nodes - 1;
+                for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                    volatile uint32_t* flag_ptr =
+                        &Rt.arrival_flags[peer_slot * single_peer_tiles + first_tile];
+                    int spin = 0;
+                    if (Rt.use_acquire_poll) {
+                        while (gemm_rs_poll_arrival_acquire(flag_ptr) != Rt.epoch) {
+                            if (spin < kTightSpin) { ++spin; }
+                            else { __nanosleep(sleep_ns); }
+                        }
+                    } else {
+                        while (gemm_rs_poll_arrival_relaxed(flag_ptr) != Rt.epoch) {
+                            if (spin < kTightSpin) { ++spin; }
+                            else { __nanosleep(sleep_ns); }
+                        }
                     }
                 }
                 // Publish a same-GPU flag for any other reducer CTA that later
@@ -375,12 +814,17 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
                 __threadfence_system();
                 gemm_rs_release_store_u32(Rt.remote_arrived_flag + chunk_id, 1u);
             }
-        } else if (threadIdx.x == 32) {
+        } else if (Rt.use_incremental_peer_reduce == 0 && threadIdx.x == 32) {
             while (gemm_rs_acquire_load_u32(Rt.sender_done + chunk_id) == 0u) {
                 __nanosleep(32);
             }
         }
         __syncthreads();
+        if (threadIdx.x == 0) {
+            gemm_rs_record_activity_event(
+                Gv.intra, fused_globals::ACTIVITY_INTER_REDUCE_WAIT, chunk_id,
+                wait_start, gemm_rs_activity_timestamp(Gv.intra));
+        }
 
         constexpr int ELEMS_PER_VEC = 8;
         constexpr int VECS_PER_ROW = G::COL_BLOCK / ELEMS_PER_VEC;
@@ -389,41 +833,52 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
         const int row_lane = threadIdx.x / VECS_PER_ROW;
         const int col_elem = vec_lane * ELEMS_PER_VEC;
 
+        const unsigned long long accum_start = (threadIdx.x == 0)
+            ? gemm_rs_activity_timestamp(Gv.intra) : 0ull;
         for (int ti = 0; ti < cols_this_chunk; ++ti) {
             for (int r = row_lane; r < G::ROW_BLOCK; r += ROWS_PER_WAVE) {
                 const int si = (rb * G::ROW_BLOCK + r) * Rt.N
                              + (col_start + ti) * G::COL_BLOCK + col_elem;
-                // Staging path: sender packs tile-major, so recv_buf is
-                // tile-major (tile_id × total_elems blocks).
-                const bf16 *recv = Rt.recv_buf
-                    + (long)(first_tile + ti) * total_elems
-                    + (long)r * G::COL_BLOCK + col_elem;
-
                 // Local and remote chunks are both tile-major; write the final
                 // reduced values back to row-major output.
                 const bf16 *local_src = Rt.staging_buf
                     + (long)(first_tile + ti) * total_elems
                     + (long)r * G::COL_BLOCK + col_elem;
                 const uint4 lv = *reinterpret_cast<const uint4*>(local_src);
-                const uint4 rv = *reinterpret_cast<const uint4*>(recv);
-                __nv_bfloat162 o0 = __hadd2(
-                    *reinterpret_cast<const __nv_bfloat162*>(&lv.x),
-                    *reinterpret_cast<const __nv_bfloat162*>(&rv.x));
-                __nv_bfloat162 o1 = __hadd2(
-                    *reinterpret_cast<const __nv_bfloat162*>(&lv.y),
-                    *reinterpret_cast<const __nv_bfloat162*>(&rv.y));
-                __nv_bfloat162 o2 = __hadd2(
-                    *reinterpret_cast<const __nv_bfloat162*>(&lv.z),
-                    *reinterpret_cast<const __nv_bfloat162*>(&rv.z));
-                __nv_bfloat162 o3 = __hadd2(
-                    *reinterpret_cast<const __nv_bfloat162*>(&lv.w),
-                    *reinterpret_cast<const __nv_bfloat162*>(&rv.w));
+                __nv_bfloat162 o0 = *reinterpret_cast<const __nv_bfloat162*>(&lv.x);
+                __nv_bfloat162 o1 = *reinterpret_cast<const __nv_bfloat162*>(&lv.y);
+                __nv_bfloat162 o2 = *reinterpret_cast<const __nv_bfloat162*>(&lv.z);
+                __nv_bfloat162 o3 = *reinterpret_cast<const __nv_bfloat162*>(&lv.w);
+                if (Rt.use_incremental_peer_reduce == 0) {
+                    const int single_peer_tiles = row_blocks_per_dev * col_blocks;
+                    const int n_peers = Rt.num_nodes - 1;
+                    for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
+                        const bf16 *peer_recv = Rt.recv_buf
+                            + ((long)peer_slot * single_peer_tiles + first_tile + ti)
+                                * total_elems
+                            + (long)r * G::COL_BLOCK + col_elem;
+                        const uint4 rv = *reinterpret_cast<const uint4*>(peer_recv);
+                        o0 = __hadd2(o0, *reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+                        o1 = __hadd2(o1, *reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+                        o2 = __hadd2(o2, *reinterpret_cast<const __nv_bfloat162*>(&rv.z));
+                        o3 = __hadd2(o3, *reinterpret_cast<const __nv_bfloat162*>(&rv.w));
+                    }
+                }
                 uint4 ov;
                 ov.x = *reinterpret_cast<unsigned int*>(&o0);
                 ov.y = *reinterpret_cast<unsigned int*>(&o1);
                 ov.z = *reinterpret_cast<unsigned int*>(&o2);
                 ov.w = *reinterpret_cast<unsigned int*>(&o3);
                 *reinterpret_cast<uint4*>(Rt.output_local + si) = ov;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            gemm_rs_record_activity_event(
+                Gv.intra, fused_globals::ACTIVITY_INTER_REDUCE_ACCUM, chunk_id,
+                accum_start, gemm_rs_activity_timestamp(Gv.intra));
+            if (Rt.use_ready_reduce_queue != 0) {
+                atomicAdd(Rt.chunks_processed, 1u);
             }
         }
     }
@@ -544,7 +999,16 @@ __device__ inline void fused_kernel(const fused_globals &G) {
         reduce_tiles_ws<fused_globals>(G);
     } else {
         // Dedicated reduce CTAs: work-stealing from the start
-        reduce_tiles_ws<fused_globals>(G);
+        const int reduce_base = I.num_comp_sms + I.num_comm_sms + G.num_send_sms;
+        const int reduce_id = (int)blockIdx.x - reduce_base;
+        if (G.rt != nullptr && G.rt->use_transport_arrival_queue != 0 &&
+            reduce_id >= 0 && reduce_id < G.rt->num_recv_progress_sms) {
+            const int total_chunks = G.rt->row_blocks_per_slice * G.rt->chunks_per_row;
+            gemm_rs_recv_progress_loop<fused_globals>(
+                G, reduce_id, G.rt->num_recv_progress_sms, total_chunks);
+        } else {
+            reduce_tiles_ws<fused_globals>(G);
+        }
     }
 
 
@@ -575,7 +1039,13 @@ __global__ void gemm_rs_fused_zero_kernel(gemm_rs_zero_regions_t regs) {
 
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
 void gemm_rs_fused_kernel_stub(const __grid_constant__ fused_globals G) {
+    if (blockIdx.x == 0 && threadIdx.x == 0 && G.intra.kernel_start_ns != nullptr) {
+        *G.intra.kernel_start_ns = gemm_rs_globaltimer();
+    }
     fused_kernel(G);
+    if (blockIdx.x == 0 && threadIdx.x == 0 && G.intra.kernel_end_ns != nullptr) {
+        *G.intra.kernel_end_ns = gemm_rs_globaltimer();
+    }
 }
 
 // Launch wrapper stays in this TU so the kernel body stays out of the .cuh.

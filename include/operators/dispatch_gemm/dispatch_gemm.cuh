@@ -74,13 +74,17 @@ static constexpr int DYNAMIC_SHARED_MEMORY = 227 * 1024 - 1024;
 // strategy is not a good fit for this proxy path.
 static constexpr int CHUNK_BYTES = 512 * 1024;
 
+#ifndef TK_MOE_NUM_NODES
+#define TK_MOE_NUM_NODES 2
+#endif
+
 // ============================================================================
 // Globals
 // ============================================================================
 
 struct globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;       // GPUs per node
-    static constexpr int NUM_NODES = 2;
+    static constexpr int NUM_NODES = TK_MOE_NUM_NODES;
     static constexpr int H = TK_MOE_H;
     static constexpr int I = TK_MOE_I;
     static constexpr int TOP_K = TK_MOE_TOP_K;
@@ -135,7 +139,7 @@ struct globals {
 
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
-    static constexpr int NUM_NODES = 2;
+    static constexpr int NUM_NODES = TK_MOE_NUM_NODES;
     static constexpr int H = TK_MOE_H;
     static constexpr int I = TK_MOE_I;
     static constexpr int TOP_K = TK_MOE_TOP_K;

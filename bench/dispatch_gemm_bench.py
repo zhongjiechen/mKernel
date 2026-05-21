@@ -30,7 +30,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
+from common import (  # noqa: E402
+    check_close,
+    compare_named_results,
+    gather_cpu_tensors,
+    get_peer_ips,
+    get_peer_ports,
+)
 
 KERNEL_NAME = "dispatch_gemm"
 
@@ -44,13 +50,18 @@ NUM_NODES = get_num_nodes()
 ROW_BLOCK = 128
 CHUNK_BYTES = 512 * 1024  # baked in source
 
-# Default sweep matches the bar chart x-axis.
-DEFAULT_SHAPES = [8192, 16384, 32768, 65536, 131072]
+# Default sweep matches the bar chart x-axis. For 3 nodes, token counts must
+# divide evenly across 24 GPUs.
+DEFAULT_SHAPES = (
+    [12288, 24576, 49152, 98304, 196608]
+    if NUM_NODES == 3 else
+    [8192, 16384, 32768, 65536, 131072]
+)
 
 
 def avg_then_max_cuda(samples):
     avg = sum(float(x) for x in samples) / len(samples)
-    t = torch.tensor([avg], device="cuda")
+    t = torch.tensor([avg], dtype=torch.float64, device="cuda")
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
@@ -193,7 +204,11 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ["WORLD_SIZE"]))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    dist_backend = os.environ.get("MKERNEL_DIST_BACKEND", "nccl")
+    if dist_backend == "nccl":
+        dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    else:
+        dist.init_process_group(dist_backend)
 
     node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
     is_chief = (local_rank == 0 and node_idx == 0)
@@ -221,6 +236,7 @@ def main():
 
     result_sizes = []
     result_fused = []
+    correctness_ok = True
 
     for num_tokens_global in shapes:
         num_local_tokens = num_tokens_global // total_gpus
@@ -289,8 +305,9 @@ def main():
         )
         pre_tokens.data_.copy_(pre_tokens_data)
 
+        n_peers = NUM_NODES - 1
         peer_tokens = mod.DistBuffer(
-            (num_local_tokens, H), dtype=torch.bfloat16,
+            (n_peers * num_local_tokens, H), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=False,
         )
         peer_tokens.data_.zero_()
@@ -315,18 +332,16 @@ def main():
 
         pre_tokens_bytes = num_local_tokens * H * 2
         total_chunks = (pre_tokens_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
+        # Per-peer sizing. At N == 2 the multiplier is 1 — same buffer /
+        # arrival-flag sizing as the legacy single-peer setup.
+        recv_buf_chunks = n_peers * total_chunks
         copy_ready = mod.DistBuffer(
-            (world_size, total_chunks, 1), dtype=torch.int32,
+            (world_size, recv_buf_chunks, 1), dtype=torch.int32,
             local_rank=local_rank, local_world_size=world_size, multicast=False,
         )
         copy_ready.data_.zero_()
         send_buf = torch.empty((num_local_tokens, H),
                                 device="cuda", dtype=torch.bfloat16)
-
-        # Per-peer sizing. At N == 2 the multiplier is 1 — same buffer /
-        # arrival-flag sizing as the legacy single-peer setup.
-        n_peers = NUM_NODES - 1
-        recv_buf_chunks = n_peers * total_chunks
 
         dist.barrier()
         fifo_cap = 2048
@@ -342,7 +357,7 @@ def main():
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
-            send_buf.data_ptr(), pre_tokens_bytes,
+            int(pre_tokens.data_.data_ptr()), pre_tokens_bytes,
             n_peers * pre_tokens_bytes, recv_buf_chunks, fifo_cap, local_rank,
             external_recv_buf_ptr,
             int(pre_tokens.data_.data_ptr()),
@@ -381,9 +396,13 @@ def main():
             sync_barrier.data_.zero_()
             copy_ready.data_.zero_()
 
-        # Prime: first epoch is a known stale-state warmup on EFA dispatch_gemm.
-        reset_state(); dist.barrier(); time.sleep(0.05)
-        run_once(); torch.cuda.synchronize(); dist.barrier()
+        # Prime: first epoch is a known stale-state warmup on the legacy
+        # two-node path. On N-node fanout it can mask the real check by
+        # deadlocking before the measured iteration, so start from a fresh
+        # epoch/reset there instead.
+        if NUM_NODES <= 2:
+            reset_state(); dist.barrier(); time.sleep(0.05)
+            run_once(); torch.cuda.synchronize(); dist.barrier()
 
         epoch += 1; mod.set_epoch(epoch); reset_state()
         dist.barrier(); time.sleep(0.05)
@@ -404,6 +423,8 @@ def main():
         # ~5 ms; smaller shapes use bigger N for stability.
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
+            legacy_sync = True
+        if NUM_NODES > 2:
             legacy_sync = True
         if not legacy_sync:
             # Tier N by shape so total measurement ~>= 100 ms.
@@ -442,6 +463,32 @@ def main():
         wall_ms = avg_then_max_cuda(samples)
         if is_chief:
             print(f"[dispatch_gemm] tokens={num_tokens_global} wall={wall_ms:.3f} ms", flush=True)
+        if args.mode == "check":
+            gathered_tokens = gather_cpu_tensors(pre_tokens_data)
+            pull_cpu = pull_idx.detach().cpu()
+            post_ref_cpu = torch.zeros((num_padded_local, H), dtype=torch.bfloat16)
+            for row in range(num_padded_local):
+                src_node, src_dev, local_tok = [int(x) for x in pull_cpu[row].tolist()]
+                if src_node >= 0:
+                    src_rank = src_node * world_size + src_dev
+                    post_ref_cpu[row].copy_(gathered_tokens[src_rank][local_tok])
+            out_ref = torch.zeros_like(outputs)
+            row_off = 0
+            expert_start = global_gpu_idx * num_experts_per_dev
+            for local_e, expert_id in enumerate(
+                range(expert_start, expert_start + num_experts_per_dev)
+            ):
+                rows = padded_list[expert_id]
+                if rows > 0:
+                    out_ref[row_off:row_off + rows].copy_(
+                        torch.matmul(post_ref_cpu[row_off:row_off + rows].to("cuda"),
+                                     weights[local_e])
+                    )
+                row_off += rows
+            correctness_ok = check_close(
+                f"dispatch_gemm tokens={num_tokens_global}",
+                outputs, out_ref, atol=0.55, rtol=0.12
+            ) and correctness_ok
         result_sizes.append(f"tokens={num_tokens_global}")
         result_fused.append(wall_ms)
         # Don't call destroy_session — re-creating per shape is fine and
@@ -458,10 +505,14 @@ def main():
     if is_chief and args.compare_to:
         ok = compare_named_results("dispatch_gemm", result_sizes, result_fused,
                                    args.compare_to)
+        ok = ok and correctness_ok
         dist.destroy_process_group()
         if not ok:
             return 1
         return 0
+    if not correctness_ok:
+        dist.destroy_process_group()
+        return 1
 
     dist.destroy_process_group()
     return 0

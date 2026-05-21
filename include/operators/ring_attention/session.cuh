@@ -46,11 +46,20 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     cfg.clocal_gpu_buf = reinterpret_cast<void*>(v0_buf_ptr);
     cfg.clocal_gpu_buf_size = (size_t)v0_buf_size;
     cfg.direct_dmabuf_enabled = true;
-    cfg.max_inflight = 2048;
+    cfg.max_inflight = 32;
+    if (const char* env_mi = std::getenv("MKERNEL_MAX_INFLIGHT")) {
+        cfg.max_inflight = std::atoi(env_mi);
+    }
     // Round 25: default to 4 QPs per endpoint to match the gemm_ar round-13 win
     // (51e19e8). Multi-NIC striping is also enabled by default via the
     // round-18 cluster default MKERNEL_EFA_NUM_NICS=2 in session_fi.h.
     cfg.num_qps = 4;
+    if (cfg.num_peers > 1 && std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS") != nullptr) {
+        cfg.num_qps = std::min(
+            internode::kMaxQPs,
+            cfg.num_peers * ring_attn_multinode::globals::NUM_DEVICES);
+        cfg.channelize_gpu_peers = true;
+    }
     if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
         cfg.num_qps = std::atoi(env_num_qps);
     }

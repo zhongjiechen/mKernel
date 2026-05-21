@@ -35,8 +35,9 @@ def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
 
     Reads NODE0_IP, NODE1_IP, ..., NODE{N-1}_IP from the environment, falling
     back to the 2-node testbed defaults when the env var is unset (only sane
-    for N <= 2). Returns the list of OTHER nodes' IPs in slot order, skipping
-    self.
+    for N <= 2). Returns peers in the same ring slot order as
+    internode::peer_rank_for_slot(): node_idx + 1, node_idx + 2, ...
+    wrapping modulo num_nodes.
     """
     all_ips = []
     for i in range(num_nodes):
@@ -44,7 +45,7 @@ def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
         if not ip:
             ip = _PEER_IP_DEFAULTS.get(i, "")
         all_ips.append(ip)
-    return [ip for i, ip in enumerate(all_ips) if i != node_idx]
+    return [all_ips[(node_idx + 1 + slot) % num_nodes] for slot in range(num_nodes - 1)]
 
 
 def get_peer_ports(node_idx: int, num_nodes: int, base_port: int) -> list[int]:
@@ -53,21 +54,24 @@ def get_peer_ports(node_idx: int, num_nodes: int, base_port: int) -> list[int]:
     For N == 2 returns [base_port] — a single shared port per pair, matching
     the legacy 2-node setup bit-for-bit.
 
-    For N > 2 each unordered (lo, hi) rank pair gets a unique port computed as
-    `base_port + lo * num_nodes + hi`, so both sides of a pair derive the same
-    port from `(min(self, peer), max(self, peer))`. Avoids the listen-socket
-    collision that would otherwise hit any rank serving more than one peer
-    when num_nodes > 2.
+    For N > 2 peers follow internode::peer_rank_for_slot() ring order. Each
+    unordered (lo, hi) rank pair gets a unique port computed as
+    `base_port + (lo * num_nodes + hi) * local_world_size`, so both sides of a
+    pair derive the same port from `(min(self, peer), max(self, peer))`.
+
+    `base_port` is already per-local-rank (`TCP_PORT + LOCAL_RANK`) in the
+    bench scripts. Striding pair offsets by local_world_size prevents adjacent
+    local ranks on the same host from colliding on the same listen port.
     """
     ports = []
-    for i in range(num_nodes):
-        if i == node_idx:
-            continue
+    for slot in range(num_nodes - 1):
+        i = (node_idx + 1 + slot) % num_nodes
         if num_nodes == 2:
             ports.append(base_port)
         else:
             lo, hi = (node_idx, i) if node_idx < i else (i, node_idx)
-            ports.append(base_port + lo * num_nodes + hi)
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "8"))
+            ports.append(base_port + (lo * num_nodes + hi) * local_world_size)
     return ports
 
 
@@ -255,6 +259,61 @@ def compare_named_results(
     return ok
 
 
+def gather_cpu_tensors(tensor: torch.Tensor) -> list[torch.Tensor]:
+    """Gather a tensor through the CPU process group for small correctness checks."""
+    obj = tensor.detach().cpu().contiguous()
+    gathered: list[torch.Tensor | None] = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, obj)
+    return [x for x in gathered if x is not None]
+
+
+def check_close(
+    name: str,
+    observed: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    atol: float = 0.35,
+    rtol: float = 0.08,
+) -> bool:
+    """Distributed tensor closeness check; returns False if any rank fails."""
+    observed_f = observed.detach().float()
+    expected_f = expected.detach().to(device=observed.device).float()
+    diff = (observed_f - expected_f).abs()
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    denom = expected_f.abs().clamp_min(1e-6)
+    max_rel = float((diff / denom).max().item()) if diff.numel() else 0.0
+    local_ok = max_abs <= atol or max_rel <= rtol
+    if not local_ok:
+        print(f"[correctness-local] rank={dist.get_rank()} {name}: "
+              f"max_abs={max_abs:.6f} max_rel={max_rel:.6f}",
+              flush=True)
+        if os.environ.get("MKERNEL_DEBUG_CORRECTNESS", "0") == "1" and diff.numel():
+            flat_idx = int(diff.argmax().item())
+            unraveled = []
+            rem = flat_idx
+            for dim in reversed(diff.shape):
+                unraveled.append(rem % dim)
+                rem //= dim
+            unraveled.reverse()
+            obs_val = float(observed_f.flatten()[flat_idx].item())
+            exp_val = float(expected_f.flatten()[flat_idx].item())
+            print(
+                f"[correctness-debug] rank={dist.get_rank()} {name}: "
+                f"idx={tuple(unraveled)} observed={obs_val:.6f} expected={exp_val:.6f}",
+                flush=True,
+            )
+    stats = torch.tensor([max_abs, max_rel, 0.0 if local_ok else 1.0],
+                         dtype=torch.float64)
+    dist.all_reduce(stats, op=dist.ReduceOp.MAX)
+    ok = bool(stats[2].item() == 0.0)
+    if dist.get_rank() == 0:
+        mark = "PASS" if ok else "FAIL"
+        print(f"[correctness] {name}: max_abs={stats[0].item():.6f} "
+              f"max_rel={stats[1].item():.6f} atol={atol} rtol={rtol} {mark}",
+              flush=True)
+    return ok
+
+
 # ----------------------------------------------------------------------
 # Result JSON writer
 # ----------------------------------------------------------------------
@@ -319,12 +378,14 @@ def write_results_json(
     sorted_ms = [merged[s] for s in sorted_sizes]
 
     data = dict(existing)  # preserve nccl_ms, _note, etc. on existing JSON
+    world_size = int(os.environ.get("WORLD_SIZE", existing.get("world_size", 8)))
+    num_nodes = int(os.environ.get("NUM_NODES", existing.get("num_nodes", 2)))
     data.update({
         "kernel": kernel,
         "sizes": sorted_sizes,
         "fused_ms": sorted_ms,
-        "world_size": existing.get("world_size", 8),
-        "num_nodes": existing.get("num_nodes", 2),
+        "world_size": world_size,
+        "num_nodes": num_nodes,
         "_note": note or existing.get("_note", f"release {kernel} bench (EFA backend)"),
     })
     out_path.parent.mkdir(parents=True, exist_ok=True)

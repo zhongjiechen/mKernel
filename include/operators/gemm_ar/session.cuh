@@ -11,6 +11,8 @@
 // Session management
 // ============================================================================
 #include "comm/internode/session_py.cuh"
+#include <algorithm>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <torch/csrc/utils/pybind.h>
 
@@ -35,19 +37,39 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     internode::py::apply_peer_ips(
         cfg, peer_ips, peer_tcp_ports, tcp_port,
         g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
-    cfg.max_inflight = 256;
-    (void)clocal_buf_ptr; (void)clocal_buf_size; (void)row_stride_bytes;
+    cfg.max_inflight = 32;
+    if (const char* env_mi = std::getenv("MKERNEL_MAX_INFLIGHT")) {
+        cfg.max_inflight = std::atoi(env_mi);
+    }
+    cfg.clocal_gpu_buf = reinterpret_cast<void*>(clocal_buf_ptr);
+    cfg.clocal_gpu_buf_size = (size_t)clocal_buf_size;
+    cfg.row_stride_bytes = (size_t)row_stride_bytes;
+    cfg.direct_dmabuf_enabled =
+        (std::getenv("GEMM_AR_RING_EXPERIMENT") != nullptr
+         || std::getenv("GEMM_AR_RING_RS_EXPERIMENT") != nullptr
+         || std::getenv("GEMM_AR_DIRECT_SRC_VIEW") != nullptr)
+        && clocal_buf_ptr != 0 && clocal_buf_size > 0;
     // EFA/libfabric backends support these extended session fields
     cfg.use_write_imm = false;
     cfg.ready_queue_cap = 0;
     cfg.use_arrival_queue = true;
     cfg.num_qps = 4;
+    if (cfg.num_peers > 1 && std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS") != nullptr) {
+        cfg.num_qps = std::min(internode::kMaxQPs, cfg.num_peers * 8);
+        cfg.channelize_gpu_peers = true;
+    }
     if (const char* env_num_qps = std::getenv("MKERNEL_INTERNODE_NUM_QPS")) {
-        cfg.num_qps = std::atoi(env_num_qps);
+        cfg.num_qps = cfg.channelize_gpu_peers
+            ? std::max(cfg.num_qps, std::atoi(env_num_qps))
+            : std::atoi(env_num_qps);
     } else if (const char* env_num_qps = std::getenv("MKERNEL_IB_NUM_QPS")) {
-        cfg.num_qps = std::atoi(env_num_qps);
+        cfg.num_qps = cfg.channelize_gpu_peers
+            ? std::max(cfg.num_qps, std::atoi(env_num_qps))
+            : std::atoi(env_num_qps);
     } else if (const char* env_num_qps = std::getenv("MKERNEL_EFA_NUM_QPS")) {
-        cfg.num_qps = std::atoi(env_num_qps);
+        cfg.num_qps = cfg.channelize_gpu_peers
+            ? std::max(cfg.num_qps, std::atoi(env_num_qps))
+            : std::atoi(env_num_qps);
     }
     cfg.logical_queues_per_qp = 1;
     if (const char* env_logical = std::getenv("GEMM_AR_LOGICAL_QUEUES_PER_QP")) {
@@ -193,6 +215,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("cross_node_barrier_ptr") = (int64_t)0,
           pybind11::arg("trace_slot") = -1,
           pybind11::arg("use_acquire_poll") = false,
-          pybind11::arg("num_nodes") = 2);
+          pybind11::arg("num_nodes") = 2,
+          pybind11::arg("remote_accum_ptr") = (int64_t)0);
 }
 // -- END inlined from gemm_ar_multinode_module.cuh

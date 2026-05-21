@@ -475,7 +475,7 @@ __device__ inline void kv_stage_and_send_sm(const kv_exchange_globals &G) {
             for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                 const int peer_rank = internode::peer_rank_for_slot(
                     G.node_idx, G.num_nodes, peer_slot);
-                const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
+                const int sap = internode::slot_at_peer(G.node_idx, peer_rank, G.num_nodes);
                 internode::TransferCmd cmd{};
                 cmd.cmd_type = internode::CmdType::WRITE;
                 cmd.dst_rank = (uint8_t)peer_rank;
@@ -485,6 +485,7 @@ __device__ inline void kv_stage_and_send_sm(const kv_exchange_globals &G) {
                 cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes + remote_off;
                 cmd.src_view = src_view;
                 cmd.lane_id = (uint16_t)chunk_id;
+                cmd.reserved0 = (uint8_t)(peer_slot * globals::NUM_DEVICES + G.dev_idx);
                 internode::D2HFifoDevice fifo =
                     internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
                 fifo.push(cmd);
@@ -520,7 +521,7 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
                 for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                     const int peer_rank = internode::peer_rank_for_slot(
                         G.node_idx, G.num_nodes, peer_slot);
-                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
+                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank, G.num_nodes);
                     internode::TransferCmd cmd{};
                     cmd.cmd_type = internode::CmdType::WRITE;
                     cmd.dst_rank = (uint8_t)peer_rank;
@@ -529,6 +530,7 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
                     cmd.local_offset  = off;
                     cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes + off;
                     cmd.lane_id = (uint16_t)chunk_id;
+                    cmd.reserved0 = (uint8_t)(peer_slot * globals::NUM_DEVICES + G.dev_idx);
                     internode::D2HFifoDevice fifo =
                         internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
                     fifo.push(cmd);
@@ -540,7 +542,7 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
                 for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                     const int peer_rank = internode::peer_rank_for_slot(
                         G.node_idx, G.num_nodes, peer_slot);
-                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
+                    const int sap = internode::slot_at_peer(G.node_idx, peer_rank, G.num_nodes);
                     internode::TransferCmd cmd{};
                     cmd.cmd_type = internode::CmdType::WRITE;
                     cmd.dst_rank = (uint8_t)peer_rank;
@@ -550,6 +552,7 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
                     cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes
                                         + (uint32_t)(G.K_bytes) + off;
                     cmd.lane_id = (uint16_t)chunk_id;
+                    cmd.reserved0 = (uint8_t)(peer_slot * globals::NUM_DEVICES + G.dev_idx);
                     internode::D2HFifoDevice fifo =
                         internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
                     fifo.push(cmd);

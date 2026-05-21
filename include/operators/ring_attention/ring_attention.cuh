@@ -162,6 +162,7 @@ struct kv_exchange_globals {
     int   total_chunks_K;
     int   total_chunks_V;
     int   node_idx;
+    int   dev_idx;
     int   num_nodes;  // total node count (>= 2). Scaffolding for multi-
                       // peer K/V exchange; recv_buf still single-peer-sized.
     int   num_send_sms;
@@ -288,6 +289,7 @@ inline void entrypoint(
         .total_chunks_K = total_chunks_K,
         .total_chunks_V = total_chunks_V,
         .node_idx = node_idx,
+        .dev_idx = dev_idx,
         .num_nodes = num_nodes,
         .num_send_sms = n_send,
         .num_copy_sms = n_copy,

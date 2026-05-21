@@ -53,7 +53,7 @@ __device__ inline void fused_inter_send_sm(const fused_globals &G) {
             for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
                 const int peer_rank = internode::peer_rank_for_slot(
                     G.node_idx, G.num_nodes, peer_slot);
-                const int sap = internode::slot_at_peer(G.node_idx, peer_rank);
+                const int sap = internode::slot_at_peer(G.node_idx, peer_rank, G.num_nodes);
                 internode::TransferCmd cmd{};
                 cmd.cmd_type = internode::CmdType::WRITE;
                 cmd.dst_rank = (uint8_t)peer_rank;
@@ -62,8 +62,10 @@ __device__ inline void fused_inter_send_sm(const fused_globals &G) {
                 cmd.local_offset = off;
                 cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes + off;
                 cmd.lane_id = (uint16_t)chunk_id;
+                cmd.reserved0 = (uint8_t)(peer_slot * fused_globals::NUM_DEVICES + G.dev_idx);
                 internode::D2HFifoDevice fifo =
-                    internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, (uint32_t)chunk_id);
+                    internode::gemm_ar_select_fifo_for_lane(
+                        G.d2h_fifos, (uint32_t)cmd.lane_id);
                 fifo.push(cmd);
             }
         }
@@ -72,11 +74,9 @@ __device__ inline void fused_inter_send_sm(const fused_globals &G) {
 
 __device__ inline void fused_inter_copy_sm(const fused_globals &G) {
     int copy_id = blockIdx.x - G.num_send_sms;
-    // Multi-peer: arrival_flags is laid out [peer_slot * total_chunks + chunk_id].
-    // For each chunk, wait for all (N-1) peers to deposit their copy. At
-    // N == 2 the loop runs once with slot == 0 — same flag offset and same
-    // wait pattern as the legacy code. Per-peer copy_ready / peer_tokens
-    // merging across slots is the per-kernel testbed-side step.
+    // Multi-peer: arrival_flags/copy_ready/peer_tokens are laid out by
+    // sender slot, where slot_at_peer(sender, this_node) identifies the slot
+    // into which that sender's data lands on this node.
     const int n_peers = G.num_nodes - 1;
     const int single_peer_chunks = G.total_chunks;
     for (int chunk_id = copy_id; chunk_id < G.total_chunks; chunk_id += G.num_copy_sms) {
@@ -92,19 +92,12 @@ __device__ inline void fused_inter_copy_sm(const fused_globals &G) {
                     if (v == G.epoch) break;
                     __nanosleep(100);
                 } while (true);
+                // Zero-copy mode: peer_tokens IS the registered RDMA
+                // destination, so this slot's chunk is already in place once
+                // its arrival flag is observed.
+                comm::atomic_u32::release_store_sys(
+                    &G.copy_ready[G.dev_idx][{flag_idx}], 1u);
             }
-        }
-        __syncthreads();
-
-        // Zero-copy mode: peer_tokens IS the registered RDMA destination, so
-        // the chunk is already in place once the arrival flag is observed.
-        // No D2D loop, no second __syncthreads needed before the release.
-        // The lane-0 release-sys store on copy_ready carries all prior
-        // visibility (RDMA payload writes by the NIC under zero-copy, or D2D
-        // writes by the CTA threads in stage-and-copy mode) to system scope,
-        // paired with the consumer's ld.acquire.sys.global on copy_ready.
-        if (threadIdx.x == 0) {
-            comm::atomic_u32::release_store_sys(&G.copy_ready[G.dev_idx][{chunk_id}], 1u);
         }
         __syncthreads();
     }
@@ -148,15 +141,18 @@ __device__ inline void dispatch_fused(const fused_globals &G, const int sm_idx) 
                     // flags covering this token's byte range. Each peer dev's
                     // copy CTA sets copy_ready[dev][chunk]=1 after writing the
                     // chunk into its peer_tokens_local; we read across IPC.
+                    const int sender_slot =
+                        internode::slot_at_peer(src_node, G.node_idx, G.num_nodes);
                     const int byte_off = src_token_idx * fused_globals::H * 2;
                     const int byte_end = byte_off + fused_globals::H * 2 - 1;
                     const int first_chunk = byte_off / CHUNK_BYTES;
                     const int last_chunk = byte_end / CHUNK_BYTES;
                     for (int c = first_chunk; c <= last_chunk; c++) {
+                        const int ready_idx = sender_slot * G.total_chunks + c;
                         int v;
                         do {
                             v = comm::atomic_u32::acquire_load_s32_sys(
-                                &G.copy_ready[src_dev_idx][{c}]);
+                                &G.copy_ready[src_dev_idx][{ready_idx}]);
                             // Throttle: chunks arrive on a 50us+ timescale
                             // (RDMA bandwidth), so an unthrottled spin only
                             // generates IPC/PCIe traffic without reducing
@@ -167,8 +163,10 @@ __device__ inline void dispatch_fused(const fused_globals &G, const int sm_idx) 
                             __nanosleep(100);
                         } while (true);
                     }
+                    const int peer_token_idx =
+                        sender_slot * G.num_local_tokens + src_token_idx;
                     ::dist::tma::load_async(token[lane_id], G.peer_tokens[src_dev_idx],
-                                    {src_token_idx, 0}, token_arrived[lane_id]);
+                                    {peer_token_idx, 0}, token_arrived[lane_id]);
                 }
                 wait(token_arrived[lane_id], 0);
                 ::dist::tma::store_async(G.post_tokens, token[lane_id], {token_idx, 0});
