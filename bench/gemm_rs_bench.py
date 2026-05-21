@@ -265,7 +265,7 @@ def main():
             workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
             barrier.data_.zero_(); ready_chunk.data_.zero_()
             staging_dbuf.data_.zero_()
-            if hasattr(mod, "zero_recv_buf"):
+            if NUM_NODES > 2 and hasattr(mod, "zero_recv_buf"):
                 mod.zero_recv_buf()
 
         def advance_epoch(next_epoch: int):
@@ -291,8 +291,21 @@ def main():
                 num_nodes=NUM_NODES,
             )
 
+        def start_iter():
+            nonlocal epoch
+            if NUM_NODES > 2 and hasattr(mod, "prepare_epoch"):
+                epoch += 1
+                advance_epoch(epoch)
+                reset_state()
+            else:
+                # Match the original 2-node no-sync benchmark ordering: clear
+                # local state before publishing the next epoch to the session.
+                reset_state()
+                epoch += 1
+                advance_epoch(epoch)
+
         for wi in range(args.warmup):
-            epoch += 1; advance_epoch(epoch); reset_state()
+            start_iter()
             dist.barrier(); time.sleep(0.1)
             run_once(); torch.cuda.synchronize()
             dist.barrier()
@@ -316,7 +329,7 @@ def main():
             # gemm_ar's GEMM_AR_STEADY_STATE_BENCH path).
             samples_pairs = []
             for _ in range(args.iters):
-                epoch += 1; advance_epoch(epoch); reset_state()
+                start_iter()
                 # NO dist.barrier + sleep here — that's the sync this fix removes.
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
@@ -330,7 +343,7 @@ def main():
                       flush=True)
         else:
             for _ in range(args.iters):
-                epoch += 1; advance_epoch(epoch); reset_state()
+                start_iter()
                 dist.barrier(); time.sleep(0.05)
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)

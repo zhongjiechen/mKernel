@@ -343,7 +343,7 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
                 __threadfence();
                 internode::D2HFifoDevice fifo =
                     internode::gemm_ar_select_fifo_for_lane(
-                        Rt.d2h_fifos, (uint32_t)cmd.reserved0);
+                        Rt.d2h_fifos, (uint32_t)cmd.lane_id);
                 fifo.push(cmd);
             }
             gemm_rs_record_activity_event(
