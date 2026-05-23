@@ -4,10 +4,9 @@
  * @file moe_dispatch_gemm_multinode.cu
  * @brief Proper 2-node × 8-GPU MoE Dispatch + Group GEMM.
  *
- * Borrows the intra-node 8-GPU dispatch pattern from
- *   experiments/dynamic_sm_allocation/question3_moe_dispatch_gemm_dynamic_sm/moe_dispatch_gemm.cu
+ * Uses the intra-node 8-GPU dispatch pattern
  * (pre_tokens_distributed_tensor + pull-based dispatch + per-row-block barrier counter +
- * per-expert GEMM with NUM_EXPERTS_PER_DEV experts per GPU) and adds an
+ * per-expert GEMM with NUM_EXPERTS_PER_DEV experts per GPU) plus an
  * inter-node phase that exchanges pre_tokens with the peer node so each node
  * can dispatch from the FULL 16-GPU token set.
  *

@@ -11,7 +11,7 @@ set -euo pipefail
 #   WARMUP=3 ITERS=10
 #   NPROC_PER_NODE=8
 #   MASTER_PORT=27200
-#   PY=/cpfs01/shared/public/jiaqi.g/lam_h100/PAIFuser/.venv/bin/python3
+#   PY=python3
 #
 # For reproducible socket smoke fallback runs, use:
 #   bash bench/run_h200x4_baseline_socket_smoke_fill.sh
@@ -20,8 +20,7 @@ KERNEL=${1:-all}
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(dirname "$HERE")
 
-PY=${PY:-/cpfs01/shared/public/jiaqi.g/lam_h100/PAIFuser/.venv/bin/python3}
-MASTER_ADDR=${MASTER_ADDR:-10.53.245.237}
+PY=${PY:-python3}
 MASTER_PORT=${MASTER_PORT:-27200}
 BASELINE_NET=${BASELINE_NET:-ib}
 TIMEOUT=${TIMEOUT:-3000}
@@ -30,13 +29,14 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 DEFAULT_NCCL_SOCKET_IFNAME=bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7
 DEFAULT_NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7
 
-NODE0_IP=${NODE0_IP:-10.53.245.237}
-NODE1_IP=${NODE1_IP:-10.53.249.182}
-NODE2_IP=${NODE2_IP:-10.53.251.56}
-NODE3_IP=${NODE3_IP:-10.53.248.58}
-NODE1_SSH=${NODE1_SSH:-root@10.53.249.182}
-NODE2_SSH=${NODE2_SSH:-root@10.53.251.56}
-NODE3_SSH=${NODE3_SSH:-root@10.53.248.58}
+NODE0_IP=${NODE0_IP:?Set NODE0_IP to node 0's data-plane IP}
+NODE1_IP=${NODE1_IP:?Set NODE1_IP to node 1's data-plane IP}
+NODE2_IP=${NODE2_IP:?Set NODE2_IP to node 2's data-plane IP}
+NODE3_IP=${NODE3_IP:?Set NODE3_IP to node 3's data-plane IP}
+NODE1_SSH=${NODE1_SSH:?Set NODE1_SSH to the SSH target for node 1}
+NODE2_SSH=${NODE2_SSH:?Set NODE2_SSH to the SSH target for node 2}
+NODE3_SSH=${NODE3_SSH:?Set NODE3_SSH to the SSH target for node 3}
+MASTER_ADDR=${MASTER_ADDR:-$NODE0_IP}
 NODE1_SSH_PORT=${NODE1_SSH_PORT:-2222}
 NODE2_SSH_PORT=${NODE2_SSH_PORT:-2222}
 NODE3_SSH_PORT=${NODE3_SSH_PORT:-2222}
@@ -137,7 +137,7 @@ cleanup() {
     pkill -9 -f '[n]ccl_baseline_bench.py|[t]orch.distributed.run|[t]orchrun' 2>/dev/null || true
     for item in "1 $NODE1_SSH $NODE1_SSH_PORT" "2 $NODE2_SSH $NODE2_SSH_PORT" "3 $NODE3_SSH $NODE3_SSH_PORT"; do
         set -- $item
-        ssh -p "$3" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        ssh -p "$3" -o BatchMode=yes \
             "$2" "pkill -9 -f '[n]ccl_baseline_bench.py|[t]orch.distributed.run|[t]orchrun' 2>/dev/null || true" \
             2>/dev/null || true
     done
@@ -153,7 +153,7 @@ for item in "1 $NODE1_SSH $NODE1_SSH_PORT" "2 $NODE2_SSH $NODE2_SSH_PORT" "3 $NO
     rank=$1
     host=$2
     port=$3
-    timeout "$TIMEOUT" ssh -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    timeout "$TIMEOUT" ssh -p "$port" \
         -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$host" \
         "cd '$REPO' && $env_prefix '$PY' -m torch.distributed.run --nproc_per_node=$NPROC_PER_NODE --nnodes=4 --node_rank=$rank --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT bench/nccl_baseline_bench.py ${EXTRA_ARGS[*]}" \
         > "/tmp/nccl_h200x4_node${rank}.log" 2>&1 &

@@ -113,8 +113,7 @@ distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types
     cmd.lane_id       = (uint16_t)lane_id;
     cmd.src_view      = (uint8_t)ch.mode;
 
-    // Pick the right fifo for this lane (the proxy that owns the destination
-    // QP). q2_select_fifo_for_lane mirrors the legacy lane->fifo routing.
+    // Pick the right FIFO for this lane: the proxy that owns the destination QP.
     const auto& bundle = *static_cast<const internode::D2HFifoDeviceBundle*>(ch.fifo_bundle);
     internode::D2HFifoDevice fifo =
         internode::q2_select_fifo_for_lane(bundle, lane_id);
@@ -195,8 +194,8 @@ __host__ inline void attach_channels_proxy(
     for (int c = 0; c < DBUF::num_channels; ++c) {
         auto& ch = d.channels[c];
 
-        // Each channel carries a pointer to the shared bundle; put_inter
-        // picks the right fifo per send via q2_select_fifo_for_lane(bundle, lane_id).
+        // Each channel carries a pointer to the shared bundle; put_inter picks
+        // the right FIFO per send based on lane_id.
         // This preserves the proxy's lane_id -> QP routing semantics.
         ch.fifo_bundle = (void*)&session.fifo_bundle;
 

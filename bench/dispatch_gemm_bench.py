@@ -7,7 +7,7 @@ dispatch_gemm configuration:
     CHUNK_BYTES=512KB (baked in src/dispatch_gemm.cu).
     SM split: send=4, copy=4, comm=64 at large shapes (131k).
 
-Reproduction target (from experiments/multinode/sweep/results/efa/fused_q3_efa_chunk512.json):
+Representative 2-node EFA timings:
     8k: 0.631 ms, 16k: 1.057 ms, 32k: 1.538 ms, 65k: 2.669 ms, 131k: 5.16 ms.
 """
 from __future__ import annotations
@@ -73,7 +73,7 @@ def parse_args():
                    default=",".join(str(s) for s in DEFAULT_SHAPES))
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=10)
-    # SM split (per-shape tuned per INSTRUCTION.md §2).
+    # SM split, with per-shape tuning available through CLI overrides.
     p.add_argument("--num-comm-sms", type=int, default=None)
     p.add_argument("--num-send-sms", type=int, default=None)
     p.add_argument("--num-copy-sms", type=int, default=None)
@@ -99,8 +99,8 @@ def _build_routing_uniform(num_tokens_global):
 def _build_routing_multinomial(num_tokens_global, rank, world_size, seed=0):
     """Random multinomial routing: bit-equivalent to NCCL/TritonDist baselines.
 
-    Mirrors `nccl_16gpu_baseline.py:run_q3` lines 167-173: rank 0 samples
-    from a single Categorical(routing_weights) and broadcasts to all ranks.
+    Rank 0 samples from a single Categorical(routing_weights) and broadcasts
+    the choices to all ranks, matching the NCCL baseline setup.
     Uses a fixed seed for reproducibility (NCCL itself does not seed; we
     seed so multi-run averages are deterministic).
     """
@@ -187,9 +187,8 @@ def build_pull_indices(global_gpu_idx, num_experts_per_dev, padded_list,
 def per_shape_sm_split(num_local_tokens):
     """Return (n_send, n_copy, n_comm) tuned per local-token count.
 
-    Per INSTRUCTION.md §2:
-      ≤1024 (small global): send=8 copy=8 comm=44
-      ≥2048 (large global): send=4 copy=4 comm=64
+    Small global token counts bias toward more send/copy CTAs; larger counts
+    leave more CTAs for GEMM.
     """
     # Iter-4 tweak: M=16384 (1024 local) and Iter-5 attempt: M=8192 (512 local)
     # also into the compute-heavy bucket. Freed 8 SMs go to GEMM.
@@ -216,9 +215,10 @@ def main():
     # Peer IP / TCP port for session bootstrap (matches experiment harness).
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        # Default for the 2-node setup: each node connects to the OTHER's private IP.
-        peer_ip = os.environ.get("NODE1_IP", "172.31.11.6") if node_idx == 0 \
-                  else os.environ.get("NODE0_IP", "172.31.1.237")
+        peer_node = 1 if node_idx == 0 else 0
+        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        if not peer_ip:
+            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)

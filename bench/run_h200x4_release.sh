@@ -4,9 +4,6 @@ set -euo pipefail
 # End-to-end reproducible H200x4 release run:
 #   1. IB/RDMA torch+NCCL baselines
 #   2. mKernel sweeps
-#   3. release-guarded plots
-#
-# The shape lists below must stay in sync with plots/plot_tflops_h200x4.py.
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(dirname "$HERE")
@@ -72,7 +69,3 @@ run_baseline ring_attention "$H200X4_RING_ATTENTION_SHAPES" 27280
 
 echo "==== mKernel h200x4 all ===="
 PORT_BASE=$PORT_BASE bash "$HERE/run_h200x4_mkernel.sh" all
-
-echo "==== h200x4 release plots ===="
-cd "$REPO"
-REQUIRE_RELEASE_BASELINE=1 python plots/plot_tflops_h200x4.py

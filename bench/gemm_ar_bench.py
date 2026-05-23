@@ -1,6 +1,6 @@
 """gemm_ar GEMM + AllReduce bench (release version).
 
-Reproduces the 'Ours' bars in experiments/multinode/benchmarks/gemm_ar_efa.png.
+Default EFA sweep for the GEMM + AllReduce chart.
 Targets at M ∈ {2048, 4096, 8192, 16384, 32768}: [0.418, 0.350, 0.868, 2.755, 10.896] ms.
 Uses gemm_ar production defaults compiled into the .so via -DGEMM_AR_*.
 """
@@ -254,7 +254,10 @@ def main():
     is_chief = (local_rank == 0 and node_idx == 0)
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        peer_ip = os.environ.get("NODE1_IP", "172.31.11.6") if node_idx == 0 else os.environ.get("NODE0_IP", "172.31.1.237")
+        peer_node = 1 if node_idx == 0 else 0
+        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        if not peer_ip:
+            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "19730")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)

@@ -6,10 +6,8 @@ set -euo pipefail
 #   bash bench/run_h200x4_mkernel.sh [kernel|all] [bench|check]
 #
 # Optional overrides:
-#   PY — must match the PyTorch used to build mKernel .so (system python often
-#        hits undefined symbol: c10::cuda::SetDevice). Example:
-#        PY=/cpfs01/shared/public/jiaqi.g/lam_h100/PAIFuser/.venv/bin/python3
-#   TORCHRUN — same venv, e.g. .../PAIFuser/.venv/bin/torchrun
+#   PY — must match the PyTorch used to build mKernel .so.
+#   TORCHRUN — same environment as PY.
 #   TIMEOUT=900
 #   WARMUP=3 ITERS=10                              # release timing
 #   WARMUP=0 ITERS=1 MKERNEL_BENCH_LEGACY_SYNC=1   # smoke/debug mode only
@@ -20,13 +18,8 @@ set -euo pipefail
 # progress ⇒ treat the job as stuck (e.g. ring wait / proxy); kill torchrun
 # and triage — do not assume it will recover.
 #
-# Launch policy: override NODE0_IP / NODE{i}_SSH to three or four **GPU-idle**
-# nodes (no SGLang, training, or other jobs). The default NODE0_IP
-# (10.53.245.237) is often a **shared head** running SGLang — do **not** bench
-# there: SSH to an idle H200, set NODE0_IP to that machine's data-plane IP, and
-# run this script from that node. Never use MKERNEL_SKIP_IDLE_CHECK=1 on a
-# busy head just to unblock CI; you will burn time. bench/run.sh runs
-# check_cluster_idle.sh unless MKERNEL_SKIP_IDLE_CHECK=1.
+# Launch policy: set NODE0_IP / NODE{i}_SSH to four **GPU-idle** nodes
+# (no SGLang, training, or other jobs). Run this script from node 0.
 
 KERNEL=${1:-all}
 MODE=${2:-bench}
@@ -35,27 +28,19 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 export MKERNEL_TOPOLOGY=h200x4
 export MKERNEL_DIST_BACKEND=${MKERNEL_DIST_BACKEND:-gloo}
-# Prefer the PAIFuser venv when present so PY/TORCHRUN match the built .so.
-_PAIF_PY=/cpfs01/shared/public/jiaqi.g/lam_h100/PAIFuser/.venv/bin/python3
-if [[ -x "$_PAIF_PY" ]]; then
-    export PY=${PY:-$_PAIF_PY}
-    export TORCHRUN=${TORCHRUN:-${_PAIF_PY%/*}/torchrun}
-else
-    export PY=${PY:-/usr/bin/python}
-    export TORCHRUN=${TORCHRUN:-/usr/local/bin/torchrun}
-fi
-unset _PAIF_PY
+export PY=${PY:-python3}
+export TORCHRUN=${TORCHRUN:-torchrun}
 export TIMEOUT=${TIMEOUT:-900}
 export NODE1_LAUNCH_SLEEP=${NODE1_LAUNCH_SLEEP:-2}
 export CLEANUP_SETTLE_SLEEP=${CLEANUP_SETTLE_SLEEP:-1}
 
-export NODE0_IP=${NODE0_IP:-10.53.245.237}
-export NODE1_IP=${NODE1_IP:-10.53.249.182}
-export NODE2_IP=${NODE2_IP:-10.53.251.56}
-export NODE3_IP=${NODE3_IP:-10.53.248.58}
-export NODE1_SSH=${NODE1_SSH:-root@10.53.249.182}
-export NODE2_SSH=${NODE2_SSH:-root@10.53.251.56}
-export NODE3_SSH=${NODE3_SSH:-root@10.53.248.58}
+export NODE0_IP=${NODE0_IP:?Set NODE0_IP to node 0's data-plane IP}
+export NODE1_IP=${NODE1_IP:?Set NODE1_IP to node 1's data-plane IP}
+export NODE2_IP=${NODE2_IP:?Set NODE2_IP to node 2's data-plane IP}
+export NODE3_IP=${NODE3_IP:?Set NODE3_IP to node 3's data-plane IP}
+export NODE1_SSH=${NODE1_SSH:?Set NODE1_SSH to the SSH target for node 1}
+export NODE2_SSH=${NODE2_SSH:?Set NODE2_SSH to the SSH target for node 2}
+export NODE3_SSH=${NODE3_SSH:?Set NODE3_SSH to the SSH target for node 3}
 export NODE1_SSH_PORT=${NODE1_SSH_PORT:-2222}
 export NODE2_SSH_PORT=${NODE2_SSH_PORT:-2222}
 export NODE3_SSH_PORT=${NODE3_SSH_PORT:-2222}

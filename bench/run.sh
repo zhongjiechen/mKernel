@@ -24,9 +24,6 @@
 #
 # Multi-node etiquette (N≥3 + MKERNEL_TOPOLOGY=h200x3|h200x4):
 #   Point NODE0_IP / NODE{i}_SSH at GPU-idle nodes only (no shared SGLang/training).
-#   By default run.sh runs bench/check_cluster_idle.sh first. Opt out with
-#   MKERNEL_SKIP_IDLE_CHECK=1 (emergency only). Force check on other topologies:
-#   MKERNEL_CLUSTER_IDLE_CHECK=1
 #
 # Runtime triage (during a run): if per-GPU utilization stays >99% for ≥15s
 # with no log / iter progress, treat the job as stuck (e.g. ring wait) — stop
@@ -50,20 +47,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 RELEASE=$(dirname "$HERE")
 
 # === Cluster topology ===
-# 2-node defaults preserved. For N > 2 set NODE{i}_IP and NODE{i}_SSH for
-# every i in [0, NUM_NODES). NODE0_SSH defaults to "" because node 0 is the
-# launching host (we run its torchrun locally instead of SSHing to it).
-NODE0_IP_ENV_SET=${NODE0_IP+x}
-NODE1_IP_ENV_SET=${NODE1_IP+x}
-NODE2_IP_ENV_SET=${NODE2_IP+x}
-NODE3_IP_ENV_SET=${NODE3_IP+x}
-NODE1_SSH_ENV_SET=${NODE1_SSH+x}
-NODE2_SSH_ENV_SET=${NODE2_SSH+x}
-NODE3_SSH_ENV_SET=${NODE3_SSH+x}
-NODE0_IP=${NODE0_IP:-172.31.1.237}
+# Set NODE{i}_IP for every i in [0, NUM_NODES). For peer nodes also set
+# NODE{i}_SSH; NODE0_SSH defaults to "" because node 0 is launched locally.
+NODE0_IP=${NODE0_IP:-}
 NODE0_SSH=${NODE0_SSH:-}
-NODE1_IP=${NODE1_IP:-172.31.11.6}
-NODE1_SSH=${NODE1_SSH:-15.164.130.63}
+NODE1_IP=${NODE1_IP:-}
+NODE1_SSH=${NODE1_SSH:-}
 BACKEND_ENV_SET=${BACKEND+x}
 BACKEND=${BACKEND:-efa}
 if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x3" || "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
@@ -76,31 +65,14 @@ if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x3" || "${MKERNEL_TOPOLOGY:-}" == "h200x4"
     if [[ -z "$BACKEND_ENV_SET" ]]; then
         BACKEND=cx7
     fi
-    if [[ -z "$NODE0_IP_ENV_SET" ]]; then
-        NODE0_IP=10.53.245.237
-    fi
     NODE0_SSH=${NODE0_SSH:-}
-    if [[ -z "$NODE1_IP_ENV_SET" ]]; then
-        NODE1_IP=10.53.249.182
-    fi
-    if [[ -z "$NODE1_SSH_ENV_SET" ]]; then
-        NODE1_SSH=root@10.53.249.182
-    fi
     NODE1_SSH_PORT=${NODE1_SSH_PORT:-2222}
-    if [[ -z "$NODE2_IP_ENV_SET" ]]; then
-        NODE2_IP=10.53.251.56
-    fi
-    if [[ -z "$NODE2_SSH_ENV_SET" ]]; then
-        NODE2_SSH=root@10.53.251.56
-    fi
+    NODE2_IP=${NODE2_IP:-}
+    NODE2_SSH=${NODE2_SSH:-}
     NODE2_SSH_PORT=${NODE2_SSH_PORT:-2222}
     if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
-        if [[ -z "$NODE3_IP_ENV_SET" ]]; then
-            NODE3_IP=10.53.248.58
-        fi
-        if [[ -z "$NODE3_SSH_ENV_SET" ]]; then
-            NODE3_SSH=root@10.53.248.58
-        fi
+        NODE3_IP=${NODE3_IP:-}
+        NODE3_SSH=${NODE3_SSH:-}
         NODE3_SSH_PORT=${NODE3_SSH_PORT:-2222}
     fi
     RESULT_SUFFIX=${RESULT_SUFFIX:-${MKERNEL_TOPOLOGY}}
@@ -138,26 +110,14 @@ for ((i=0; i<NUM_NODES; i++)); do
     fi
 done
 
-# --- GPU-idle preflight (H200 3/4-node): do not bench on occupied nodes ---
 if ((NUM_NODES >= 3)) && [[ "${MKERNEL_TOPOLOGY:-}" == "h200x3" || "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
     echo "[run] policy: NUM_NODES=${NUM_NODES} topology=${MKERNEL_TOPOLOGY:-} — use GPU-idle nodes only; set NODE0_IP to an idle chief (not a shared head)." >&2
-    if [[ -n "${MKERNEL_SKIP_IDLE_CHECK:-}" ]]; then
-        echo "[run] MKERNEL_SKIP_IDLE_CHECK set — skipping bench/check_cluster_idle.sh (not recommended)." >&2
-        echo "[run] WARNING: if this host runs SGLang/training on all GPUs, mKernel will contend and hang or lie;" >&2
-        echo "[run] run from an idle GPU chief instead (correct NODE0_IP for that host)." >&2
-    elif [[ "${MKERNEL_CLUSTER_IDLE_CHECK:-1}" == "0" ]]; then
-        echo "[run] MKERNEL_CLUSTER_IDLE_CHECK=0 — skipping idle check." >&2
-    else
-        bash "$HERE/check_cluster_idle.sh" || exit 1
-    fi
-elif ((NUM_NODES >= 3)) && [[ "${MKERNEL_CLUSTER_IDLE_CHECK:-}" == "1" ]]; then
-    bash "$HERE/check_cluster_idle.sh" || exit 1
+    echo "[run] WARNING: if any selected node is busy, benchmark results may hang or be misleading." >&2
 fi
 
-# Python venv with torch installed (EFS-shared, both nodes see this path).
-# Default to the repo-local release env; callers can still override PY/TORCHRUN.
-PY=${PY:-$RELEASE/ziming/bin/python}
-TORCHRUN=${TORCHRUN:-$RELEASE/ziming/bin/torchrun}
+# Python with torch installed. Override PY/TORCHRUN if using a virtualenv.
+PY=${PY:-python3}
+TORCHRUN=${TORCHRUN:-torchrun}
 
 # === Common env propagated to both nodes ===
 COMMON_ENV=(
@@ -218,7 +178,7 @@ cleanup_stale_benches() {
         if [[ -n "${!ssh_port_var:-}" ]]; then
             ssh_port_args=(-p "${!ssh_port_var}")
         fi
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        ssh -o BatchMode=yes \
             -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "${ssh_port_args[@]}" "$ssh_host" \
             "pkill -9 -f '$STALE_BENCH_PATTERN' 2>/dev/null || true" 2>/dev/null || true
     done
@@ -610,7 +570,7 @@ run_one_2node() {
             '$TORCHRUN' --nproc_per_node=8 --nnodes=$NUM_NODES --node_rank=$i \
                 --master_addr=$NODE0_IP --master_port=$master_port \
                 '$script' $extra_args"
-        timeout "${TIMEOUT_S}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        timeout "${TIMEOUT_S}" ssh \
             -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
             "${ssh_port_args[@]}" "$ssh_host" "bash -c \"$launch_peer\"" \
             > "/tmp/${kernel}_node${i}.log" 2>&1 &
@@ -650,7 +610,7 @@ run_one_2node() {
             if [[ -n "${!ssh_port_var:-}" ]]; then
                 ssh_port_args=(-p "${!ssh_port_var}")
             fi
-            ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            ssh -o BatchMode=yes \
                 "${ssh_port_args[@]}" "${!ssh_var}" "pkill -9 -f ${kernel}_bench.py; pkill -9 -f nccl_baseline_bench.py" 2>/dev/null || true
         done
     fi

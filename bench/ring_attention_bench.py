@@ -1,6 +1,6 @@
 """ring_attention Ring Attention bench (release version).
 
-Reproduces fused_q4_efa_per_stage.json (5 shapes seq_per_dev∈{768,1536,3072,6144,12288}).
+Default EFA sweep: seq_per_dev∈{768,1536,3072,6144,12288}.
 Uses --per-stage build (RING_ATTN_PER_STAGE_KERNEL=1 baked in Makefile).
 """
 from __future__ import annotations
@@ -79,8 +79,10 @@ def main():
     is_chief = (local_rank == 0 and node_idx == 0)
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        peer_ip = os.environ.get("NODE1_IP", "172.31.11.6") if node_idx == 0 \
-                  else os.environ.get("NODE0_IP", "172.31.1.237")
+        peer_node = 1 if node_idx == 0 else 0
+        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        if not peer_ip:
+            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "18560")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)

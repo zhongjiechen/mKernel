@@ -4,8 +4,6 @@
  *
  * Includes rdma_transport.h for shared primitives (PD, CQ, MR, TCP bootstrap)
  * and adds EFA-specific functions: SRD QP creation, address handles, device discovery.
- *
- * Reference: /efs/users/ziming_mao_7f0b834/uccl/ep/src/rdma.cpp (EFA sections)
  */
 #pragma once
 

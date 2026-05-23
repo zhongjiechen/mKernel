@@ -1,6 +1,6 @@
 """gemm_rs GEMM + Reduce-Scatter bench (release version).
 
-Reproduces fused_q5_efa.json (5 shapes M∈{2048,4096,8192,16384,32768}, K=M/16).
+Default EFA sweep: M∈{2048,4096,8192,16384,32768}, K=M/16.
 Bakes the on-by-default gemm_rs env vars into Python:
   GEMM_RS_FUSE_COMPUTE_INTRA=1, GEMM_RS_INTRA_RS_DIRECT_STAGING=1, GEMM_RS_SEND_READY_BITMAP=1.
 Per-shape SM split tuned to match the chunk512 numbers (see SM_SPLIT below).
@@ -156,8 +156,10 @@ def main():
 
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        peer_ip = os.environ.get("NODE1_IP", "172.31.11.6") if node_idx == 0 \
-                  else os.environ.get("NODE0_IP", "172.31.1.237")
+        peer_node = 1 if node_idx == 0 else 0
+        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        if not peer_ip:
+            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)

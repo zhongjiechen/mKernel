@@ -12,14 +12,6 @@
  * structurally through `get_tma`, shape/stride accessors, and multicast
  * address access.
  *
- * Status:
- *   - M2a (this revision): structural — own gls/mc_ptr/tma_descs and the
- *     inter-node Channel[]/send-ring/arrived[] fields. Method declarations only;
- *     bodies live in backend headers.
- *   - M2b: proxy backend method bodies.
- *   - M2c: 2-node smoke test.
- *   - M2d: migrate Q5 multinode.
- *
  * Design contract:
  *   - One channel = one QP = one comm CTA. No CAS in fast path.
  *   - Inter-node sends are RDMA WRITE_WITH_IMM, imm = tile_id.
@@ -91,7 +83,7 @@ struct Channel {
      *   so put_inter can route by lane_id (the proxy thread that owns the
      *   destination QP differs across lanes). `bind_inter_proxy` /
      *   `attach_channels_proxy` populates this; `put_inter` calls
-     *   `internode::q2_select_fifo_for_lane(*bundle, lane_id)` internally.
+     *   the backend lane-to-FIFO helper internally.
      *
      *   We store the bundle as `void*` to avoid pulling internode headers
      *   into this header; backend_proxy.cuh casts it back to the real type.

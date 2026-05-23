@@ -4,8 +4,6 @@
  *
  * Tight-polling loop: reads TransferCmd from D2H FIFO, posts chained
  * RDMA writes (tile data + arrival flag), polls send CQ, advances FIFO tail.
- *
- * Reference: ~/nfs/ziming/uccl/ep/src/proxy.cpp
  */
 #pragma once
 
@@ -51,7 +49,7 @@ struct ProxyConfig {
     uint32_t      local_data_lkey;  // MR lkey
 
     // Optional second MR for direct-from-C_local sends (DMA-BUF only).
-    // Populated when Q2_DIRECT_DMABUF_SEND is enabled. If
+    // Populated when direct-DMA-BUF sends are enabled. If
     // direct_dmabuf_enabled == false, the staging path is the only source.
     uint64_t      clocal_data_addr = 0;
     uint32_t      clocal_data_lkey = 0;
@@ -294,11 +292,11 @@ public:
             row_cursor += n;
             remote_cursor += (uint64_t)n * span;
         }
-        // Flag WR (INLINE). Layout matches the batched path: under
-        // Q2_ARRIVAL_QUEUE we write pack_arrival_work(first_tile, run_tiles)
+        // Flag WR (INLINE). Layout matches the batched path: with the arrival
+        // queue enabled we write pack_arrival_work(first_tile, run_tiles)
         // into the logical-queue slot; without it, we write the shared epoch
         // value directly into remote_flags[tile_id] (flat array, one slot per
-        // tile) so a kernel that polls arrival_flags[first_tile]==epoch (Q5)
+        // tile) so a kernel that polls arrival_flags[first_tile]==epoch
         // makes progress.
         ibv_send_wr& flag_wr = wrs[n_data_wrs];
         memset(&flag_wr, 0, sizeof(flag_wr));

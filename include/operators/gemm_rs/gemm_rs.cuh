@@ -4,10 +4,9 @@
  * @file gemm_rs_multinode.cu
  * @brief Proper 2-node × 8-GPU GEMM + Reduce-Scatter.
  *
- * Borrows the intra-node 8-GPU pattern from
- *   experiments/dynamic_sm_allocation/question5_gemm_rs/gemm_rs.cu
+ * Uses the intra-node 8-GPU pattern
  * (output_distributed_tensor + tma::store_add_async + per-task ready flags + atomic
- * task claiming) and bolts on an inter-node phase that exchanges each
+ * task claiming) plus an inter-node phase that exchanges each
  * GPU's owned M/8 rows with its same-index peer on the other node.
  *
  * Data flow per GPU (g ∈ [0, 8) within node n ∈ [0, 2)):

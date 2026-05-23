@@ -5,8 +5,6 @@
  * Registers GPU HBM buffers so the NIC can read/write them directly.
  * Tries ibv_reg_dmabuf_mr first (via CUDA VMM FD export), falls back
  * to ibv_reg_mr with nvidia_peermem.
- *
- * Reference: ~/nfs/ziming/uccl/ep/src/rdma.cpp lines 45-253
  */
 #pragma once
 

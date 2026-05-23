@@ -1,5 +1,5 @@
 {
-    "_note": "External cx7 reference numbers per kernel. Source: experiments/multinode/baselines/STATUS.md and the published bar charts under experiments/multinode/benchmarks/<topic>_efa.png. These do NOT change between releases — they are external published numbers used as comparison points.",
+    "_note": "External cx7 reference numbers per kernel. These are fixed comparison points used by the plotting scripts.",
     "_published_charts": {
         "ag_gemm": "ag_gemm_efa.png — no cx7 line; baselines are CuBLAS+NCCL only.",
         "gemm_ar": "gemm_ar_efa.png — no cx7 line.",

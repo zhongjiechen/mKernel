@@ -173,11 +173,8 @@ public:
     static constexpr int ACCUMULATE_MISS_BUDGET = 8;
     static constexpr int SRD_SQ_DEPTH = 512;
 
-    // R1 Commit 1: adaptive BATCH_SIZE / ACCUMULATE_SPINS bounds. These are
-    // declared now but only consumed by Commit 2/3 once run() reads the
-    // adaptive `batch_size_current_` / `accum_spins_current_` state. The
-    // existing BATCH_SIZE / ACCUMULATE_SPINS constants above remain the
-    // static-mode fallback (Q2_PROXY_PIPELINE=0, default).
+    // Adaptive BATCH_SIZE / ACCUMULATE_SPINS bounds. The fixed constants above
+    // remain the static-mode fallback.
     static constexpr uint32_t BATCH_SIZE_MIN     = 2;
     static constexpr uint32_t BATCH_SIZE_MAX     = 8;
     static constexpr uint32_t ACCUM_SPINS_MIN    = 16;
@@ -191,8 +188,7 @@ public:
     explicit Proxy(const ProxyConfig& cfg)
         : cfg_(cfg), running_(false), paused_(false), ack_paused_(false),
           inflight_(0), notify_mode_(detect_notify_mode()) {
-        // R1 Commit 1: mirror the session-level Q2_PROXY_PIPELINE flag into
-        // the proxy. Not read by run() until Commit 2/3.
+        // Mirror the session-level pipeline flag into the proxy.
         use_adaptive_batch_  = cfg_.pipeline_enabled;
         batch_size_current_  = BATCH_SIZE_MAX;
         accum_spins_current_ = ACCUMULATE_SPINS;
@@ -256,7 +252,7 @@ public:
 
     void set_epoch(uint32_t epoch) {
         cfg_.epoch = epoch;
-        // Per-queue send sequence counters restart every epoch so Q2_ARRIVAL_QUEUE
+        // Per-queue send sequence counters restart every epoch so arrival-queue
         // senders write into slot 0 of each queue on the first post of the epoch.
         memset(sender_seq_, 0, sizeof(sender_seq_));
         // Reset the staging cursor too. Safe because set_epoch is only called
@@ -414,7 +410,7 @@ private:
     int effective_max_inflight_;
     ibv_qp_ex* qpx_[kMaxExchangeQPs] = {};       // cached ibv_qp_ex per local QP
 
-    // Per-logical-queue next-slot counters for the Q2_ARRIVAL_QUEUE layout. The
+    // Per-logical-queue next-slot counters for the arrival-queue layout. The
     // upper bound matches proxy.h (kMaxExchangeQPs * 16 logical queues) so the
     // same lane→queue mapping fits without any per-session realloc.
     uint32_t sender_seq_[kMaxExchangeQPs * 16] = {};
@@ -761,8 +757,7 @@ private:
             // still waiting to seed the next batch. Draining the CQ until
             // inflight_==0 forces every prior WRITE to be PCIe-committed at
             // the remote before BARRIER leaves the wire, which is the
-            // ordering Q2_GPU_CROSS_NODE_BARRIER + q2_iter_end_reset_arrival_flags
-            // relies on for steady-state correctness on SRD.
+            // ordering required for steady-state correctness on SRD.
             if (has_pending_barrier_ && pending_count == 0 && !has_pending_cmd_) {
                 has_pending_barrier_ = false;
                 drain_cq();

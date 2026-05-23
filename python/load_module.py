@@ -1,7 +1,7 @@
 """Thin importlib loader for prebuilt .so kernels.
 
 Replaces torch.utils.cpp_extension.load() — no JIT, no env-var lookups,
-no ninja. Assumes the Makefile has produced release/build/lib<name>.so.
+no ninja. Assumes the Makefile has produced build/lib<name>.so.
 """
 from __future__ import annotations
 import importlib.util
@@ -17,7 +17,7 @@ BUILD = ROOT / "build"
 
 
 def load(name: str):
-    """Load release/build/lib<name>.so as a Python module.
+    """Load build/lib<name>.so as a Python module.
 
     Args:
         name: kernel base name (e.g. "dispatch_gemm").
@@ -35,7 +35,7 @@ def load(name: str):
     so = max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else plain_so
     if not so.exists():
         raise RuntimeError(
-            f"{so} does not exist. Run `make {name}` (or `make all`) "
+            f"{so} does not exist. Run `make build/lib{name}.so` (or `make all`) "
             f"from {ROOT} first."
         )
     load_so = so
