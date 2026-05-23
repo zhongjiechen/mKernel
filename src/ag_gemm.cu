@@ -127,27 +127,10 @@ __device__ inline void intra_comm_sm(const globals& G) {
     const int ring_steps = n_peers;
     const int rows_per_peer_slot = global_row_blocks;
 
-#ifdef AG_GEMM_DEBUG_WAIT_TIMEOUT
-    if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
-        if (blockIdx.x == 0 && warp_id == 0 && lane_id == 0) {
-            printf("AG_STAGE node=%d dev=%d phase1_done epoch=%u mode=%d\n",
-                   G.node_idx, G.dev_idx, G.epoch, G.collective_mode);
-        }
-    }
-#endif
-
     // Drain every recv_buf peer slot. Ring uses ring_step as hop order
     // (origin = node - 1 - step); direct uses ring_step as peer_slot
     // (phase-0 already sent to all peers).
     for (int ring_step = 0; ring_step < ring_steps; ++ring_step) {
-#ifdef AG_GEMM_DEBUG_WAIT_TIMEOUT
-        if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
-            if (blockIdx.x == 0 && warp_id == 0 && lane_id == 0) {
-                printf("AG_STAGE node=%d dev=%d ring_step=%d begin epoch=%u\n",
-                       G.node_idx, G.dev_idx, ring_step, G.epoch);
-            }
-        }
-#endif
         const int peer_slot = (G.collective_mode == 1)
             ? internode::slot_at_peer(
                 ag_gemm_ring_origin_for_step(G.node_idx, G.num_nodes, ring_step),

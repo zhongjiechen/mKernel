@@ -344,7 +344,6 @@ inline Session* create_session(const SessionConfig& cfg) {
             nic = nic_buf;
         }
     }
-    fprintf(stderr, "session: dev=%d using NIC=%s\n", cfg.device_id, nic);
     s->ctx = rdma::open_device(nic);
     s->pd  = rdma::alloc_pd(s->ctx);
     s->cq  = rdma::create_cq(s->ctx, 4096);
@@ -368,8 +367,6 @@ inline Session* create_session(const SessionConfig& cfg) {
         } else {
             qp_max_send_sge = 32;  // hopeful default on mlx5
         }
-        fprintf(stderr, "session: q2 dmabuf: max_send_sge=%d row_stride=%zu\n",
-                qp_max_send_sge, cfg.row_stride_bytes);
     }
     // SQ depth: proxy batches WRs via ibv_post_send so 2048 is plenty.
     int qp_max_send_wr = 2048;
@@ -403,12 +400,11 @@ inline Session* create_session(const SessionConfig& cfg) {
                     "session: direct_dmabuf_enabled but clocal_gpu_buf not provided\n");
             exit(EXIT_FAILURE);
         }
-        const char* dmabuf_path = nullptr;
         s->clocal_data_mr = gpu_mr::register_gpu_buffer_dmabuf_only(
             s->pd, cfg.clocal_gpu_buf, cfg.clocal_gpu_buf_size,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
             | IBV_ACCESS_RELAXED_ORDERING,
-            &dmabuf_path);
+            nullptr);
         if (!s->clocal_data_mr) {
             fprintf(stderr,
                     "session: DMA-BUF-only registration of C_local failed "
@@ -416,11 +412,6 @@ inline Session* create_session(const SessionConfig& cfg) {
                     cfg.clocal_gpu_buf, cfg.clocal_gpu_buf_size);
             exit(EXIT_FAILURE);
         }
-        fprintf(stderr,
-                "session: q2 dmabuf: C_local ptr=%p bytes=%zu path=%s lkey=0x%x rkey=0x%x\n",
-                cfg.clocal_gpu_buf, cfg.clocal_gpu_buf_size,
-                dmabuf_path ? dmabuf_path : "?",
-                s->clocal_data_mr->lkey, s->clocal_data_mr->rkey);
     }
 
     // --- 3. Allocate + register receive buffer ---
@@ -530,19 +521,6 @@ inline Session* create_session(const SessionConfig& cfg) {
     const int qps_per_peer = cfg.channelize_gpu_peers
         ? std::max(1, s->num_qps / num_remote_peers)
         : s->num_qps;
-    const bool session_debug = []() {
-        const char* v = std::getenv("MKERNEL_SESSION_DEBUG");
-        return v && v[0] == '1';
-    }();
-    if (session_debug) {
-        fprintf(stderr,
-                "session-debug: rank=%d dev=%d peers=%d channelize=%d "
-                "num_qps=%d qps_per_peer=%d requested_qps=%d\n",
-                cfg.rank, cfg.device_id, num_remote_peers,
-                cfg.channelize_gpu_peers ? 1 : 0, s->num_qps,
-                qps_per_peer, cfg.num_qps);
-    }
-
     auto qp_for_global = [&](int global_qp) -> ibv_qp* {
         return (global_qp == 0) ? s->qp : s->extra_qps[global_qp - 1];
     };
@@ -582,14 +560,6 @@ inline Session* create_session(const SessionConfig& cfg) {
             const bool is_server = (cfg.rank == lo);
             s->remote_infos[peer_slot] =
                 rdma::exchange_info_tcp(local_info, sess_peer_ip, sess_tcp_port, is_server);
-            if (session_debug) {
-                fprintf(stderr,
-                        "session-debug: rank=%d dev=%d peer_rank=%d peer_slot=%d "
-                        "remote_num_qps=%d remote_qp0=%u\n",
-                        cfg.rank, cfg.device_id, peer_rank, peer_slot,
-                        s->remote_infos[peer_slot].num_qps,
-                        s->remote_infos[peer_slot].qp_num);
-            }
         }
     }
     s->remote_info = s->remote_infos[0];
@@ -617,15 +587,6 @@ inline Session* create_session(const SessionConfig& cfg) {
             } else {
                 remote_qp_info.qp_num = s->remote_infos[peer_slot].extra_qp_nums[remote_qp - 1];
                 remote_qp_info.psn = s->remote_infos[peer_slot].extra_psns[remote_qp - 1];
-            }
-            if (session_debug) {
-                fprintf(stderr,
-                        "session-debug: rank=%d dev=%d peer_slot=%d peer_rank=%d "
-                        "local_qp=%d remote_slot=%d remote_qp=%d remote_qpn=%u "
-                        "remote_num_qps=%d\n",
-                        cfg.rank, cfg.device_id, peer_slot, peer_rank,
-                        local_qp, remote_slot, remote_qp, remote_qp_info.qp_num,
-                        s->remote_infos[peer_slot].num_qps);
             }
             rdma::modify_qp_rtr(qp_for_global(local_qp), remote_qp_info);
             rdma::modify_qp_rts(qp_for_global(local_qp), local_psn_for_global(local_qp));
@@ -722,11 +683,6 @@ inline Session* create_session(const SessionConfig& cfg) {
 
         s->proxies[t] = new Proxy(pcfg);
         s->proxies[t]->start();
-    }
-
-    if (cfg.rank == 0) {
-        fprintf(stderr, "internode::Session created (rank=%d, peer=%s:%d)\n",
-                cfg.rank, cfg.peer_ip, cfg.tcp_port);
     }
 
     return s;

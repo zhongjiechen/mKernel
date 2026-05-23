@@ -517,38 +517,6 @@ def main():
             C_ref_cpu = torch.matmul(A, B).detach().float().cpu()
             local_ref_cpu = C_ref_cpu.clone()
             dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
-            debug_idx = os.environ.get("MKERNEL_DEBUG_INDEX", "")
-            if debug_idx:
-                try:
-                    dbg_row, dbg_col = [int(x) for x in debug_idx.split(",", 1)]
-                    obs_dbg = float(C_final.data_[dbg_row, dbg_col].detach().float().item())
-                    ref_dbg = float(C_ref_cpu[dbg_row, dbg_col].item())
-                    local_ref_dbg = float(local_ref_cpu[dbg_row, dbg_col].item())
-                    intra_dbg = float(C_dbuf.data_[dbg_row, dbg_col].detach().float().item())
-                    msg = (
-                        f"[gemm_ar-debug-index] rank={rank} idx=({dbg_row},{dbg_col}) "
-                        f"C_final={obs_dbg:.6f} C_dbuf={intra_dbg:.6f} "
-                        f"local_ref={local_ref_dbg:.6f} ref={ref_dbg:.6f}"
-                    )
-                    slice_rows = M // world_size
-                    owner_local_rank = dbg_row // slice_rows
-                    if (
-                        remote_accum is not None
-                        and local_rank == owner_local_rank
-                        and 0 <= owner_local_rank < world_size
-                    ):
-                        local_row = dbg_row - owner_local_rank * slice_rows
-                        rb = local_row // ROW_BLOCK
-                        r = local_row - rb * ROW_BLOCK
-                        col_idx = dbg_col // COL_BLOCK
-                        col_elem = dbg_col - col_idx * COL_BLOCK
-                        tile_id = rb * col_blocks + col_idx
-                        flat = tile_id * ROW_BLOCK * COL_BLOCK + r * COL_BLOCK + col_elem
-                        accum_dbg = float(remote_accum[flat].detach().float().item())
-                        msg += f" remote_accum={accum_dbg:.6f}"
-                    print(msg, flush=True)
-                except Exception as ex:
-                    print(f"[gemm_ar-debug-index] failed: {ex}", flush=True)
             correctness_ok = check_close(
                 f"gemm_ar M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
             ) and correctness_ok

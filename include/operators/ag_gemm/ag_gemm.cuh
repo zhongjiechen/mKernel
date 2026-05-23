@@ -201,21 +201,9 @@ __device__ inline void ag_gemm_record_activity_event(
 // is a local CTA on same GPU L2).
 __device__ __forceinline__ void ag_gemm_wait_arrival_one(const globals& G, int slot_ck) {
     uint32_t v;
-#ifdef AG_GEMM_DEBUG_WAIT_TIMEOUT
-    unsigned long long spins = 0;
-#endif
     do {
         v = comm::atomic_u32::volatile_load(&G.arrival_flags[slot_ck]);
         if (v == G.epoch) break;
-#ifdef AG_GEMM_DEBUG_WAIT_TIMEOUT
-        if (++spins == 10000ULL) {
-            if (threadIdx.x == 0) {
-                printf("AG_WAIT_TIMEOUT node=%d dev=%d block=%d slot_ck=%d epoch=%u saw=%u\n",
-                       G.node_idx, G.dev_idx, (int)blockIdx.x, slot_ck, G.epoch, v);
-            }
-            return;
-        }
-#endif
         __nanosleep(100);
     } while (true);
 }

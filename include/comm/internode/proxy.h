@@ -355,34 +355,12 @@ public:
         }
 
         ibv_qp* post_qp = (batch_qp == 0) ? cfg_.qp : cfg_.extra_qps[batch_qp - 1];
-        if (std::getenv("MKERNEL_STRIDED_DIRECT_DEBUG") != nullptr) {
-            static std::atomic<int> dbg_count{0};
-            int n = dbg_count.fetch_add(1, std::memory_order_relaxed);
-            if (n < 16) {
-                const int global_qp = cfg_.qp_base_idx + batch_qp;
-                fprintf(stderr,
-                        "proxy-strided-debug: rank=%d dev=%d dst=%u "
-                        "global_qp=%d tile_id=%u local_off=%u remote_off=%u "
-                        "bytes=%u rows=%u span=%u total_qps=%d\n",
-                        cfg_.rank, cfg_.device_id, (unsigned)cmd.dst_rank,
-                        global_qp, (unsigned)cmd.tile_id,
-                        (unsigned)cmd.local_offset,
-                        (unsigned)cmd.remote_offset, (unsigned)cmd.bytes,
-                        (unsigned)cmd.row_count, (unsigned)cmd.row_span,
-                        cfg_.global_num_qps);
-            }
-        }
         ibv_send_wr* bad = nullptr;
         int ret = ibv_post_send(post_qp, &wrs[0], &bad);
         if (ret != 0) {
             fprintf(stderr, "proxy: strided post failed (rows=%u span=%u wrs=%u): %s\n",
                     rows, span, n_data_wrs, strerror(ret));
             return 0;
-        }
-        if (__builtin_expect(!strided_logged_, false)) {
-            fprintf(stderr, "proxy: q2 dmabuf strided: rows=%u span=%u wrs=%u max_sge=%u\n",
-                    rows, span, n_data_wrs, max_sge);
-            strided_logged_ = true;
         }
         return cfg_.use_arrival_queue && cfg_.enable_remote_tail
             ? (int)n_data_wrs + 2
@@ -476,7 +454,6 @@ private:
     uint32_t barrier_token_ = 0;
     TransferCmd pending_cmd_{};
     bool has_pending_cmd_ = false;
-    bool strided_logged_ = false;
 
     // Pre-allocated WR/SGE templates — initialized once, only dynamic fields updated per batch.
     ibv_send_wr wrs_[BATCH_SIZE * 4];
@@ -554,9 +531,6 @@ private:
         int ret = pthread_setaffinity_np(thread_.native_handle(), sizeof(cpu_set_t), &cpuset);
         if (ret != 0) {
             fprintf(stderr, "proxy: pin_proxy: pthread_setaffinity_np failed: %s\n", strerror(ret));
-        } else {
-            fprintf(stderr, "proxy: pinned proxy thread to NUMA %d cpulist=%s (GPU %d)\n",
-                    numa, cpulist.c_str(), device_id);
         }
     }
 
@@ -1223,13 +1197,6 @@ private:
             }
         }
 
-        // Print diagnostics
-        if (diag_total_loops_ > 0) {
-            fprintf(stderr, "proxy diag: loops=%lu empty=%lu(%.0f%%) full_batch=%lu partial=%lu inflight_limited=%lu\n",
-                    diag_total_loops_, diag_empty_loops_,
-                    100.0 * diag_empty_loops_ / diag_total_loops_,
-                    diag_full_batches_, diag_partial_batches_, diag_inflight_limited_);
-        }
     }
 };
 

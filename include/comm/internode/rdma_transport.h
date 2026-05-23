@@ -115,9 +115,6 @@ inline ibv_qp* create_rc_qp(ibv_pd* pd, ibv_cq* send_cq, int sq_depth = 2048, in
 
     ibv_qp* qp = ibv_create_qp(pd, &init_attr);
     RDMA_CHECK(qp != nullptr, "ibv_create_qp(RC) failed");
-    fprintf(stderr, "QP created: requested sq=%d, actual sq=%d, max_sge=%d, max_inline=%d\n",
-            sq_depth, init_attr.cap.max_send_wr, init_attr.cap.max_send_sge,
-            init_attr.cap.max_inline_data);
     return qp;
 }
 
@@ -339,18 +336,12 @@ inline ConnectionInfo exchange_info_tcp(const ConnectionInfo& local,
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t)port);
         addr.sin_addr.s_addr = INADDR_ANY;
-        if (std::getenv("MKERNEL_TCP_EXCHANGE_DEBUG")) {
-            fprintf(stderr, "rdma_tcp: server listen port=%d peer=%s\n", port, peer_ip ? peer_ip : "(null)");
-        }
         RDMA_CHECK(bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) == 0,
                    "bind() failed");
         RDMA_CHECK(listen(listen_fd, 1) == 0, "listen() failed");
 
         int conn_fd = accept(listen_fd, nullptr, nullptr);
         RDMA_CHECK(conn_fd >= 0, "accept() failed");
-        if (std::getenv("MKERNEL_TCP_EXCHANGE_DEBUG")) {
-            fprintf(stderr, "rdma_tcp: server accepted port=%d peer=%s\n", port, peer_ip ? peer_ip : "(null)");
-        }
         close(listen_fd);
 
         // Send ours, recv theirs
@@ -366,9 +357,6 @@ inline ConnectionInfo exchange_info_tcp(const ConnectionInfo& local,
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t)port);
         inet_pton(AF_INET, peer_ip, &addr.sin_addr);
-        if (std::getenv("MKERNEL_TCP_EXCHANGE_DEBUG")) {
-            fprintf(stderr, "rdma_tcp: client connect peer=%s port=%d\n", peer_ip ? peer_ip : "(null)", port);
-        }
 
         // Extension rebuilds can take well over 30s on one rank while the peer
         // has already finished and started retrying the TCP bootstrap connect.
@@ -379,10 +367,6 @@ inline ConnectionInfo exchange_info_tcp(const ConnectionInfo& local,
         for (int attempt = 0; attempt < max_retries; attempt++) {
             if (connect(fd, (sockaddr*)&addr, sizeof(addr)) == 0) {
                 connected = true;
-                if (std::getenv("MKERNEL_TCP_EXCHANGE_DEBUG")) {
-                    fprintf(stderr, "rdma_tcp: client connected peer=%s port=%d attempt=%d\n",
-                            peer_ip ? peer_ip : "(null)", port, attempt);
-                }
                 break;
             }
             close(fd);

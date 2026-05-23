@@ -10,7 +10,6 @@
 #pragma once
 
 #include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -27,11 +26,6 @@ static constexpr CUmemAllocationHandleType kHandleType = CU_MEM_HANDLE_TYPE_POSI
 
 using Handle = CUmemGenericAllocationHandle;
 
-__host__ inline bool mc_debug_enabled() {
-    const char *v = std::getenv("MKERNEL_MC_DEBUG");
-    return v && v[0] == '1';
-}
-
 __host__ inline void alloc(
     Handle *handle,
     size_t *allocated_size,
@@ -47,16 +41,6 @@ __host__ inline void alloc(
     MKERNEL_CUCHECK(cuMemGetAllocationGranularity(
         &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
     *allocated_size = ((size + granularity - 1) / granularity) * granularity;
-    if (mc_debug_enabled()) {
-        std::fprintf(
-            stderr,
-            "comm::vmm::alloc: dev=%d req_size=%zu alloc_size=%zu granularity=%zu handleType=0x%x allocType=%d locType=%d\n",
-            device_id, size, *allocated_size, granularity,
-            static_cast<unsigned int>(prop.requestedHandleTypes),
-            static_cast<int>(prop.type),
-            static_cast<int>(prop.location.type)
-        );
-    }
 
     MKERNEL_CUCHECK(cuMemCreate(handle, *allocated_size, &prop, 0));
 }
@@ -143,18 +127,6 @@ __host__ inline void multicast_create_handle(
         &granularity, &prop, CU_MULTICAST_GRANULARITY_RECOMMENDED));
     *allocated_size = ((size + granularity - 1) / granularity) * granularity;
     prop.size = *allocated_size;
-    if (mc_debug_enabled()) {
-        size_t min_granularity = 0;
-        CUresult r = cuMulticastGetGranularity(
-            &min_granularity, &prop, CU_MULTICAST_GRANULARITY_MINIMUM);
-        if (r != CUDA_SUCCESS) min_granularity = 0;
-        std::fprintf(
-            stderr,
-            "comm::vmm::multicast_create_handle: numDevices=%d req_size=%zu alloc_size=%zu gran_rec=%zu gran_min=%zu handleType=0x%x\n",
-            num_devices, size, *allocated_size, granularity, min_granularity,
-            static_cast<unsigned int>(prop.handleTypes)
-        );
-    }
 
     MKERNEL_CUCHECK(cuMulticastCreate(handle, &prop));
 }
@@ -169,35 +141,6 @@ __host__ inline void multicast_bind_memory(
     const Handle &multicast_handle,
     const Handle &memory_handle,
     size_t size) {
-    if (mc_debug_enabled()) {
-        CUmemAllocationProp p = {};
-        CUresult pr = cuMemGetAllocationPropertiesFromHandle(&p, memory_handle);
-        if (pr == CUDA_SUCCESS) {
-            std::fprintf(
-                stderr,
-                "comm::vmm::multicast_bind_memory: memory_handle=0x%llx size=%zu allocType=%d reqHandleTypes=0x%x location(type=%d,id=%d)\n",
-                static_cast<unsigned long long>(memory_handle),
-                size,
-                static_cast<int>(p.type),
-                static_cast<unsigned int>(p.requestedHandleTypes),
-                static_cast<int>(p.location.type),
-                static_cast<int>(p.location.id)
-            );
-        } else {
-            const char *n = nullptr;
-            const char *s = nullptr;
-            cuGetErrorName(pr, &n);
-            cuGetErrorString(pr, &s);
-            std::fprintf(
-                stderr,
-                "comm::vmm::multicast_bind_memory: cuMemGetAllocationPropertiesFromHandle failed for memory_handle=0x%llx err=%s (%s)\n",
-                static_cast<unsigned long long>(memory_handle),
-                n ? n : "unknown",
-                s ? s : "unknown"
-            );
-        }
-    }
-
     CUresult mc_bind_result = cuMulticastBindMem(multicast_handle, 0, memory_handle, 0, size, 0);
     if (mc_bind_result != CUDA_SUCCESS) {
         const char *err_str = nullptr;

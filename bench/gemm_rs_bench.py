@@ -391,49 +391,6 @@ def main():
                                 sparse_ref[row_lo2:row_hi2, col_lo:col_hi] = \
                                     C_ref[row_lo2:row_hi2, col_lo:col_hi]
                         C_ref = sparse_ref
-                    if os.environ.get("GEMM_RS_DEBUG_REF", "0") == "1":
-                        obs = output.data_.float()
-                        combos = []
-                        for mask in range(1, 1 << NUM_NODES):
-                            ref = None
-                            label_parts = []
-                            for ref_node, node_ref in enumerate(node_refs):
-                                if mask & (1 << ref_node):
-                                    label_parts.append(str(ref_node))
-                                    ref = node_ref if ref is None else ref + node_ref
-                            diff = (obs - ref.to("cuda").float()).abs().max().item()
-                            combos.append(("+".join(label_parts), diff))
-                        combos_s = " ".join(
-                            f"{label}:{diff:.4f}" for label, diff in combos
-                        )
-                        print(
-                            f"[gemm_rs-refdiag] rank={rank} node={node_idx} "
-                            f"lr={local_rank} {combos_s}",
-                            flush=True,
-                        )
-                        sparse_obs = output.data_.float()
-                        sparse_exp = C_ref.to("cuda").float()
-                        sparse_diff = (sparse_obs - sparse_exp).abs()
-                        if sparse_diff.numel() and float(sparse_diff.max().item()) > 0.75:
-                            flat_idx = int(sparse_diff.argmax().item())
-                            dbg_row = flat_idx // n
-                            dbg_col = flat_idx - dbg_row * n
-                            dbg_rb = dbg_row // ROW_BLOCK
-                            dbg_ci = (dbg_col // COL_BLOCK) // chunk_tiles
-                            dbg_chunk = dbg_rb * chunks_per_row + dbg_ci
-                            comps = [
-                                float(node_ref[dbg_row, dbg_col].item())
-                                for node_ref in node_refs
-                            ]
-                            print(
-                                f"[gemm_rs-sparse-refdiag] rank={rank} node={node_idx} "
-                                f"lr={local_rank} idx=({dbg_row},{dbg_col}) "
-                                f"chunk={dbg_chunk} owner={dbg_chunk % NUM_NODES} "
-                                f"obs={float(sparse_obs[dbg_row, dbg_col].item()):.6f} "
-                                f"exp={float(sparse_exp[dbg_row, dbg_col].item()):.6f} "
-                                f"components={','.join(f'{x:.6f}' for x in comps)}",
-                                flush=True,
-                            )
             # Only the destination local-rank owns this reduce-scatter shard.
             # Non-owners still participate in the distributed check_close()
             # collective, but compare against themselves so only owner ranks

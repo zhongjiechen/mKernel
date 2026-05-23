@@ -222,8 +222,6 @@ def main():
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
-    print(f"[dispatch_gemm] node{node_idx}/lr{local_rank} loaded mod, peer_ip={peer_ip} "
-          f"tcp_port={tcp_port} MKERNEL_BIND={os.environ.get('MKERNEL_BIND_RETAINED_HANDLE','-')}", flush=True)
 
     if is_chief:
         print(f"[dispatch_gemm] world={world_size*NUM_NODES} per_node={world_size} "
@@ -350,8 +348,6 @@ def main():
 
         # ZERO_COPY baked on: peer_tokens IS the RDMA destination.
         external_recv_buf_ptr = int(peer_tokens.data_.data_ptr())
-        print(f"[dispatch_gemm] node{node_idx}/lr{local_rank} alloc done; "
-              f"creating session peer={peer_ip}:{tcp_port}", flush=True)
         # Zero-copy send: register pre_tokens as the proxy's data MR. Kernel
         # reads straight from pre_tokens — no send_buf pack required.
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
@@ -365,7 +361,6 @@ def main():
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
-        print(f"[dispatch_gemm] node{node_idx}/lr{local_rank} session created", flush=True)
         fifo = mod.get_fifo_handles()
         arrival_ptr = mod.get_arrival_flags_ptr()
         recv_ptr = mod.get_recv_buf_ptr()

@@ -269,11 +269,6 @@ run_one_2node() {
         # from the caller's shell; opt in explicitly for diagnostic runs.
         allow_profiler_logging=0
     fi
-    # Optional: forward MKERNEL_DUMP_DIAG so the bench scripts can dump
-    # per-proxy diagnostics.
-    if [[ "$allow_profiler_logging" == "1" && -n "${MKERNEL_DUMP_DIAG:-}" ]]; then
-        env_str="$env_str MKERNEL_DUMP_DIAG=$MKERNEL_DUMP_DIAG"
-    fi
     if [[ "$allow_profiler_logging" == "1" && -n "${MKERNEL_EFA_PROXY_DIAG:-}" ]]; then
         env_str="$env_str MKERNEL_EFA_PROXY_DIAG=$MKERNEL_EFA_PROXY_DIAG"
     fi
@@ -294,9 +289,6 @@ run_one_2node() {
     fi
     if [[ -n "${MKERNEL_GEMM_AR_WARMUP:-}" ]]; then
         env_str="$env_str MKERNEL_GEMM_AR_WARMUP=$MKERNEL_GEMM_AR_WARMUP"
-    fi
-    if [[ -n "${GEMM_RS_DEBUG_REF:-}" ]]; then
-        env_str="$env_str GEMM_RS_DEBUG_REF=$GEMM_RS_DEBUG_REF"
     fi
     if [[ -n "${GEMM_RS_SPLIT:-}" ]]; then
         env_str="$env_str GEMM_RS_SPLIT=$GEMM_RS_SPLIT"
@@ -475,9 +467,6 @@ run_one_2node() {
     if [[ -n "${MKERNEL_PROXY_THREADS:-}" ]]; then
         env_str="$env_str MKERNEL_PROXY_THREADS=$MKERNEL_PROXY_THREADS"
     fi
-    if [[ -n "${MKERNEL_STRIDED_DIRECT_DEBUG:-}" ]]; then
-        env_str="$env_str MKERNEL_STRIDED_DIRECT_DEBUG=$MKERNEL_STRIDED_DIRECT_DEBUG"
-    fi
     if [[ -n "${AG_GEMM_PROXY_THREADS:-}" ]]; then
         env_str="$env_str AG_GEMM_PROXY_THREADS=$AG_GEMM_PROXY_THREADS"
     fi
@@ -510,15 +499,6 @@ run_one_2node() {
     fi
     if [[ -n "${MKERNEL_MAX_INFLIGHT:-}" ]]; then
         env_str="$env_str MKERNEL_MAX_INFLIGHT=$MKERNEL_MAX_INFLIGHT"
-    fi
-    if [[ -n "${MKERNEL_TCP_EXCHANGE_DEBUG:-}" ]]; then
-        env_str="$env_str MKERNEL_TCP_EXCHANGE_DEBUG=$MKERNEL_TCP_EXCHANGE_DEBUG"
-    fi
-    if [[ -n "${MKERNEL_DEBUG_CORRECTNESS:-}" ]]; then
-        env_str="$env_str MKERNEL_DEBUG_CORRECTNESS=$MKERNEL_DEBUG_CORRECTNESS"
-    fi
-    if [[ -n "${MKERNEL_DEBUG_INDEX:-}" ]]; then
-        env_str="$env_str MKERNEL_DEBUG_INDEX=$MKERNEL_DEBUG_INDEX"
     fi
     if [[ -n "${MKERNEL_ALLOW_NOSYNC_NGT2:-}" ]]; then
         env_str="$env_str MKERNEL_ALLOW_NOSYNC_NGT2=$MKERNEL_ALLOW_NOSYNC_NGT2"

@@ -284,9 +284,6 @@ inline ibv_context* open_efa_device(int local_rank = 0) {
         }
     }
     if (idx < 0) idx = local_rank % (int)efa_devs.size();
-    fprintf(stderr, "rdma_efa: local_rank=%d using EFA device %s (%d/%d available, root=%s)\n",
-            local_rank, efa_devs[idx].name.c_str(), idx + 1, (int)efa_devs.size(),
-            efa_devs[idx].pcie_root.c_str());
 
     ibv_context* ctx = ibv_open_device(efa_devs[idx].dev);
     ibv_free_device_list(dev_list);
@@ -374,8 +371,6 @@ inline std::vector<EfaOpenedDevice> open_efa_devices(int local_rank, int count) 
 
         ibv_context* ctx = ibv_open_device(target_dev);
         RDMA_CHECK(ctx != nullptr, "ibv_open_device failed");
-        fprintf(stderr, "rdma_efa: local_rank=%d rail=%d using EFA device %s (root=%s)\n",
-                local_rank, r, selected.name.c_str(), selected.pcie_root.c_str());
         result.push_back({ctx, selected.name});
     }
 
@@ -428,9 +423,6 @@ inline ibv_qp* create_srd_qp(ibv_pd* pd, ibv_cq* send_cq, ibv_context* ctx,
     if (actual_sq_depth_out) {
         *actual_sq_depth_out = requested_sq_depth;
     }
-    fprintf(stderr,
-            "rdma_efa: SRD QP created requested sq=%d (default=%d env=%d provider_max=%d)\n",
-            requested_sq_depth, sq_depth, env_sq_depth, provider_max_sq_wr);
     return qp;
 }
 

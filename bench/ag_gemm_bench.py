@@ -174,23 +174,11 @@ def main():
 
         if is_chief:
             print(f"\n[ag_gemm] M={M} K={K} N={N} M_node={M_node} M_local={M_local}", flush=True)
-            print("[ag_gemm] debug env "
-                  f"collective={os.environ.get('AG_GEMM_INTERNODE_COLLECTIVE', '')} "
-                  f"skip_remote={os.environ.get('AG_GEMM_SKIP_REMOTE_COMPUTE', '')} "
-                  f"skip_phase1={os.environ.get('AG_GEMM_SKIP_PHASE1', '')} "
-                  f"skip_phase1_gate={os.environ.get('AG_GEMM_SKIP_PHASE1_GATE', '')} "
-                  f"skip_phase2={os.environ.get('AG_GEMM_SKIP_PHASE2', '')} "
-                  f"skip_compute={os.environ.get('AG_GEMM_SKIP_COMPUTE', '')} "
-                  f"skip_reset={os.environ.get('AG_GEMM_SKIP_RESET', '')} "
-                  f"skip_prologue={os.environ.get('AG_GEMM_SKIP_PROLOGUE', '')}",
-                  flush=True)
-        print(f"[ag_gemm] node{node_idx}/lr{local_rank} start alloc", flush=True)
 
         torch.manual_seed(42 + global_gpu_idx); torch.cuda.manual_seed(42 + global_gpu_idx)
         A_local = torch.randn((M_local, K), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
         torch.manual_seed(100); torch.cuda.manual_seed(100)
         B = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
-        print(f"[ag_gemm] node{node_idx}/lr{local_rank} A,B done", flush=True)
 
         if use_ngt2_fallback:
             if is_chief:
@@ -222,18 +210,15 @@ def main():
 
         a_tk = mod.DistBuffer((M_node, K), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
-        print(f"[ag_gemm] node{node_idx}/lr{local_rank} a_tk done", flush=True)
         start_row = local_rank * M_local
         a_tk.data_[start_row:start_row + M_local].copy_(A_local)
 
         a_recv_tk = mod.DistBuffer((M_node * n_peers * ring_recv_banks, K), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
-        print(f"[ag_gemm] node{node_idx}/lr{local_rank} a_recv_tk done", flush=True)
         a_recv_tk.data_.zero_()
 
         barrier = mod.DistBuffer((3, 1024, 1024), dtype=torch.int,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
-        print(f"[ag_gemm] node{node_idx}/lr{local_rank} barrier done", flush=True)
         barrier.data_.zero_()
 
         C = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
@@ -256,7 +241,6 @@ def main():
         a_tk_ptr = int(a_tk.data_.data_ptr())
         send_buf_ptr = int(a_recv_tk.data_.data_ptr()) if ring_collective else a_tk_ptr
         send_buf_size = recv_buf_bytes if ring_collective else a_half_bytes
-        print(f"[ag_gemm] node{node_idx}/lr{local_rank} pre create_session peer={peer_ip}:{tcp_port}", flush=True)
         # Direct mode sends local A through MR1 (src_view=1). Ring mode also
         # registers A_recv as MR0 (src_view=0) so received shards can be
         # forwarded to the next node after phase-2 republishes them.
@@ -269,7 +253,6 @@ def main():
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
-        print(f"[ag_gemm] node{node_idx}/lr{local_rank} post create_session", flush=True)
         fifo = mod.get_fifo_handles()
         arrival_ptr = mod.get_arrival_flags_ptr()
         recv_ptr = mod.get_recv_buf_ptr()
@@ -277,7 +260,6 @@ def main():
         epoch = 1
         mod.set_epoch(epoch)
         dist.barrier(); time.sleep(0.5)
-        print(f"[ag_gemm] node{node_idx}/lr{local_rank} epoch=1 settled, starting warmup", flush=True)
 
         def reset_state():
             barrier.data_.zero_()
@@ -298,9 +280,7 @@ def main():
         for wi in range(args.warmup):
             reset_state(); epoch += 1; mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.1)
-            print(f"[ag_gemm] node{node_idx}/lr{local_rank} warmup{wi} pre-launch epoch={epoch}", flush=True)
             run_once(); torch.cuda.synchronize()
-            print(f"[ag_gemm] node{node_idx}/lr{local_rank} warmup{wi} done", flush=True)
             dist.barrier()
 
         samples = []
@@ -365,18 +345,6 @@ def main():
                 f"ag_gemm M={M}", C, C_ref, atol=0.45, rtol=0.10
             ) and correctness_ok
 
-        # Optional proxy diagnostics dump for the V2 Planner cost-model refit.
-        # Off by default; enable with MKERNEL_DUMP_DIAG=1.
-        if os.environ.get("MKERNEL_DUMP_DIAG") == "1":
-            try:
-                diags = mod.get_proxy_diagnostics()
-                print(f"[ag_gemm-diag] node{node_idx}/lr{local_rank} M={M} "
-                      f"num_proxies={len(diags)}", flush=True)
-                for i, d in enumerate(diags):
-                    print(f"[ag_gemm-diag] node{node_idx}/lr{local_rank} M={M} "
-                          f"proxy{i} {dict(d)}", flush=True)
-            except Exception as ex:
-                print(f"[ag_gemm-diag] dump failed: {ex}", flush=True)
         result_sizes.append(f"M={M}")
         result_fused.append(wall_ms)
 

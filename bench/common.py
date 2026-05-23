@@ -281,21 +281,6 @@ def check_close(
         print(f"[correctness-local] rank={dist.get_rank()} {name}: "
               f"max_abs={max_abs:.6f} max_rel={max_rel:.6f}",
               flush=True)
-        if os.environ.get("MKERNEL_DEBUG_CORRECTNESS", "0") == "1" and diff.numel():
-            flat_idx = int(diff.argmax().item())
-            unraveled = []
-            rem = flat_idx
-            for dim in reversed(diff.shape):
-                unraveled.append(rem % dim)
-                rem //= dim
-            unraveled.reverse()
-            obs_val = float(observed_f.flatten()[flat_idx].item())
-            exp_val = float(expected_f.flatten()[flat_idx].item())
-            print(
-                f"[correctness-debug] rank={dist.get_rank()} {name}: "
-                f"idx={tuple(unraveled)} observed={obs_val:.6f} expected={exp_val:.6f}",
-                flush=True,
-            )
     stats = torch.tensor([max_abs, max_rel, 0.0 if local_ok else 1.0],
                          dtype=torch.float64)
     dist.all_reduce(stats, op=dist.ReduceOp.MAX)

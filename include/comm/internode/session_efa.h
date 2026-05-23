@@ -712,11 +712,6 @@ inline Session* create_session(const SessionConfig& cfg) {
             const char* pipe_env = std::getenv("Q2_PROXY_PIPELINE");
             pcfg.pipeline_enabled =
                 (pipe_env != nullptr && pipe_env[0] == '1');
-            if (t == 0 && cfg.rank == 0) {
-                fprintf(stderr,
-                        "internode_efa::Session Q2_PROXY_PIPELINE=%d\n",
-                        (int)pcfg.pipeline_enabled);
-            }
         }
 
         pcfg.remote_barrier_addr = s->remote_info.barrier_addr;
@@ -765,14 +760,6 @@ inline Session* create_session(const SessionConfig& cfg) {
 
         s->proxies[t] = new Proxy(pcfg);
         s->proxies[t]->start();
-    }
-
-    if (cfg.rank == 0) {
-        fprintf(stderr,
-                "internode_efa::Session created (rank=%d, peer=%s:%d, qps=%d, "
-                "rails=%d, proxies=%d, logical_q_per_qp=%d)\n",
-                cfg.rank, cfg.peer_ip, cfg.tcp_port,
-                num_qps, num_rails, num_proxy_threads, logical_queues_per_qp);
     }
 
     return s;
