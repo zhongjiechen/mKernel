@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief Virtual Memory Management (VMM) communication primitives for inter-process and inter-GPU sharing.
+ * @brief CUDA VMM allocation, mapping, and multicast helpers.
  *
  * This file wraps CUDA driver VMM APIs for:
  * - shareable allocation handles (FD export/import path),

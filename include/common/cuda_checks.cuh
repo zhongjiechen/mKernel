@@ -1,9 +1,9 @@
 /**
  * @file
- * @brief Shared CUDA runtime/driver error-check helpers used by communication modules.
+ * @brief CUDA runtime/driver error-check helpers.
  *
- * This file is not a transport primitive itself; it provides consistent failure
- * handling for IPC, VMM, multicast, and multimem wrappers.
+ * Shared by IPC, VMM, multicast, and multimem wrappers so failures include
+ * source location and CUDA error text.
  */
 #pragma once
 

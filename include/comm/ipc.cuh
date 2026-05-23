@@ -1,12 +1,9 @@
 /**
  * @file
- * @brief IPC communication primitives for sharing GPU memory across processes.
+ * @brief IPC handle export/import helpers for GPU memory.
  *
- * This file provides two handle flavors:
- * - legacy CUDA IPC handles (`cudaIpcMemHandle_t`),
- * - VMM POSIX-FD-based handles for modern CUDA memory sharing.
- *
- * It includes export/import/free helpers and support checks.
+ * Supports legacy CUDA IPC handles (`cudaIpcMemHandle_t`) and VMM
+ * POSIX-FD-based handles.
  */
 #pragma once
 
