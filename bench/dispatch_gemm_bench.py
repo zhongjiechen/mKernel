@@ -7,7 +7,7 @@ dispatch_gemm configuration:
     CHUNK_BYTES=512KB (baked in src/dispatch_gemm.cu).
     SM split: send=4, copy=4, comm=64 at large shapes (131k).
 
-Representative 2-node EFA timings:
+Representative EFA timings:
     8k: 0.631 ms, 16k: 1.057 ms, 32k: 1.538 ms, 65k: 2.669 ms, 131k: 5.16 ms.
 """
 from __future__ import annotations

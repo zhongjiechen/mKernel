@@ -32,8 +32,7 @@ NUM_NODES = get_num_nodes()
 ROW_BLOCK = 128
 COL_BLOCK = 256
 
-# Sweep matches the 2-node bar chart. On N>2, scale M=N so
-# K=M/(NUM_NODES*8) preserves the same aligned K values.
+# Sweep shapes keep K=M/(NUM_NODES*8) on aligned values.
 DEFAULT_SHAPES = (
     [3072, 6144, 12288, 24576, 49152]
     if NUM_NODES == 3 else
@@ -298,8 +297,7 @@ def main():
                 advance_epoch(epoch)
                 reset_state()
             else:
-                # Match the original 2-node no-sync benchmark ordering: clear
-                # local state before publishing the next epoch to the session.
+                # Clear local state before publishing the next epoch to the session.
                 reset_state()
                 epoch += 1
                 advance_epoch(epoch)

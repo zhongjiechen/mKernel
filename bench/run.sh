@@ -6,7 +6,7 @@
 #   bash run.sh nccl_baseline bench 3 55296   # NCCL+GEMM baseline (nccl_baseline_bench.py)
 #
 # Examples:
-#   bash run.sh dispatch_gemm bench               # default 2 nodes
+#   bash run.sh dispatch_gemm bench               # default NUM_NODES=2
 #   bash run.sh ag_gemm check 2
 #   bash run.sh all bench 2 4096,8192
 #   NUM_NODES=2 bash run.sh all bench             # via env, equivalent
@@ -16,7 +16,7 @@
 #   NODE{i}_SSH  — SSH target for peer node i (i > 0)
 #   NODE{i}_SSH_PORT — optional SSH port for peer node i
 #
-# Multi-node etiquette (N≥3 + MKERNEL_TOPOLOGY=h200x3|h200x4):
+# H200 etiquette:
 #   Point NODE0_IP / NODE{i}_SSH at GPU-idle nodes only (no shared SGLang/training).
 #
 # Runtime triage (during a run): if per-GPU utilization stays >99% for ≥15s
@@ -49,29 +49,17 @@ NODE1_IP=${NODE1_IP:-}
 NODE1_SSH=${NODE1_SSH:-}
 BACKEND_ENV_SET=${BACKEND+x}
 BACKEND=${BACKEND:-efa}
-if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x3" || "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
-    if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
-        NUM_NODES=4
-    else
-        NUM_NODES=3
-    fi
-    export NUM_NODES
+if [[ "${MKERNEL_H200:-0}" == "1" ]]; then
     if [[ -z "$BACKEND_ENV_SET" ]]; then
         BACKEND=cx7
     fi
     NODE0_SSH=${NODE0_SSH:-}
-    NODE1_SSH_PORT=${NODE1_SSH_PORT:-2222}
-    NODE2_IP=${NODE2_IP:-}
-    NODE2_SSH=${NODE2_SSH:-}
-    NODE2_SSH_PORT=${NODE2_SSH_PORT:-2222}
-    if [[ "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
-        NODE3_IP=${NODE3_IP:-}
-        NODE3_SSH=${NODE3_SSH:-}
-        NODE3_SSH_PORT=${NODE3_SSH_PORT:-2222}
-    fi
-    RESULT_SUFFIX=${RESULT_SUFFIX:-${MKERNEL_TOPOLOGY}}
-    # Match bench/run_h200x4_baseline.sh (BASELINE_NET=ib): NCCL bootstrap must use
-    # RoCE-facing bonds, not eth0 — otherwise NCCL_IB fails (GID / QP setup).
+    for ((i=1; i<NUM_NODES; i++)); do
+        port_var="NODE${i}_SSH_PORT"
+        export "${port_var}=${!port_var:-2222}"
+    done
+    RESULT_SUFFIX=${RESULT_SUFFIX:-h200_n${NUM_NODES}}
+    # H200 RoCE bootstrap must use the bond interfaces, not eth0.
     _MK_NCCL_BOND_IFS=bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7
     NCCL_SOCKET_IFNAME=${MKERNEL_BASELINE_NCCL_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME:-$_MK_NCCL_BOND_IFS}}
     NCCL_SOCKET_FAMILY=AF_INET
@@ -104,8 +92,8 @@ for ((i=0; i<NUM_NODES; i++)); do
     fi
 done
 
-if ((NUM_NODES >= 3)) && [[ "${MKERNEL_TOPOLOGY:-}" == "h200x3" || "${MKERNEL_TOPOLOGY:-}" == "h200x4" ]]; then
-    echo "[run] policy: NUM_NODES=${NUM_NODES} topology=${MKERNEL_TOPOLOGY:-} — use GPU-idle nodes only; set NODE0_IP to an idle chief (not a shared head)." >&2
+if [[ "${MKERNEL_H200:-0}" == "1" ]]; then
+    echo "[run] policy: NUM_NODES=${NUM_NODES} — use GPU-idle nodes only; set NODE0_IP to an idle chief (not a shared head)." >&2
     echo "[run] WARNING: if any selected node is busy, benchmark results may hang or be misleading." >&2
 fi
 
@@ -128,14 +116,14 @@ COMMON_ENV=(
     "GEMM_AR_K_DIV=${GEMM_AR_K_DIV:-global_world}"
     # NCCL's NVLS multicast claims the multicast capability for its own
     # collectives; that conflicts with DistBuffer's multicast bind
-    # in the 2-node setup. Disable NCCL multicast so our user-mode bind
+    # in this setup. Disable NCCL multicast so our user-mode bind
     # has the multicast feature exclusively.
     "NCCL_NVLS_ENABLE=0"
     "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7"
     "TORCH_CUDA_ARCH_LIST=9.0a"
     "MASTER_ADDR=$NODE0_IP"
     "NUM_NODES=$NUM_NODES"
-    "MKERNEL_TOPOLOGY=${MKERNEL_TOPOLOGY:-}"
+    "MKERNEL_H200=${MKERNEL_H200:-0}"
 )
 for ((i=0; i<NUM_NODES; i++)); do
     ip_var="NODE${i}_IP"

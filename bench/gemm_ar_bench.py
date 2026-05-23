@@ -11,10 +11,7 @@ from pathlib import Path
 os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
 os.environ.setdefault("GEMM_AR_ARRIVAL_QUEUE", "1")
 os.environ.setdefault("GEMM_AR_DISABLE_SEND_COALESCE", "1")
-if not (
-    os.environ.get("MKERNEL_TOPOLOGY") == "h200x4"
-    and os.environ.get("NUM_NODES") == "4"
-):
+if os.environ.get("NUM_NODES") != "4":
     os.environ.setdefault("GEMM_AR_INTER_SEND_SMS", "4")
     os.environ.setdefault("GEMM_AR_NUM_INTRA_COMM_SMS", "12")
 os.environ.setdefault("GEMM_AR_STEADY_STATE_BENCH", "1")
@@ -39,7 +36,7 @@ ROW_BLOCK = 128
 COL_BLOCK = 256
 
 DEFAULT_SHAPES = (
-    # 4-node release sweep: use the largest verified natural multiples.
+    # H200 release sweep: use the largest verified natural multiples.
     [8192, 12288, 16384, 20480, 22528]
     if NUM_NODES == 4 else
     [2048, 4096, 8192, 16384, 32768]
@@ -195,9 +192,8 @@ def pick_sm_split(M, N, world_size, num_comm_sms_total, num_intra_override, num_
     effective_comm_sms = min(num_comm_sms_total, max(adaptive_comm, 16))
     env_intra = os.environ.get("GEMM_AR_NUM_INTRA_COMM_SMS")
     env_inter_send = os.environ.get("GEMM_AR_INTER_SEND_SMS")
-    h200x4_default_tune = (
+    four_node_default_tune = (
         NUM_NODES == 4
-        and os.environ.get("MKERNEL_TOPOLOGY") == "h200x4"
         and num_intra_override is None
         and env_intra is None
         and num_inter_send_override is None
@@ -207,8 +203,8 @@ def pick_sm_split(M, N, world_size, num_comm_sms_total, num_intra_override, num_
         num_intra_comm_sms = max(4, num_intra_override)
     elif env_intra:
         num_intra_comm_sms = max(4, int(env_intra))
-    elif h200x4_default_tune:
-        # H200x4 direct-fanout AR needs inter-heavy progress; balanced splits
+    elif four_node_default_tune:
+        # Four-node direct-fanout AR needs inter-heavy progress; balanced splits
         # helped debug smoke tests but lost in release warmup/10-iter timing.
         num_intra_comm_sms = 4
     else:
@@ -221,7 +217,7 @@ def pick_sm_split(M, N, world_size, num_comm_sms_total, num_intra_override, num_
         inter_send_override = num_inter_send_override
     elif env_inter_send:
         inter_send_override = int(env_inter_send)
-    elif h200x4_default_tune:
+    elif four_node_default_tune:
         inter_send_override = 20
     else:
         inter_send_override = None
