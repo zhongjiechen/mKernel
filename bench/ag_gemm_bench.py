@@ -119,9 +119,8 @@ def main():
     result_sizes, result_fused = [], []
     correctness_ok = True
 
-    # Per-shape intra override that bypasses the max(4) floor in the kernel
-    # by going through num_intra_comm_override path. On H200x4 direct, 16
-    # intra-comm CTAs gave the best release timings for small/medium shapes;
+    # Per-shape intra override that bypasses the max(4) floor in the kernel.
+    # With H200 direct mode, 16 intra-comm CTAs gave the best release timings for small/medium shapes;
     # M=49152 stays on the adaptive/default split, which was slightly faster.
     INTRA_OVERRIDE = {}
     if NUM_NODES == 4 and os.environ.get("AG_GEMM_INTERNODE_COLLECTIVE", "").strip().lower() == "direct":

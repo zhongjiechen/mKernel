@@ -76,9 +76,7 @@ def get_num_nodes() -> int:
 
     Bench scripts and the launcher consult this to size the global world
     (`WORLD_SIZE = NUM_NODES * LOCAL_WORLD_SIZE`) and the multi-peer
-    session bringup (peer_ips / peer_tcp_ports lists). The 2-node config
-    is regression-tested; N > 2 has been wired through the session, proxy,
-    and kernel layers but is still untested without a 4+ node testbed.
+    session bringup (peer_ips / peer_tcp_ports lists).
     """
     return int(os.environ.get("NUM_NODES", "2"))
 

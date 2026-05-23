@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# Reproducible 4-node H200x launcher for torch/cuBLAS + NCCL baselines.
+# Reproducible H200 launcher for torch/cuBLAS + NCCL baselines.
 # Usage:
-#   bash bench/run_h200x4_baseline.sh [kernel|all]
+#   NUM_NODES=<n> bash bench/run_h200_baseline.sh [kernel|all]
 #
 # Optional overrides:
 #   BASELINE_NET=ib|socket     # default: ib
@@ -13,8 +13,7 @@ set -euo pipefail
 #   MASTER_PORT=27200
 #   PY=python3
 #
-# For reproducible socket smoke fallback runs, use:
-#   bash bench/run_h200x4_baseline_socket_smoke_fill.sh
+# For socket smoke fallback runs, set BASELINE_NET=socket.
 
 KERNEL=${1:-all}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -24,22 +23,34 @@ PY=${PY:-python3}
 MASTER_PORT=${MASTER_PORT:-27200}
 BASELINE_NET=${BASELINE_NET:-ib}
 TIMEOUT=${TIMEOUT:-3000}
-TAG=${TAG:-nccl_h200x4}
+NUM_NODES=${NUM_NODES:-4}
+TAG=${TAG:-nccl_h200_n${NUM_NODES}}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 DEFAULT_NCCL_SOCKET_IFNAME=bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7
 DEFAULT_NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7
 
-NODE0_IP=${NODE0_IP:?Set NODE0_IP to node 0's data-plane IP}
-NODE1_IP=${NODE1_IP:?Set NODE1_IP to node 1's data-plane IP}
-NODE2_IP=${NODE2_IP:?Set NODE2_IP to node 2's data-plane IP}
-NODE3_IP=${NODE3_IP:?Set NODE3_IP to node 3's data-plane IP}
-NODE1_SSH=${NODE1_SSH:?Set NODE1_SSH to the SSH target for node 1}
-NODE2_SSH=${NODE2_SSH:?Set NODE2_SSH to the SSH target for node 2}
-NODE3_SSH=${NODE3_SSH:?Set NODE3_SSH to the SSH target for node 3}
+: "${NODE0_IP:?Set NODE0_IP to node 0 data-plane IP}"
+for ((i=1; i<NUM_NODES; i++)); do
+    ip_var="NODE${i}_IP"
+    ssh_var="NODE${i}_SSH"
+    port_var="NODE${i}_SSH_PORT"
+    if [[ -z "${!ip_var:-}" ]]; then
+        echo "Set ${ip_var} to node ${i}'s data-plane IP" >&2
+        exit 1
+    fi
+    if [[ -z "${!ssh_var:-}" ]]; then
+        echo "Set ${ssh_var} to the SSH target for node ${i}" >&2
+        exit 1
+    fi
+    export "$ip_var" "$ssh_var"
+    port_value="${!port_var:-}"
+    if [[ -z "$port_value" ]]; then
+        port_value=2222
+    fi
+    printf -v "$port_var" '%s' "$port_value"
+    export "$port_var"
+done
 MASTER_ADDR=${MASTER_ADDR:-$NODE0_IP}
-NODE1_SSH_PORT=${NODE1_SSH_PORT:-2222}
-NODE2_SSH_PORT=${NODE2_SSH_PORT:-2222}
-NODE3_SSH_PORT=${NODE3_SSH_PORT:-2222}
 
 BASE_ENV=(
     "PATH=${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
@@ -49,11 +60,7 @@ BASE_ENV=(
     "BASELINE_NET=$BASELINE_NET"
     "MASTER_ADDR=$MASTER_ADDR"
     "MASTER_PORT=$MASTER_PORT"
-    "NUM_NODES=4"
-    "NODE0_IP=$NODE0_IP"
-    "NODE1_IP=$NODE1_IP"
-    "NODE2_IP=$NODE2_IP"
-    "NODE3_IP=$NODE3_IP"
+    "NUM_NODES=$NUM_NODES"
     "NCCL_DEBUG=${NCCL_DEBUG:-WARN}"
     "NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}"
     "NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}"
@@ -61,6 +68,10 @@ BASE_ENV=(
     "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-eth0}"
     "BASELINE_RING_ATTN_IMPL=${BASELINE_RING_ATTN_IMPL:-flash_all_gather}"
 )
+for ((i=0; i<NUM_NODES; i++)); do
+    ip_var="NODE${i}_IP"
+    BASE_ENV+=("${ip_var}=${!ip_var}")
+done
 if [[ -n "${NCCL_ALGO:-}" ]]; then
     BASE_ENV+=("NCCL_ALGO=$NCCL_ALGO")
 fi
@@ -125,7 +136,7 @@ fi
 
 if [[ "${CLEAN_RESULTS:-1}" == "1" ]]; then
     if [[ "$KERNEL" == "all" ]]; then
-        rm -f "$HERE/results/"*_nccl_h200x4.json
+        rm -f "$HERE/results/"*_nccl_h200_n"${NUM_NODES}".json
     else
         rm -f "$HERE/results/${KERNEL}_${TAG}.json"
     fi
@@ -135,10 +146,11 @@ env_prefix="env -i ${BASE_ENV[*]}"
 
 cleanup() {
     pkill -9 -f '[n]ccl_baseline_bench.py|[t]orch.distributed.run|[t]orchrun' 2>/dev/null || true
-    for item in "1 $NODE1_SSH $NODE1_SSH_PORT" "2 $NODE2_SSH $NODE2_SSH_PORT" "3 $NODE3_SSH $NODE3_SSH_PORT"; do
-        set -- $item
-        ssh -p "$3" -o BatchMode=yes \
-            "$2" "pkill -9 -f '[n]ccl_baseline_bench.py|[t]orch.distributed.run|[t]orchrun' 2>/dev/null || true" \
+    for ((i=1; i<NUM_NODES; i++)); do
+        ssh_var="NODE${i}_SSH"
+        port_var="NODE${i}_SSH_PORT"
+        ssh -p "${!port_var}" -o BatchMode=yes \
+            "${!ssh_var}" "pkill -9 -f '[n]ccl_baseline_bench.py|[t]orch.distributed.run|[t]orchrun' 2>/dev/null || true" \
             2>/dev/null || true
     done
     sleep 3
@@ -148,21 +160,21 @@ trap cleanup EXIT
 cleanup
 
 declare -a peer_pids=()
-for item in "1 $NODE1_SSH $NODE1_SSH_PORT" "2 $NODE2_SSH $NODE2_SSH_PORT" "3 $NODE3_SSH $NODE3_SSH_PORT"; do
-    set -- $item
-    rank=$1
-    host=$2
-    port=$3
+for ((rank=1; rank<NUM_NODES; rank++)); do
+    ssh_var="NODE${rank}_SSH"
+    port_var="NODE${rank}_SSH_PORT"
+    host=${!ssh_var}
+    port=${!port_var}
     timeout "$TIMEOUT" ssh -p "$port" \
         -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$host" \
-        "cd '$REPO' && $env_prefix '$PY' -m torch.distributed.run --nproc_per_node=$NPROC_PER_NODE --nnodes=4 --node_rank=$rank --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT bench/nccl_baseline_bench.py ${EXTRA_ARGS[*]}" \
-        > "/tmp/nccl_h200x4_node${rank}.log" 2>&1 &
+        "cd '$REPO' && $env_prefix '$PY' -m torch.distributed.run --nproc_per_node=$NPROC_PER_NODE --nnodes=$NUM_NODES --node_rank=$rank --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT bench/nccl_baseline_bench.py ${EXTRA_ARGS[*]}" \
+        > "/tmp/nccl_h200_n${NUM_NODES}_node${rank}.log" 2>&1 &
     peer_pids+=("$!")
 done
 
 sleep 2
 timeout "$TIMEOUT" bash -c \
-    "cd '$REPO' && $env_prefix '$PY' -m torch.distributed.run --nproc_per_node=$NPROC_PER_NODE --nnodes=4 --node_rank=0 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT bench/nccl_baseline_bench.py ${EXTRA_ARGS[*]}"
+    "cd '$REPO' && $env_prefix '$PY' -m torch.distributed.run --nproc_per_node=$NPROC_PER_NODE --nnodes=$NUM_NODES --node_rank=0 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT bench/nccl_baseline_bench.py ${EXTRA_ARGS[*]}"
 rc0=$?
 
 rc_sum=$rc0
