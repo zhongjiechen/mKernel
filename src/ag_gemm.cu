@@ -231,8 +231,8 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 __threadfence_system();
 
                 if (G.remote_ready_per_col != 0) {
-                    // Experimental: signal each republished A k-chunk. Remote
-                    // compute waits on the matching chunk inside its red_idx loop.
+                    // Signal each republished A k-chunk. Remote compute waits
+                    // on the matching chunk inside its red_idx loop.
                     signal_all(G.barrier, {2, slot_row_store, col_idx}, 1);
                 } else {
                     // Default: count all k-chunks at row slot 0; remote compute

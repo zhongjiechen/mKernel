@@ -11,16 +11,10 @@
 #   bash run.sh all bench 2 4096,8192
 #   NUM_NODES=2 bash run.sh all bench             # via env, equivalent
 #
-# Multi-node WIP: only num_nodes=2 is fully validated. The bench layer
-# resolves NUM_NODES (CLI arg > env var > default 2) and prints a WIP
-# warning for >2 (see bench/common.py:get_num_nodes); the launcher itself
-# refuses >2 because it only knows about NODE0/NODE1 SSH endpoints.
-#
-# Cluster (override via env if it changes):
-#   NODE0_IP   — private IP of this (master) node
-#   NODE1_IP   — private IP of the peer node (used as torchrun MASTER target)
-#   NODE1_SSH  — host this script SSHs into to launch node 1 (public or private)
-#   NODE1_SSH_PORT — optional SSH port for node 1
+# Cluster configuration:
+#   NODE{i}_IP   — data-plane IP for node i
+#   NODE{i}_SSH  — SSH target for peer node i (i > 0)
+#   NODE{i}_SSH_PORT — optional SSH port for peer node i
 #
 # Multi-node etiquette (N≥3 + MKERNEL_TOPOLOGY=h200x3|h200x4):
 #   Point NODE0_IP / NODE{i}_SSH at GPU-idle nodes only (no shared SGLang/training).
@@ -231,7 +225,7 @@ run_one_2node() {
             local out_suffix="${RESULT_SUFFIX:-$BACKEND}"
             local out_json="$HERE/results/${kernel}_${out_suffix}.json"
             extra_args="$extra_args --save-json $out_json"
-            # Self-contained regression check against the in-tree source-of-truth JSON.
+            # Optional regression check against an in-tree reference JSON.
             local ref_json="$HERE/source_of_truth/${kernel}.json"
             if [[ -f "$ref_json" && -z "${SKIP_BENCH_COMPARE_TO:-}" ]]; then
                 extra_args="$extra_args --compare-to $ref_json"
@@ -275,8 +269,7 @@ run_one_2node() {
         efa_num_qps_env=" MKERNEL_EFA_NUM_QPS=${MKERNEL_EFA_NUM_QPS:-8}"
     fi
     if [[ "$BACKEND" == "efa" && "$kernel" == "gemm_ar" && -z "${MKERNEL_EFA_NUM_QPS+x}" ]]; then
-        # Match the gemm_ar source-of-truth experiment harness: leave this unset so
-        # the gemm_ar module's session config uses its in-code default of 4 QPs.
+        # Leave this unset so the gemm_ar module uses its in-code default of 4 QPs.
         efa_num_qps_env=""
     fi
     local best_of_env=" MKERNEL_BENCH_BEST_OF_N=${MKERNEL_BENCH_BEST_OF_N:-0}"
@@ -542,11 +535,11 @@ run_one_2node() {
     if [[ -n "${MKERNEL_ALLOW_NOSYNC_NGT2:-}" ]]; then
         env_str="$env_str MKERNEL_ALLOW_NOSYNC_NGT2=$MKERNEL_ALLOW_NOSYNC_NGT2"
     fi
-    # team_v8: forward MKERNEL_GEMM_RS_SPLIT_<M> overrides for sweep tuning.
+    # Forward per-shape GEMM_RS split overrides.
     for var in $(compgen -e | grep '^MKERNEL_GEMM_RS_SPLIT_' || true); do
         env_str="$env_str ${var}=${!var}"
     done
-    # team_v13: forward AG_GEMM_INTRA_OVERRIDE_<M> for ag_gemm sweep tuning.
+    # Forward per-shape ag_gemm intra-CTA overrides.
     for var in $(compgen -e | grep '^AG_GEMM_INTRA_OVERRIDE_' || true); do
         env_str="$env_str ${var}=${!var}"
     done

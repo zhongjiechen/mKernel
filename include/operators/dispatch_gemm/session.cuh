@@ -57,8 +57,7 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     if (const char* env_mi = std::getenv("MKERNEL_MAX_INFLIGHT")) {
         cfg.max_inflight = std::atoi(env_mi);
     }
-    // Round 24 (dispatch_gemm cross-kernel port from gemm_ar round 13 / ag_gemm round 23):
-    // multi-QP lets the proxy post WRs in parallel.
+    // Multiple QPs let the proxy post WRs in parallel.
     cfg.num_qps = 4;
     const char* channelize_env = std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS");
     if (cfg.num_peers > 1 && channelize_env != nullptr && std::atoi(channelize_env) != 0) {

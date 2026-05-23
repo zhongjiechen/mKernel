@@ -126,7 +126,7 @@ def main():
     INTRA_OVERRIDE = {}
     if NUM_NODES == 4 and os.environ.get("AG_GEMM_INTERNODE_COLLECTIVE", "").strip().lower() == "direct":
         INTRA_OVERRIDE.update({8192: 16, 16384: 16, 32768: 16})
-    # team_v13: env-var override for sweep tuning. Format: AG_GEMM_INTRA_OVERRIDE_<M>=<intra>
+    # Per-shape override format: AG_GEMM_INTRA_OVERRIDE_<M>=<intra>.
     # Applied after the conditional defaults so the env value always wins.
     for base_n in shapes:
         env_key = f"AG_GEMM_INTRA_OVERRIDE_{base_n}"

@@ -2,7 +2,7 @@
 
 /**
  * @file moe_dispatch_gemm_multinode.cu
- * @brief Proper 2-node × 8-GPU MoE Dispatch + Group GEMM.
+ * @brief 2-node × 8-GPU MoE Dispatch + Group GEMM.
  *
  * Uses the intra-node 8-GPU dispatch pattern
  * (pre_tokens_distributed_tensor + pull-based dispatch + per-row-block barrier counter +
@@ -15,7 +15,7 @@
  *   - Each GPU has its own num_local_tokens tokens (in pre_tokens DistBuffer)
  *   - After inter-node exchange, each GPU has access to:
  *       (a) Local node's 8 GPU pre_tokens via dbuf (pre_tokens_distributed_tensor)
- *       (b) Peer node's 8 GPU pre_tokens via a SECOND dbuf (peer_tokens_distributed_tensor)
+ *       (b) Peer node's 8 GPU pre_tokens via a second dbuf (peer_tokens_distributed_tensor)
  *           — populated by RDMA writes from peer node + a local D2D copy
  *           into the IPC-shared DistBuffer.
  *
@@ -26,7 +26,7 @@
  *   Phase 2 (intra-node copy + dispatch):
  *     Each GPU copies its recv_buf into its slot of peer_tokens_distributed_tensor
  *     (DistBuffer, IPC-shared across local 8 GPUs).
- *     Then dispatch SM pulls tokens from EITHER pre_tokens_distributed_tensor OR peer_tokens_distributed_tensor
+ *     Then dispatch SM pulls tokens from either pre_tokens_distributed_tensor or peer_tokens_distributed_tensor
  *     based on pull_dispatch_indices (which now has 3 columns: src_node, src_dev, src_token).
  *   Phase 3 (group GEMM):
  *     Same as intranode kernel — each GPU computes GEMMs for its assigned experts.

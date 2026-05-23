@@ -204,7 +204,7 @@ struct copy { // for non-compile-time setters.
  * @param b[in] The second input value.
  * @return The same value as the second input.
  */
-struct copy2 { // this turns out to be a slightly hacky op that makes some code cleaner :/
+struct copy2 {
     template<typename T> static __device__ inline T op(const T &a, const T &b) { return b; }
 };
 /**

@@ -340,10 +340,10 @@ __device__ inline void post_merge_wrs_for_intra_row(
     }
 }
 
-// Experimental direct-send layout: send the two exact 128x128 K-slice halves
-// consumed by one phase-2 remote_publish tile. The proxy gathers strided rows
-// from A and writes adjacent packed half-tiles into recv_buf, so two arrival
-// flags unlock one useful 256x128 multicast publish tile.
+// Direct-send layout for the two 128x128 K-slice halves consumed by one
+// phase-2 remote_publish tile. The proxy gathers strided rows from A and writes
+// adjacent packed half-tiles into recv_buf, so two arrival flags unlock one
+// 256x128 multicast publish tile.
 __device__ inline void post_tiled_direct_wrs_for_intra_row(
     const globals& G, int global_row_idx) {
     const int col_blocks = G.A_local.cols() / (globals::RED_BLOCK * 2);

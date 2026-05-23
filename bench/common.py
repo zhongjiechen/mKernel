@@ -48,8 +48,7 @@ def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
 def get_peer_ports(node_idx: int, num_nodes: int, base_port: int) -> list[int]:
     """Compute symmetric per-pair TCP ports (length num_nodes - 1) for this node.
 
-    For N == 2 returns [base_port] — a single shared port per pair, matching
-    the legacy 2-node setup bit-for-bit.
+    For N == 2 returns [base_port], a single shared port per pair.
 
     For N > 2 peers follow internode::peer_rank_for_slot() ring order. Each
     unordered (lo, hi) rank pair gets a unique port computed as
@@ -324,9 +323,9 @@ def write_results_json(
 ):
     """Write a benchmark JSON consumed by the plotting scripts.
 
-    Crucial: this function MERGES with the existing JSON at `out_path` rather
-    than replacing it wholesale. A bench run with `--shapes 4096` shouldn't
-    erase results for the other 4 shapes that the chart needs. New entries
+    This function merges with the existing JSON at `out_path` rather than
+    replacing it wholesale. A bench run with `--shapes 4096` should not erase
+    results for the other shapes that the chart needs. New entries
     overwrite same-shape entries; absent shapes are preserved.
     """
     new_sizes = list(sizes)

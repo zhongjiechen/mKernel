@@ -11,7 +11,7 @@
  *
  * Original design notes (from src/ring_attention.cu pre-split):
  *
- *  Proper 2-node x 8-GPU Ring Attention.
+ *  2-node x 8-GPU Ring Attention.
  *
  *  Algorithm (16 logical ring stages = 8 local + 1 inter-node hop + 8 local):
  *    Stage 0:        Each GPU computes attention(Q, local KV in K0/V0) -> O, L
@@ -23,8 +23,7 @@
  *    Final reduction: Merge per-stage partials via online softmax.
  *
  *  The intra-node ring_attn primitive (attn_partial / attn_comm / attn_reduction)
- *  is reused verbatim from the intranode kernel — we just call it more times
- *  with an RDMA hop at the midpoint.
+ *  is invoked repeatedly with an RDMA hop at the midpoint.
  */
 
 #include "common/types.cuh"
@@ -163,8 +162,7 @@ struct kv_exchange_globals {
     int   total_chunks_V;
     int   node_idx;
     int   dev_idx;
-    int   num_nodes;  // total node count (>= 2). Scaffolding for multi-
-                      // peer K/V exchange; recv_buf still single-peer-sized.
+    int   num_nodes;  // total node count (>= 2).
     int   num_send_sms;
     int   num_copy_sms;
 
@@ -240,8 +238,7 @@ inline void entrypoint(
     int num_comm_sms,
     int num_send_sms,
     int num_copy_sms,
-    int num_nodes = 2  // total node count (>= 2). N == 2 reproduces the
-                       // legacy 2-node behavior bit-for-bit.
+    int num_nodes = 2  // total node count (>= 2).
 ) {
     const int dev_idx = barrier.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
