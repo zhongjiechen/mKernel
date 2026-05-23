@@ -50,9 +50,8 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     if (const char* env_mi = std::getenv("MKERNEL_MAX_INFLIGHT")) {
         cfg.max_inflight = std::atoi(env_mi);
     }
-    // Round 25: default to 4 QPs per endpoint to match the gemm_ar round-13 win
-    // (51e19e8). Multi-NIC striping is also enabled by default via the
-    // round-18 cluster default MKERNEL_EFA_NUM_NICS=2 in session_fi.h.
+    // Default to 4 QPs per endpoint; multi-NIC striping is controlled by the
+    // internode session configuration.
     cfg.num_qps = 4;
     if (cfg.num_peers > 1 && std::getenv("MKERNEL_CHANNELIZE_GPU_PEERS") != nullptr) {
         cfg.num_qps = std::min(

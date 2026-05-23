@@ -27,15 +27,12 @@ import load_module  # noqa: E402
 # Distributed init / launcher helpers
 # ----------------------------------------------------------------------
 
-_PEER_IP_DEFAULTS = {0: "172.31.1.237", 1: "172.31.11.6"}
-
 
 def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
     """Resolve the list of peer IPs (length num_nodes - 1) for this node.
 
-    Reads NODE0_IP, NODE1_IP, ..., NODE{N-1}_IP from the environment, falling
-    back to the 2-node testbed defaults when the env var is unset (only sane
-    for N <= 2). Returns peers in the same ring slot order as
+    Reads NODE0_IP, NODE1_IP, ..., NODE{N-1}_IP from the environment.
+    Returns peers in the same ring slot order as
     internode::peer_rank_for_slot(): node_idx + 1, node_idx + 2, ...
     wrapping modulo num_nodes.
     """
@@ -43,7 +40,7 @@ def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
     for i in range(num_nodes):
         ip = os.environ.get(f"NODE{i}_IP")
         if not ip:
-            ip = _PEER_IP_DEFAULTS.get(i, "")
+            raise RuntimeError(f"NODE{i}_IP must be set for NUM_NODES={num_nodes}")
         all_ips.append(ip)
     return [all_ips[(node_idx + 1 + slot) % num_nodes] for slot in range(num_nodes - 1)]
 
@@ -51,8 +48,7 @@ def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
 def get_peer_ports(node_idx: int, num_nodes: int, base_port: int) -> list[int]:
     """Compute symmetric per-pair TCP ports (length num_nodes - 1) for this node.
 
-    For N == 2 returns [base_port] — a single shared port per pair, matching
-    the legacy 2-node setup bit-for-bit.
+    For N == 2 returns [base_port], a single shared port per pair.
 
     For N > 2 peers follow internode::peer_rank_for_slot() ring order. Each
     unordered (lo, hi) rank pair gets a unique port computed as
@@ -325,11 +321,11 @@ def write_results_json(
     fused_ms: Iterable[float],
     note: str = "",
 ):
-    """Write a release-format JSON. Schema matches experiments/multinode/sweep/results/efa/.
+    """Write a benchmark JSON consumed by the plotting scripts.
 
-    Crucial: this function MERGES with the existing JSON at `out_path` rather
-    than replacing it wholesale. A bench run with `--shapes 4096` shouldn't
-    erase results for the other 4 shapes that the chart needs. New entries
+    This function merges with the existing JSON at `out_path` rather than
+    replacing it wholesale. A bench run with `--shapes 4096` should not erase
+    results for the other shapes that the chart needs. New entries
     overwrite same-shape entries; absent shapes are preserved.
     """
     new_sizes = list(sizes)

@@ -2,12 +2,11 @@
 
 /**
  * @file gemm_rs_multinode.cu
- * @brief Proper 2-node × 8-GPU GEMM + Reduce-Scatter.
+ * @brief 2-node × 8-GPU GEMM + Reduce-Scatter.
  *
- * Borrows the intra-node 8-GPU pattern from
- *   experiments/dynamic_sm_allocation/question5_gemm_rs/gemm_rs.cu
+ * Uses the intra-node 8-GPU pattern
  * (output_distributed_tensor + tma::store_add_async + per-task ready flags + atomic
- * task claiming) and bolts on an inter-node phase that exchanges each
+ * task claiming) plus an inter-node phase that exchanges each
  * GPU's owned M/8 rows with its same-index peer on the other node.
  *
  * Data flow per GPU (g ∈ [0, 8) within node n ∈ [0, 2)):
@@ -201,10 +200,7 @@ struct fused_globals {
         int M_local;
         int N;
         int node_idx;
-        int num_nodes;  // total node count (>= 2). N == 2 reproduces the
-                        // legacy 2-node code path bit-for-bit. Scaffolding
-                        // for kernel-side multi-peer iteration only;
-                        // recv_buf / staging are still single-peer-sized.
+        int num_nodes;  // total node count (>= 2); recv_buf/staging are per-peer.
         unsigned int *sender_done;
         internode::D2HFifoDeviceBundle d2h_fifos;
         volatile uint32_t *arrival_flags;
@@ -778,8 +774,7 @@ void entrypoint_fused(
     dist::ParallelBuffer &ready_chunk,
     // Staging DistBuffer used as the chunk-major intra-RS atomic-add target.
     pybind11::object staging_obj,
-    int num_nodes = 2  // Total node count (>= 2). N == 2 reproduces the
-                       // legacy 2-node behavior bit-for-bit.
+    int num_nodes = 2  // total node count (>= 2).
 ) {
     const int dev_idx = output.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);

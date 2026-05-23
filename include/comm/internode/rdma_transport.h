@@ -5,8 +5,6 @@
  * Pure C++ host code — no CUDA dependency. Link with -libverbs.
  * Provides RC QP setup, memory registration, RDMA write posting, CQ polling,
  * and TCP bootstrap for connection info exchange.
- *
- * Reference: ~/nfs/ziming/uccl/ep/src/rdma.cpp
  */
 #pragma once
 

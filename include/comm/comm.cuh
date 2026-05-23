@@ -2,7 +2,7 @@
  * @file
  * @brief Umbrella include for communication primitives.
  *
- * Include this file to pull in IPC, VMM/multicast, and multimem primitives.
+ * Pulls in IPC, VMM/multicast, multimem, and atomic helpers.
  */
 #pragma once
 

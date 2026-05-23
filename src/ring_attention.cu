@@ -41,7 +41,6 @@ namespace ring_attn_multinode {
 
 // ============================================================================
 // Intra-node device functions: attn_partial, attn_comm, attn_reduction
-// (verbatim from dynamic_sm_allocation/question4_ring_attn_dynamic_sm/ring_attn.cu)
 // ============================================================================
 //
 // NOTE: The device functions below are large and identical to those in the
@@ -569,9 +568,7 @@ __device__ inline void kv_copy_sm(const kv_exchange_globals &G) {
 
     // Multi-peer: arrival_flags is laid out [peer_slot * total_chunks + chunk_id].
     // For each chunk, wait for all (N-1) peers' KV writes. At N == 2 the loop
-    // runs once with slot == 0 — same flag offset / same wait pattern as today.
-    // Per-peer K_recv/V_recv merging into the ring's intra-node loop is the
-    // per-kernel testbed-side step.
+    // runs once with slot == 0.
     const int n_peers = G.num_nodes - 1;
     const int single_peer_chunks = total_chunks;
     for (int chunk_id = copy_id; chunk_id < total_chunks; chunk_id += G.num_copy_sms) {

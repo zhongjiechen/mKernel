@@ -3,9 +3,8 @@
 // Session management + pybind module for gemm_ar_multinode.
 // Included from src/gemm_ar.cu after the kernel namespace closes.
 //
-// Note: the kernel namespace `gemm_ar_multinode` is opened+closed entirely
-// inside src/gemm_ar.cu; this header lives at top-level (no namespace
-// gymnastics) and only defines the pybind handlers and PYBIND11_MODULE.
+// The kernel namespace lives in src/gemm_ar.cu; this header defines the pybind
+// handlers and PYBIND11_MODULE at top level.
 
 // ============================================================================
 // Session management

@@ -896,7 +896,7 @@ __device__ inline void gemm_ar_post_ring_forward_cmd(
     cmd.local_offset = offset;
     cmd.remote_offset = (uint32_t)((long)dst_slot * single_peer_bytes) + offset;
     cmd.lane_id = (uint16_t)logical_q;
-    cmd.src_view = 1; // registered C_remote_accum source for ring experiment
+    cmd.src_view = 1; // registered C_remote_accum source for ring path
     cmd.reserved0 = (uint8_t)(G.dev_idx);
     cmd.row_span = 0;
     cmd.row_count = (uint16_t)tiles_this_chunk;

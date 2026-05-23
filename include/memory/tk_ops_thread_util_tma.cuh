@@ -16,16 +16,7 @@ namespace tma {
 
 /* ----------   Barrier functions for async load  ---------- */
 
-/**
-* @brief Sets the number of bytes expected at the semaphore.
-*
-* This function sets the number of bytes expected at the semaphore for the first thread in the warp.
-* It converts the semaphore pointer to a generic shared memory pointer and uses an inline assembly
-* instruction to set the expected number of bytes.
-*
-* @param semaphore Reference to the semaphore variable.
-* @param bytes The number of bytes expected at the semaphore.
-*/
+/** @brief Set expected bytes for a CTA mbarrier. */
 __device__ static inline void expect_bytes(semaphore& bar, uint32_t bytes) {
     void const* const ptr = &bar;
     uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr)); 
@@ -33,11 +24,7 @@ __device__ static inline void expect_bytes(semaphore& bar, uint32_t bytes) {
     asm volatile ("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
         :: "r"(bar_ptr), "r"(bytes));
 }
-/**
-* @brief Sets the number of bytes expected at the semaphore.
-*
-* This function sets the number of bytes expected at the mbarrier before the transaction arrives.
-*/
+/** @brief Set expected bytes from one or more TMA payload types. */
 template<typename T, typename... args>
 __device__ static inline void expect(semaphore& bar, const T& _1, const args&... _2) {
     expect_bytes(bar, size_bytes<T, args...>);
@@ -152,20 +139,7 @@ __device__ static inline void careful_wait(semaphore& bar, int kPhaseBit) {
     );
 }
 
-/**
-* @brief Sets the number of bytes expected at the semaphore, assuming a multicast instruction.
-*
-* This function sets the number of bytes expected at the semaphore for the first thread in the warp.
-* It converts the semaphore pointer to a generic shared memory pointer and uses an inline assembly
-* instruction to set the expected number of bytes.
-* 
-* It's worth being aware that this function is particularly necessary for multicast loads, and
-* distributed shared memory can actually be done with a normal tma::expect followed by wait. See
-* the unit tests of dsmem for an example.
-*
-* @param semaphore Reference to the semaphore variable.
-* @param bytes The number of bytes expected at the semaphore.
-*/
+/** @brief Set expected bytes for a cluster mbarrier. */
 __device__ static inline void expect_bytes(semaphore& bar, uint32_t bytes) {
     uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
     asm volatile ("mbarrier.arrive.expect_tx.shared::cluster.b64 _, [%0], %1;\n"
@@ -182,21 +156,7 @@ __device__ static inline void expect_bytes(semaphore& bar, uint32_t bytes, int d
     asm volatile ("mbarrier.arrive.expect_tx.shared::cluster.b64 _, [%0], %1;\n"
         :: "r"(neighbor_mbar_addr), "r"(bytes));
 }
-/**
-* @brief Sets the number of bytes expected at the semaphore.
-*
-* This function sets the number of bytes expected at the semaphore for the first thread in the warp.
-* It converts the semaphore pointer to a generic shared memory pointer and uses an inline assembly
-* instruction to set the expected number of bytes.
-*
-* @tparam T The type of the data to be stored at the semaphore.
-* @param semaphore Reference to the semaphore variable.
-*/
-/**
-* @brief Sets the number of bytes expected at the semaphore.
-*
-* This function sets the number of bytes expected at the mbarrier before the transaction arrives.
-*/
+/** @brief Set expected bytes from one or more TMA payload types. */
 template<typename T, typename... args>
 __device__ static inline void expect(semaphore& bar, const T& _1, const args&... _2) {
     expect_bytes(bar, size_bytes<T, args...>);

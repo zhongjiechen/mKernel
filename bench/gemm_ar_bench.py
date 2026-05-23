@@ -1,6 +1,6 @@
 """gemm_ar GEMM + AllReduce bench (release version).
 
-Reproduces the 'Ours' bars in experiments/multinode/benchmarks/gemm_ar_efa.png.
+Default EFA sweep for the GEMM + AllReduce chart.
 Targets at M ∈ {2048, 4096, 8192, 16384, 32768}: [0.418, 0.350, 0.868, 2.755, 10.896] ms.
 Uses gemm_ar production defaults compiled into the .so via -DGEMM_AR_*.
 """
@@ -19,12 +19,8 @@ if not (
     os.environ.setdefault("GEMM_AR_NUM_INTRA_COMM_SMS", "12")
 os.environ.setdefault("GEMM_AR_STEADY_STATE_BENCH", "1")
 os.environ.setdefault("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET", "1")
-# Fast prepare_epoch: skip cudaDeviceSynchronize + pause/drain_cq/reset (level 2).
-# Safe when MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1 because commit_epoch's
-# skip path doesn't reset proxy CQ/inflight, so pausing+draining in prepare_epoch
-# is overhead. drain_proxy itself remains load-bearing (level 3 hangs — the
-# FIFO consistency invariant from session_efa.h:1017 needs the cursor sync).
-# Per-iter prepare_epoch drops ~50-150us → ~30us at steady state.
+# Fast prepare_epoch path: skip host synchronization while keeping the FIFO
+# cursor sync needed by the session invariant.
 os.environ.setdefault("MKERNEL_PREP_EPOCH_FAST", "2")
 
 import torch
@@ -43,18 +39,14 @@ ROW_BLOCK = 128
 COL_BLOCK = 256
 
 DEFAULT_SHAPES = (
-    # 4-node H200x release sweep: use the largest verified natural multiples.
-    # 22528 passes with the inter-heavy split; larger shapes still deadlock.
+    # 4-node release sweep: use the largest verified natural multiples.
     [8192, 12288, 16384, 20480, 22528]
     if NUM_NODES == 4 else
     [2048, 4096, 8192, 16384, 32768]
 )
 
-# Per-shape num_intra_comm_sms override. Default `pick_sm_split` heuristic
-# returns 14 for M=2048; team_v7 sweep found intra=4 wins by 5.9% over baseline
-# (n=6, σ=0.005/0.007, σ-overlap 0.72, statistically separated). At small M
-# there isn't much intra-AR work to parallelize, so freeing those CTAs to the
-# compute role is the win.
+# Per-shape num_intra_comm_sms override. Small M has little intra-AR work to
+# parallelize, so freeing those CTAs for compute is faster.
 INTRA_OVERRIDE_AR = {2048: 4, 32768: 24}
 
 
@@ -87,7 +79,7 @@ def kernel_chunk_tiles_for_n(N):
 
 
 def cta_split_chunk_tiles_for_n(N):
-    """Mirror experiment Python-side CTA allocation heuristic.
+    """Host-side CTA allocation heuristic.
 
     The CUDA kernel's RDMA chunk size is still kernel_chunk_tiles_for_n().
     This host-only heuristic intentionally coarsens small shapes when deciding
@@ -254,7 +246,10 @@ def main():
     is_chief = (local_rank == 0 and node_idx == 0)
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        peer_ip = os.environ.get("NODE1_IP", "172.31.11.6") if node_idx == 0 else os.environ.get("NODE0_IP", "172.31.1.237")
+        peer_node = 1 if node_idx == 0 else 0
+        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        if not peer_ip:
+            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "19730")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)

@@ -1008,10 +1008,6 @@ __device__ inline void gemm_ar_decode_comp_task(
         task_id, row_blocks_per_slice, col_blocks, fused_globals::NUM_DEVICES, row_idx, col_idx);
 }
 
-// (gemm_ar_decode_comp_chunk_task removed — was dead code referencing an
-// unresolved symbol `slice_interleaved_chunks_decode`; no caller exists in
-// the current tree.)
-
 // ============================================================================
 // Role 1: GEMM compute SM — produce C tiles, signal per-tile barrier
 // ============================================================================

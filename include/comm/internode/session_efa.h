@@ -97,7 +97,7 @@ struct SessionConfig {
     // DMA-BUF MR on every rail's PD. When populated + direct_dmabuf_enabled,
     // the GPU kernel can set cmd.src_view = 1 and compute cmd.local_offset
     // into this buffer; the proxy sends directly from HBM without an
-    // intermediate pack into the staging buffer. Mirrors Q2's clocal_gpu_buf.
+    // intermediate pack into the staging buffer.
     void*       clocal_gpu_buf          = nullptr;
     size_t      clocal_gpu_buf_size     = 0;
     bool        direct_dmabuf_enabled   = false;
@@ -411,7 +411,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     // Two modes:
     //   (a) Default — allocate via cudaMalloc and register on every rail's PD.
     //   (b) external_recv_buf set — register the caller-owned buffer instead.
-    //       Used by Q3's zero-copy inter-recv where peer_tokens is the RDMA
+    //       Used by dispatch_gemm zero-copy inter-recv where peer_tokens is the RDMA
     //       target, eliminating the recv_buf -> peer_tokens D2D copy. Caller
     //       owns the buffer and its lifetime.
     if (cfg.external_recv_buf != nullptr) {
@@ -1038,9 +1038,9 @@ inline void prepare_epoch(Session* s) {
  * Updates epoch, resets arrivals/stage-barrier/FIFOs, resumes all proxies.
  *
  * When MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1, skips arrival/stage-barrier
- * resets and FIFO reinit. This is safe under Q2_STEADY_STATE_BENCH because:
- *   - arrival flags: kernel resets them on-GPU via q2_iter_end_reset_arrival_flags
- *     before the epilogue barrier, so they're clean by the time the next iter starts.
+ * resets and FIFO reinit. This is safe for steady-state benchmarks because:
+ *   - arrival flags: the kernel resets them on-GPU before the epilogue barrier,
+ *     so they're clean by the time the next iter starts.
  *   - stage_barrier: kernel uses monotonic (>= epoch) checks and never clears,
  *     so host-side zeroing is unnecessary and actually harmful — it races with
  *     incoming BARRIER_NOTIFY RDMA WRITEs from a faster peer that has already

@@ -1,11 +1,9 @@
 /**
  * @file
- * @brief Declarations, manipulations, and wrappers for basic types.
- * 
- * This file is a bunch of utilities for going back and forth between different types.
- * 
- * Many of them are for the compiler, so as to clean up the code. It unfortunately
- * seems necessary when we have types we really care about that are less than word width.
+ * @brief Basic numeric types and conversion helpers.
+ *
+ * Includes packed CUDA scalar aliases and small-width conversion utilities used
+ * by the TK-derived tile code.
  */
 
 #pragma once

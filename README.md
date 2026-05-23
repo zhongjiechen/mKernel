@@ -1,7 +1,7 @@
 # mKernel
 
 <div align="center" >
-    <img src="figs/mKernel.png" height=350 alt="mKernel" style="margin-bottom:px"/><br/>
+    <img src="figs/mKernel.png" height=350 alt="mKernel" style="margin-bottom:12px"/><br/>
     <em>mKernel: multi-GPU, multi-node fused kernels</em><br/><br/>
 </div>
 
@@ -35,10 +35,26 @@ _mKernel is under active development, including optimizing for larger scale, dif
 ## Quick start
 
 ```sh
-make BACKEND=cx7 all                  # build all 5 .so's against ConnectX-7 RC (libibverbs)
-bash bench/run.sh all bench 2         # 2 nodes, all kernels, default shapes
-make plots                            # regenerate the figures below
+# Pick BACKEND=efa for AWS EFA, or BACKEND=cx7 for ConnectX-7 / InfiniBand.
+make BACKEND=cx7 PYTHON=python3 all
+
+# Two-node benchmark example. Run from node 0; node 1 is launched over SSH.
+NODE0_IP=<node0-data-ip> \
+NODE1_IP=<node1-data-ip> \
+NODE1_SSH=<node1-ssh-target> \
+bash bench/run.sh all bench 2
+
+make plots
 ```
+
+## Requirements
+
+- NVIDIA Hopper GPUs; the default build targets `sm_90a`.
+- CUDA 12.9 by default (`CUDA_HOME=/usr/local/cuda-12.9`), override with `CUDA_HOME=...`.
+- Python with PyTorch installed; pass it to the build with `PYTHON=/path/to/python`.
+- CX7 backend: libibverbs development headers and libraries.
+- EFA backend: AWS EFA installation with libfabric, libibverbs, efadv, and EFA headers/libraries under `EFA_HOME=/opt/amazon/efa` by default.
+- Benchmarks assume homogeneous multi-GPU nodes, `torchrun`, passwordless SSH from node 0 to peer nodes, and routable data-plane IPs in `NODE*_IP`.
 
 ## Backends
 

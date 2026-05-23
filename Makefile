@@ -1,11 +1,11 @@
-# release/Makefile — single-config build for 5 multinode kernels (EFA proxy)
+# Makefile — single-config build for 5 multinode kernels
 #
 # Usage:
-#   make all       — build all 5 .so's into release/build/
+#   make all       — build all 5 .so's into build/
 #   make check     — run correctness check across all 5 kernels (2-node)
 #   make bench     — run wall-time bench across all 5 kernels (2-node)
-#   make plots     — regenerate TFLOPS bar charts under release/plots/
-#   make clean     — remove release/build/
+#   make plots     — regenerate TFLOPS bar charts under plots/
+#   make clean     — remove build/
 
 # === Backend selection ===
 #
@@ -29,8 +29,8 @@ endif
 CUDA_HOME       ?= /usr/local/cuda-12.9
 EFA_HOME        ?= /opt/amazon/efa
 NVCC            := $(CUDA_HOME)/bin/nvcc
-# Python with torch installed; both nodes see this via EFS.
-PYTHON          ?= /home/ubuntu/efs/yzhou/uccl/.venv/bin/python3
+# Python with torch installed. Override with `PYTHON=/path/to/python`.
+PYTHON          ?= python3
 
 # === Include paths (must precede LDFLAGS — TORCH_LIB feeds both) ===
 HERE            := $(abspath .)
@@ -56,11 +56,8 @@ COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 
 # === Per-kernel constants (passed via -D, no env-var lookups) ===
 #
-# Note: these include the on-by-default `Q*_*` flags from the experiment
-# build_utils.py. Long-term these should be hard-coded in src/<kernel>.cu
-# (delete the #ifdef wrappers, keep the bodies) per INSTRUCTION.md §3 — but
-# until that strip pass runs, the Makefile defines them so the verbatim
-# experiment source builds with the optimal config.
+# Note: keep per-kernel compile-time constants here until the corresponding
+# source paths no longer need build-time specialization.
 #
 # Failed-experiment flags are NOT defined here (HYBRID, MERGED_COMM,
 # PUSH_NVL_FANOUT, DISPATCH_DONATE_INTER_SEND, ACTIVITY_TRACE, etc.) so
@@ -101,6 +98,5 @@ check: all
 
 plots:
 	cd plots && python3 plot_tflops_efa.py
-	cd plots && python3 plot_overall_grid.py
 
 .PHONY: all clean bench check plots

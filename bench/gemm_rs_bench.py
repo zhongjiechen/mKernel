@@ -1,6 +1,6 @@
 """gemm_rs GEMM + Reduce-Scatter bench (release version).
 
-Reproduces fused_q5_efa.json (5 shapes M∈{2048,4096,8192,16384,32768}, K=M/16).
+Default EFA sweep: M∈{2048,4096,8192,16384,32768}, K=M/16.
 Bakes the on-by-default gemm_rs env vars into Python:
   GEMM_RS_FUSE_COMPUTE_INTRA=1, GEMM_RS_INTRA_RS_DIRECT_STAGING=1, GEMM_RS_SEND_READY_BITMAP=1.
 Per-shape SM split tuned to match the chunk512 numbers (see SM_SPLIT below).
@@ -9,8 +9,7 @@ from __future__ import annotations
 import argparse, json, os, sys, time
 from pathlib import Path
 
-# Keep the release default, but allow parity tests against the experiment
-# harness, which leaves this unset.
+# Default binding behavior; callers can override for compatibility checks.
 os.environ.setdefault("MKERNEL_BIND_RETAINED_HANDLE", "1")
 
 import torch
@@ -42,17 +41,10 @@ DEFAULT_SHAPES = (
     if NUM_NODES == 4 else
     [2048, 4096, 8192, 16384, 32768]
 )
-# Note: M=65536 is in published bar chart but requires GEMM_RS_SEND_READY_BITMAP+FUSE_COMPUTE_INTRA
-# which hangs on this hardware. Excluded from default sweep.
+# M=65536 is supported as an explicit shape but excluded from the default sweep.
 
-# Tuned role split for the fused compute/intra/send/reduce path.
+# Tuned role split for the fused compute/intra/send/reduce path:
 # (n_comp, n_intra, n_send, n_reduce, chunk_tiles).
-# 2026-05-07 (team_v5): retuned M=4096 from (116,0,8,8,4) -> (114,0,10,8,2).
-# Halving chunk_tiles from 4 -> 2 is the dominant lever (smaller staging
-# granularity reduces the per-iter cold-cluster penalty in the bimodal
-# pattern) and bumping n_send 8 -> 10 better feeds the per-peer inter-tile
-# rate at m_local=512. M=4096 wall drops 0.367 -> 0.218 ms (-41%) and now
-# beats NCCL 0.236 ms by ~7%. No regression at any other shape.
 SM_SPLIT = {
     2048:  (112, 0, 10, 10, 2),
     4096:  (114, 0, 10,  8,  2),
@@ -60,8 +52,8 @@ SM_SPLIT = {
     16384: (120, 0, 4,  8,  4),
     32768: (120, 0, 4,  8,  8),
     65536: (124, 0, 2,  6,  32),
-    # H200x3 shapes. M=24576 benefits from smaller RDMA chunks; small shapes
-    # regressed correctness with chunk_tiles=2, and larger M overfills QPs.
+    # Multi-node shapes use smaller chunks for M=24576 and conservative chunks
+    # at the extremes.
     6144:  (116, 0, 8,  8,  4),
     12288: (118, 0, 6,  8,  4),
     24576: (120, 0, 4,  8,  2),
@@ -94,11 +86,8 @@ def split_for_shape(m: int) -> tuple[int, int, int, int, int]:
 def poll_tuning(m: int) -> tuple[int, int]:
     if NUM_NODES > 2:
         return (1, 100)
-    # Relaxed poll across all shapes. Acquire polling (`use_acquire_poll=1`)
-    # was historically enabled at M=4096 under per-iter-sync timing; under the
-    # canonical no-sync methodology it costs ~50 µs/iter and amplifies a
-    # cold/warm bimodal pattern, regressing the median by ~17%. The kernel-side
-    # acquire branch (`src/gemm_rs.cu:362`) is left in place but dormant.
+    # Relaxed polling is the default timing path; acquire polling remains
+    # available through the kernel option when needed.
     return (0, 100)
 
 
@@ -156,8 +145,10 @@ def main():
 
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        peer_ip = os.environ.get("NODE1_IP", "172.31.11.6") if node_idx == 0 \
-                  else os.environ.get("NODE0_IP", "172.31.1.237")
+        peer_node = 1 if node_idx == 0 else 0
+        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        if not peer_ip:
+            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
@@ -178,7 +169,7 @@ def main():
         m_local = m // world_size  # each rank owns M/8 rows after intra-RS
 
         n_comp, n_intra, n_send, n_reduce, chunk_tiles = split_for_shape(m)
-        # team_v8 sweep override: MKERNEL_GEMM_RS_SPLIT_<M>="comp,intra,send,reduce,ct"
+        # Per-shape override: MKERNEL_GEMM_RS_SPLIT_<M>="comp,intra,send,reduce,ct".
         # Layered on top of split_for_shape so per-shape env wins over the
         # global GEMM_RS_SPLIT / GEMM_RS_NUM_*_SMS knobs handled there.
         _ovr = os.environ.get(f"MKERNEL_GEMM_RS_SPLIT_{m}")

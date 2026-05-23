@@ -2,12 +2,11 @@
 
 /**
  * @file moe_dispatch_gemm_multinode.cu
- * @brief Proper 2-node × 8-GPU MoE Dispatch + Group GEMM.
+ * @brief 2-node × 8-GPU MoE Dispatch + Group GEMM.
  *
- * Borrows the intra-node 8-GPU dispatch pattern from
- *   experiments/dynamic_sm_allocation/question3_moe_dispatch_gemm_dynamic_sm/moe_dispatch_gemm.cu
+ * Uses the intra-node 8-GPU dispatch pattern
  * (pre_tokens_distributed_tensor + pull-based dispatch + per-row-block barrier counter +
- * per-expert GEMM with NUM_EXPERTS_PER_DEV experts per GPU) and adds an
+ * per-expert GEMM with NUM_EXPERTS_PER_DEV experts per GPU) plus an
  * inter-node phase that exchanges pre_tokens with the peer node so each node
  * can dispatch from the FULL 16-GPU token set.
  *
@@ -16,7 +15,7 @@
  *   - Each GPU has its own num_local_tokens tokens (in pre_tokens DistBuffer)
  *   - After inter-node exchange, each GPU has access to:
  *       (a) Local node's 8 GPU pre_tokens via dbuf (pre_tokens_distributed_tensor)
- *       (b) Peer node's 8 GPU pre_tokens via a SECOND dbuf (peer_tokens_distributed_tensor)
+ *       (b) Peer node's 8 GPU pre_tokens via a second dbuf (peer_tokens_distributed_tensor)
  *           — populated by RDMA writes from peer node + a local D2D copy
  *           into the IPC-shared DistBuffer.
  *
@@ -27,7 +26,7 @@
  *   Phase 2 (intra-node copy + dispatch):
  *     Each GPU copies its recv_buf into its slot of peer_tokens_distributed_tensor
  *     (DistBuffer, IPC-shared across local 8 GPUs).
- *     Then dispatch SM pulls tokens from EITHER pre_tokens_distributed_tensor OR peer_tokens_distributed_tensor
+ *     Then dispatch SM pulls tokens from either pre_tokens_distributed_tensor or peer_tokens_distributed_tensor
  *     based on pull_dispatch_indices (which now has 3 columns: src_node, src_dev, src_token).
  *   Phase 3 (group GEMM):
  *     Same as intranode kernel — each GPU computes GEMMs for its assigned experts.
@@ -192,10 +191,7 @@ struct fused_globals {
     int pre_tokens_bytes;
     int total_chunks;
     int node_idx;
-    int num_nodes;  // Total node count (>= 2). N == 2 reproduces the
-                    // legacy 2-node code path bit-for-bit. Scaffolding
-                    // for N-node fan-out only; peer_tokens / arrival
-                    // flag layouts not yet generalized.
+    int num_nodes;  // total node count (>= 2).
     int dev_idx;
     int num_local_tokens;
     int num_padded_local_tokens;
@@ -259,8 +255,7 @@ void fused(
     int num_send_sms,
     int num_copy_sms,
     int num_comm_sms_intra,
-    int num_nodes = 2  // total node count (>= 2). N == 2 reproduces the
-                       // legacy 2-node behavior bit-for-bit.
+    int num_nodes = 2  // total node count (>= 2).
 ) {
     const int dev_idx = barrier.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);

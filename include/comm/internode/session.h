@@ -192,7 +192,7 @@ struct SessionConfig {
     size_t      clocal_gpu_buf_size = 0;
     bool        direct_dmabuf_enabled = false;
     // Row stride in bytes for strided direct-gather sends (src_view=2).
-    // Typically N * sizeof(bf16) for Q2 GEMM output. Used by the proxy to
+    // Typically N * sizeof(bf16) for GEMM output. Used by the proxy to
     // compute per-row SGE addresses inside C_local.
     size_t      row_stride_bytes = 0;
 
@@ -931,8 +931,7 @@ inline void commit_epoch(Session* s, uint32_t epoch) {
     // next-iter flag values into our host-pinned arrival array; memset here
     // would zero them and deadlock our next-iter kernel which spins on
     // `flag_val != 0`. Callers that need a reset must do it stream-ordered
-    // on the GPU at iter-end BEFORE the cross-node barrier (see Q2 kernels'
-    // q2_iter_end_reset_arrival_flags), or call reset_arrival_flags()
+    // on the GPU at iter-end BEFORE the cross-node barrier, or call reset_arrival_flags()
     // explicitly in a regime where no in-flight peer writes can race.
     if (std::getenv("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET") == nullptr) {
         reset_arrival_flags(s->arrival);

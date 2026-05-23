@@ -38,7 +38,7 @@ __device__ inline static void load(RV &dst, const SV &src) {
                 }
             }
             __syncwarp();
-            // now we need to do a bunch of shuffle_sync's to make sure everyone has everything they need.
+            // Broadcast lane data with warp shuffles.
             #pragma unroll
             for(auto w = 0; w < dst.outer_dim; w++) {
                 int leader = 8*(w%4) + (laneid%4); // repeats every 64 columns
@@ -47,8 +47,7 @@ __device__ inline static void load(RV &dst, const SV &src) {
             }
         }
         else if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {
-            // really hoping https://stackoverflow.com/questions/15029765/is-coalescing-triggered-for-accessing-memory-in-reverse-order is still true
-            // otherwise there will be some pain :/
+            // Preserve coalesced access for the reverse-order lane mapping.
             #pragma unroll
             for(auto w = 0; w < (dst.outer_dim+1)/2; w++) {
                 int idx = w*32 + (laneid%4)*8 + (laneid/4);
@@ -62,7 +61,7 @@ __device__ inline static void load(RV &dst, const SV &src) {
                 }
             }
             __syncwarp();
-            // now we need to do a bunch of shuffle_sync's to make sure everyone has everything they need.
+            // Broadcast lane data with warp shuffles.
             #pragma unroll
             for(auto w = 0; w < dst.outer_dim; w++) {
                 int leader = (laneid/4)*4 + 2*(w%2); // repeats every 64 columns
@@ -125,8 +124,7 @@ __device__ inline static void store(SV &dst, const RV &src) {
             }
         }
         else if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {
-            // really hoping https://stackoverflow.com/questions/15029765/is-coalescing-triggered-for-accessing-memory-in-reverse-order is still true
-            // otherwise there will be some pain :/
+            // Preserve coalesced access for the reverse-order lane mapping.
             #pragma unroll
             for(auto w = 0; w < (src.outer_dim+1)/2; w++) {
                 int idx = w*32 + (laneid%4)*8 + (laneid/4);

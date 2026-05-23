@@ -113,8 +113,7 @@ distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types
     cmd.lane_id       = (uint16_t)lane_id;
     cmd.src_view      = (uint8_t)ch.mode;
 
-    // Pick the right fifo for this lane (the proxy that owns the destination
-    // QP). q2_select_fifo_for_lane mirrors the legacy lane->fifo routing.
+    // Pick the right FIFO for this lane: the proxy that owns the destination QP.
     const auto& bundle = *static_cast<const internode::D2HFifoDeviceBundle*>(ch.fifo_bundle);
     internode::D2HFifoDevice fifo =
         internode::q2_select_fifo_for_lane(bundle, lane_id);
@@ -195,8 +194,8 @@ __host__ inline void attach_channels_proxy(
     for (int c = 0; c < DBUF::num_channels; ++c) {
         auto& ch = d.channels[c];
 
-        // Each channel carries a pointer to the shared bundle; put_inter
-        // picks the right fifo per send via q2_select_fifo_for_lane(bundle, lane_id).
+        // Each channel carries a pointer to the shared bundle; put_inter picks
+        // the right FIFO per send based on lane_id.
         // This preserves the proxy's lane_id -> QP routing semantics.
         ch.fifo_bundle = (void*)&session.fifo_bundle;
 
@@ -220,33 +219,10 @@ __host__ inline void attach_channels_proxy(
 }
 
 /**
- * @brief Create an internode session and wire `dbuf` into it for zero-copy
- * inter-node sends. **Zero-copy is the only path** — there is no fallback
- * staging-buffer mode in this API.
+ * @brief Create an internode session for zero-copy dbuf sends.
  *
- * The caller fills in the standard SessionConfig fields (rank, peer_ip,
- * tcp_port, num_qps, fifo_capacity, recv_buf_size, etc.). This function
- * then forces:
- *
- *   cfg.direct_dmabuf_enabled = true;
- *   cfg.local_gpu_buf         = dbuf_data_ptr;
- *   cfg.local_gpu_buf_size    = dbuf_data_bytes;
- *
- * before calling `internode::create_session(cfg)`. Session creation registers
- * the dbuf's local data buffer as a DMA-BUF MR on every rail's PD via
- * `cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr`. After creation, this
- * function asserts that every rail has a non-null `clocal_data_mr` — if any
- * rail's DMA-BUF registration failed, the session is destroyed and a clear
- * error is thrown rather than silently downgrading to a non-zero-copy path.
- *
- * Send-side semantics: every `dbuf.put_inter()` produces a TransferCmd with
- * `src_view = 1`, so the proxy posts a single-SGE WQE pointing at the local
- * DMA-BUF MR — NIC reads straight from the kernel's data buffer with no
- * pack, no staging.
- *
- * @returns owning Session* (caller passes to `internode::destroy_session`
- *          when done; also call `unbind_inter_proxy(dbuf)` to free the
- *          per-channel send rings).
+ * Requires DMA-BUF registration for the dbuf data buffer. `dbuf.put_inter()`
+ * sends with `src_view = 1`, so the proxy reads directly from the local MR.
  */
 template<typename DBUF>
 __host__ inline internode::Session* bind_inter_proxy(
