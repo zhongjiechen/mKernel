@@ -352,54 +352,54 @@ def main():
         wall_ms = median_then_max_cuda(samples)
         if is_chief:
             print(f"[gemm_rs] M={m} wall={wall_ms:.3f} ms", flush=True)
-        if args.mode == "check":
-            C_ref = None
-            for target_lr in range(world_size):
-                row_lo = target_lr * m_local
-                row_hi = row_lo + m_local
-                # Mirror the kernel topology: first reduce this row slice across
-                # all 8 local GPUs in the node, then reduce the owning local-rank
-                # slice across nodes.
-                ref_slice = torch.matmul(A[row_lo:row_hi], B).cpu()
-                dist.all_reduce(
-                    ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
+        C_ref = None
+        for target_lr in range(world_size):
+            row_lo = target_lr * m_local
+            row_hi = row_lo + m_local
+            # Mirror the kernel topology: first reduce this row slice across
+            # all 8 local GPUs in the node, then reduce the owning local-rank
+            # slice across nodes.
+            # Keep on GPU so the NCCL backend can all_reduce/all_gather it.
+            ref_slice = torch.matmul(A[row_lo:row_hi], B)
+            dist.all_reduce(
+                ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
+            )
+            if local_rank == target_lr:
+                node_refs = [torch.empty_like(ref_slice) for _ in range(NUM_NODES)]
+                dist.all_gather(
+                    node_refs, ref_slice,
+                    group=same_local_rank_groups[target_lr],
                 )
-                if local_rank == target_lr:
-                    node_refs = [torch.empty_like(ref_slice) for _ in range(NUM_NODES)]
-                    dist.all_gather(
-                        node_refs, ref_slice,
-                        group=same_local_rank_groups[target_lr],
-                    )
-                    C_ref = node_refs[0]
-                    for node_ref in node_refs[1:]:
-                        C_ref = C_ref + node_ref
-                    if os.environ.get("GEMM_RS_RECEIVER_OWNER_RS", "0") == "1":
-                        # Receiver-owner RS: each tile chunk is owned by exactly
-                        # one node, so this rank's output buffer contains only
-                        # chunks where chunk_id % NUM_NODES == node_idx.
-                        sparse_ref = torch.zeros_like(C_ref)
-                        chunks_per_row = (n // COL_BLOCK + chunk_tiles - 1) // chunk_tiles
-                        for rb in range(m_local // ROW_BLOCK):
-                            row_lo2 = rb * ROW_BLOCK
-                            row_hi2 = row_lo2 + ROW_BLOCK
-                            for ci in range(chunks_per_row):
-                                chunk_id = rb * chunks_per_row + ci
-                                if chunk_id % NUM_NODES != node_idx:
-                                    continue
-                                col_lo = ci * chunk_tiles * COL_BLOCK
-                                col_hi = min(n, col_lo + chunk_tiles * COL_BLOCK)
-                                sparse_ref[row_lo2:row_hi2, col_lo:col_hi] = \
-                                    C_ref[row_lo2:row_hi2, col_lo:col_hi]
-                        C_ref = sparse_ref
-            # Only the destination local-rank owns this reduce-scatter shard.
-            # Non-owners still participate in the distributed check_close()
-            # collective, but compare against themselves so only owner ranks
-            # determine the global correctness result.
-            if C_ref is None:
-                C_ref = output.data_
-            correctness_ok = check_close(
-                f"gemm_rs M={m}", output.data_, C_ref, atol=0.75, rtol=0.15
-            ) and correctness_ok
+                C_ref = node_refs[0]
+                for node_ref in node_refs[1:]:
+                    C_ref = C_ref + node_ref
+                if os.environ.get("GEMM_RS_RECEIVER_OWNER_RS", "0") == "1":
+                    # Receiver-owner RS: each tile chunk is owned by exactly
+                    # one node, so this rank's output buffer contains only
+                    # chunks where chunk_id % NUM_NODES == node_idx.
+                    sparse_ref = torch.zeros_like(C_ref)
+                    chunks_per_row = (n // COL_BLOCK + chunk_tiles - 1) // chunk_tiles
+                    for rb in range(m_local // ROW_BLOCK):
+                        row_lo2 = rb * ROW_BLOCK
+                        row_hi2 = row_lo2 + ROW_BLOCK
+                        for ci in range(chunks_per_row):
+                            chunk_id = rb * chunks_per_row + ci
+                            if chunk_id % NUM_NODES != node_idx:
+                                continue
+                            col_lo = ci * chunk_tiles * COL_BLOCK
+                            col_hi = min(n, col_lo + chunk_tiles * COL_BLOCK)
+                            sparse_ref[row_lo2:row_hi2, col_lo:col_hi] = \
+                                C_ref[row_lo2:row_hi2, col_lo:col_hi]
+                    C_ref = sparse_ref
+        # Only the destination local-rank owns this reduce-scatter shard.
+        # Non-owners still participate in the distributed check_close()
+        # collective, but compare against themselves so only owner ranks
+        # determine the global correctness result.
+        if C_ref is None:
+            C_ref = output.data_
+        correctness_ok = check_close(
+            f"gemm_rs M={m}", output.data_, C_ref, atol=0.75, rtol=0.15
+        ) and correctness_ok
         result_sizes.append(f"M={m}")
         result_fused.append(wall_ms)
 

@@ -458,32 +458,31 @@ def main():
         wall_ms = avg_then_max_cuda(samples)
         if is_chief:
             print(f"[dispatch_gemm] tokens={num_tokens_global} wall={wall_ms:.3f} ms", flush=True)
-        if args.mode == "check":
-            gathered_tokens = gather_cpu_tensors(pre_tokens_data)
-            pull_cpu = pull_idx.detach().cpu()
-            post_ref_cpu = torch.zeros((num_padded_local, H), dtype=torch.bfloat16)
-            for row in range(num_padded_local):
-                src_node, src_dev, local_tok = [int(x) for x in pull_cpu[row].tolist()]
-                if src_node >= 0:
-                    src_rank = src_node * world_size + src_dev
-                    post_ref_cpu[row].copy_(gathered_tokens[src_rank][local_tok])
-            out_ref = torch.zeros_like(outputs)
-            row_off = 0
-            expert_start = global_gpu_idx * num_experts_per_dev
-            for local_e, expert_id in enumerate(
-                range(expert_start, expert_start + num_experts_per_dev)
-            ):
-                rows = padded_list[expert_id]
-                if rows > 0:
-                    out_ref[row_off:row_off + rows].copy_(
-                        torch.matmul(post_ref_cpu[row_off:row_off + rows].to("cuda"),
-                                     weights[local_e])
-                    )
-                row_off += rows
-            correctness_ok = check_close(
-                f"dispatch_gemm tokens={num_tokens_global}",
-                outputs, out_ref, atol=0.55, rtol=0.12
-            ) and correctness_ok
+        gathered_tokens = gather_cpu_tensors(pre_tokens_data)
+        pull_cpu = pull_idx.detach().cpu()
+        post_ref_cpu = torch.zeros((num_padded_local, H), dtype=torch.bfloat16)
+        for row in range(num_padded_local):
+            src_node, src_dev, local_tok = [int(x) for x in pull_cpu[row].tolist()]
+            if src_node >= 0:
+                src_rank = src_node * world_size + src_dev
+                post_ref_cpu[row].copy_(gathered_tokens[src_rank][local_tok])
+        out_ref = torch.zeros_like(outputs)
+        row_off = 0
+        expert_start = global_gpu_idx * num_experts_per_dev
+        for local_e, expert_id in enumerate(
+            range(expert_start, expert_start + num_experts_per_dev)
+        ):
+            rows = padded_list[expert_id]
+            if rows > 0:
+                out_ref[row_off:row_off + rows].copy_(
+                    torch.matmul(post_ref_cpu[row_off:row_off + rows].to("cuda"),
+                                 weights[local_e])
+                )
+            row_off += rows
+        correctness_ok = check_close(
+            f"dispatch_gemm tokens={num_tokens_global}",
+            outputs, out_ref, atol=0.55, rtol=0.12
+        ) and correctness_ok
         result_sizes.append(f"tokens={num_tokens_global}")
         result_fused.append(wall_ms)
         # Don't call destroy_session — re-creating per shape is fine and

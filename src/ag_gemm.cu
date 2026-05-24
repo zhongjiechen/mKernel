@@ -77,6 +77,12 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 tma::store_async(G.A, A_smem[warp_id], {global_row_idx, col_idx});
                 tma::store_async_wait();
 
+                // Multicast store_async_wait only fences local-GPU completion;
+                // cross-GPU visibility of the multicast write needs a system
+                // fence before signaling compute (which lives on the same GPU
+                // but reads via the multicast aperture). 
+                __threadfence_system();
+
                 // Plane 0 [row,col]: per-K-strip, count=1. Compute waits per red_idx
                 // so it can stream tiles as cols arrive, not per whole row block.
                 // Per-(row,col) count is 1 because each task_id is processed by
@@ -419,6 +425,9 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     }
                 }
 
+                wait(outputs_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
+
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                     // #4: per-K-strip wait on plane 0. Each intra col_chunk
                     // covers 2 compute K-strips, so wait when crossing boundary.
@@ -434,10 +443,6 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
                     tma::expect_bytes(inputs_arrived[stage], sizeof(globals::pipeline_inputs));
-                    if (red_idx == globals::PIPELINE_STAGES - 1) {
-                        wait(outputs_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
-                        update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
-                    }
                     #pragma unroll
                     for (int i = 0; i < 2; i++) {
                         if (is_remote) {
@@ -478,7 +483,10 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 #pragma unroll
                 for (int i = 0; i < 2; i++)
                     tma::store_async(G.C, outputs.C[i], {row_idx * 2 + i, col_idx});
-                tma::store_async_read_wait();
+                // store_async_wait waits for the global commit (not just smem
+                // reuse safety like read_wait). At large M, store-in-flight
+                // can race with downstream reads of C.
+                tma::store_async_wait();
                 arrive(outputs_finished);
                 ag_gemm_record_activity_event(
                     G,

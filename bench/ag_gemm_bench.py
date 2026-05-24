@@ -329,21 +329,20 @@ def main():
         wall_ms = avg_then_max_cuda(samples)
         if is_chief:
             print(f"[ag_gemm] M={M} wall={wall_ms:.3f} ms", flush=True)
-        if args.mode == "check":
-            gathered_a = gather_cpu_tensors(A_local)
-            A_ref = torch.cat(gathered_a, dim=0).to(device="cuda")
-            C_ref = torch.matmul(A_ref, B)
-            if is_chief:
-                rows_per_node = M // NUM_NODES
-                for nr in range(NUM_NODES):
-                    lo = nr * rows_per_node
-                    hi = lo + rows_per_node
-                    shard_abs = (C[lo:hi].float() - C_ref[lo:hi].float()).abs().max().item()
-                    print(f"[ag_gemm-correctness] node_shard={nr} max_abs={shard_abs:.6f}",
-                          flush=True)
-            correctness_ok = check_close(
-                f"ag_gemm M={M}", C, C_ref, atol=0.45, rtol=0.10
-            ) and correctness_ok
+        gathered_a = gather_cpu_tensors(A_local)
+        A_ref = torch.cat(gathered_a, dim=0).to(device="cuda")
+        C_ref = torch.matmul(A_ref, B)
+        if is_chief:
+            rows_per_node = M // NUM_NODES
+            for nr in range(NUM_NODES):
+                lo = nr * rows_per_node
+                hi = lo + rows_per_node
+                shard_abs = (C[lo:hi].float() - C_ref[lo:hi].float()).abs().max().item()
+                print(f"[ag_gemm-correctness] node_shard={nr} max_abs={shard_abs:.6f}",
+                      flush=True)
+        correctness_ok = check_close(
+            f"ag_gemm M={M}", C, C_ref, atol=0.45, rtol=0.10
+        ) and correctness_ok
 
         result_sizes.append(f"M={M}")
         result_fused.append(wall_ms)
