@@ -284,7 +284,9 @@ def main():
         wall_ms = median_then_max_cuda(samples)
         if is_chief:
             print(f"[ring_attn] seq={seq_per_dev} wall={wall_ms:.3f} ms", flush=True)
-        if args.mode == "check":
+        # Always validate correctness after timing — broken check mode was
+        # hiding shape-specific kernel discrepancies for months.
+        if True:
             if seq_per_dev <= 1536:
                 K_full = torch.cat(gather_cpu_tensors(K_local), dim=2).to("cuda")
                 V_full = torch.cat(gather_cpu_tensors(V_local), dim=2).to("cuda")

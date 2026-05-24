@@ -458,7 +458,9 @@ def main():
         wall_ms = avg_then_max_cuda(samples)
         if is_chief:
             print(f"[dispatch_gemm] tokens={num_tokens_global} wall={wall_ms:.3f} ms", flush=True)
-        if args.mode == "check":
+        # Always validate correctness after timing — broken check mode was
+        # hiding shape-specific kernel discrepancies for months.
+        if True:
             gathered_tokens = gather_cpu_tensors(pre_tokens_data)
             pull_cpu = pull_idx.detach().cpu()
             post_ref_cpu = torch.zeros((num_padded_local, H), dtype=torch.bfloat16)

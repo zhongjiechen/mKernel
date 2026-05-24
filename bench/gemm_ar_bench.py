@@ -513,8 +513,11 @@ def main():
             sample_str = "[" + ", ".join(f"{x:.4f}" for x in samples) + "]"
             print(f"[gemm_ar] M={M} samples={sample_str} min={min(samples):.4f} median={sorted(samples)[len(samples)//2]:.4f}", flush=True)
             print(f"[gemm_ar] M={M} wall={wall_ms:.3f} ms", flush=True)
-        if args.mode == "check":
-            C_ref_cpu = torch.matmul(A, B).detach().float().cpu()
+        # Always validate correctness after timing — broken check mode was
+        # hiding shape-specific kernel discrepancies for months.
+        if True:
+            # Keep on GPU so the NCCL backend can all_reduce it.
+            C_ref_cpu = torch.matmul(A, B).detach().float()
             local_ref_cpu = C_ref_cpu.clone()
             dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
             correctness_ok = check_close(

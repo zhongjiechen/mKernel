@@ -352,7 +352,9 @@ def main():
         wall_ms = median_then_max_cuda(samples)
         if is_chief:
             print(f"[gemm_rs] M={m} wall={wall_ms:.3f} ms", flush=True)
-        if args.mode == "check":
+        # Always validate correctness after timing — broken check mode was
+        # hiding shape-specific kernel discrepancies for months.
+        if True:
             C_ref = None
             for target_lr in range(world_size):
                 row_lo = target_lr * m_local
@@ -360,7 +362,8 @@ def main():
                 # Mirror the kernel topology: first reduce this row slice across
                 # all 8 local GPUs in the node, then reduce the owning local-rank
                 # slice across nodes.
-                ref_slice = torch.matmul(A[row_lo:row_hi], B).cpu()
+                # Keep on GPU so the NCCL backend can all_reduce/all_gather it.
+                ref_slice = torch.matmul(A[row_lo:row_hi], B)
                 dist.all_reduce(
                     ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
                 )

@@ -329,7 +329,9 @@ def main():
         wall_ms = avg_then_max_cuda(samples)
         if is_chief:
             print(f"[ag_gemm] M={M} wall={wall_ms:.3f} ms", flush=True)
-        if args.mode == "check":
+        # Always validate correctness after timing — broken check mode was
+        # hiding shape-specific kernel discrepancies for months.
+        if True:
             gathered_a = gather_cpu_tensors(A_local)
             A_ref = torch.cat(gathered_a, dim=0).to(device="cuda")
             C_ref = torch.matmul(A_ref, B)
