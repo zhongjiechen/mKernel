@@ -129,8 +129,8 @@ int64_t get_recv_buf_ptr_py() {
 #include <torch/csrc/utils/pybind.h>
 
 // Per-proxy diagnostic counters — mirrors the binding in
-// include/operators/gemm_ar/session.cuh so the V2 Planner can read
-// post→CQE per-WR latency directly from Python.
+// include/operators/gemm_ar/session.cuh so post→CQE per-WR latency is
+// readable directly from Python.
 pybind11::list get_proxy_diagnostics_py() {
     pybind11::list out;
     for (const auto& diag : internode::get_proxy_diagnostics(g_session)) {

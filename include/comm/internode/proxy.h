@@ -992,10 +992,10 @@ private:
                 }
             }
 
-            // --- Step 1b: Pre-filter strided-direct cmds (src_view=2) and
-            // post each as its own WR chain via post_strided_direct(). The
-            // batched template below assumes fixed 3-WR-per-cmd layout and
-            // can't express variable multi-SGE gather, so strided cmds are
+            // Pre-filter strided-direct cmds (src_view=2) and post each as
+            // its own WR chain via post_strided_direct(). The batched
+            // template below assumes a fixed 3-WR-per-cmd layout and can't
+            // express variable multi-SGE gather, so strided cmds are
             // handled one at a time. Remaining cmds are compacted in-place.
             int strided_posted = 0;
             if (count > 0 && cfg_.direct_dmabuf_enabled) {

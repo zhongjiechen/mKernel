@@ -145,46 +145,12 @@ struct globals {
     const int num_intra_comm;  // CTAs for intra-node IPC gather + RDMA push
     const int num_comp_sms;    // CTAs for GEMM compute
 
-    enum activity_kind : int {
-        ACTIVITY_LOCAL_GATHER = 0,
-        ACTIVITY_REMOTE_PUBLISH = 1,
-        ACTIVITY_COMPUTE_LOCAL = 2,
-        ACTIVITY_COMPUTE_REMOTE = 3,
-    };
-    struct activity_event {
-        unsigned long long start_ns;
-        unsigned long long end_ns;
-        int work_id;
-        int kind;
-    };
-    activity_event* activity_buf = nullptr;
-    uint32_t* activity_counts = nullptr;
-    unsigned long long* kernel_start_ns = nullptr;
-    unsigned long long* kernel_end_ns = nullptr;
-    int activity_max_events = 0;
-
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
     struct pipeline_outputs { C_tile C[2]; };
 };
 
 __device__ inline unsigned long long ag_gemm_globaltimer() {
     return comm::globaltimer();
-}
-
-__device__ inline void ag_gemm_record_activity_event(
-    const globals& G, int kind, int work_id,
-    unsigned long long start_ns, unsigned long long end_ns
-) {
-    if (G.activity_buf == nullptr || G.activity_counts == nullptr) return;
-    uint32_t idx = atomicAdd(&G.activity_counts[blockIdx.x], 1u);
-    if (idx < (uint32_t)G.activity_max_events) {
-        auto& ev = G.activity_buf[
-            (size_t)blockIdx.x * (size_t)G.activity_max_events + (size_t)idx];
-        ev.start_ns = start_ns;
-        ev.end_ns = end_ns;
-        ev.work_id = work_id;
-        ev.kind = kind;
-    }
 }
 
 // Wait for arrival_flags[chunk_id] == G.epoch. Single helper used at every
@@ -386,193 +352,6 @@ __device__ inline void post_ring_forward_wrs_for_intra_row(
 // Forward declaration: kernel body and raw CUDA launch live in src/ag_gemm.cu.
 void launch_fused_ag_gemm(const globals& G, unsigned int active_sms);
 
-static globals::activity_event* g_ag_gemm_trace_buf[globals::NUM_DEVICES] = {};
-static uint32_t* g_ag_gemm_trace_counts[globals::NUM_DEVICES] = {};
-static unsigned long long* g_ag_gemm_trace_start[globals::NUM_DEVICES] = {};
-static unsigned long long* g_ag_gemm_trace_end[globals::NUM_DEVICES] = {};
-static size_t g_ag_gemm_trace_buf_cap[globals::NUM_DEVICES] = {};
-
-__host__ inline const char* ag_gemm_activity_kind_name(int kind) {
-    switch (kind) {
-        case globals::ACTIVITY_LOCAL_GATHER: return "local_gather";
-        case globals::ACTIVITY_REMOTE_PUBLISH: return "remote_publish";
-        case globals::ACTIVITY_COMPUTE_LOCAL: return "compute_local";
-        case globals::ACTIVITY_COMPUTE_REMOTE: return "compute_remote";
-        default: return "unknown";
-    }
-}
-
-__host__ inline const char* ag_gemm_block_role_name(int block_idx, const globals& G) {
-    return block_idx < G.num_intra_comm ? "intra_comm" : "compute";
-}
-
-__host__ inline bool ag_gemm_trace_dump_enabled(int node_idx, int dev_idx) {
-    const char* all_ranks = std::getenv("AG_GEMM_ACTIVITY_TRACE_ALL_RANKS");
-    if (all_ranks != nullptr && all_ranks[0] == '1') return true;
-    const char* all_local = std::getenv("AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS");
-    if (all_local != nullptr && all_local[0] == '1') return node_idx == 0;
-    const char* all_nodes = std::getenv("AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES");
-    if (all_nodes != nullptr && all_nodes[0] == '1') return dev_idx == 0;
-    return node_idx == 0 && dev_idx == 0;
-}
-
-__host__ inline void ag_gemm_trace_dump_path(
-    int node_idx, int dev_idx, const char* base_path,
-    char* out_path, size_t out_path_size
-) {
-    const char* all_ranks = std::getenv("AG_GEMM_ACTIVITY_TRACE_ALL_RANKS");
-    const char* all_local = std::getenv("AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS");
-    const char* all_nodes = std::getenv("AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES");
-    if ((all_ranks != nullptr && all_ranks[0] == '1') ||
-        (all_local != nullptr && all_local[0] == '1') ||
-        (all_nodes != nullptr && all_nodes[0] == '1')) {
-        std::snprintf(out_path, out_path_size, "%s.node%d_rank%d.json",
-                      base_path, node_idx, dev_idx);
-        return;
-    }
-    std::snprintf(out_path, out_path_size, "%s", base_path);
-}
-
-__host__ inline void ag_gemm_alloc_activity_trace(
-    globals& G, int M, int K, int N
-) {
-    const char* out_path = std::getenv("AG_GEMM_ACTIVITY_TRACE_OUT");
-    if (out_path == nullptr || out_path[0] == '\0') return;
-    const int dev = G.dev_idx;
-    const int global_row_blocks = (M / G.num_nodes) / (globals::ROW_BLOCK * 2);
-    const int local_row_blocks = global_row_blocks / globals::NUM_DEVICES;
-    const int intra_col_blocks = K / (globals::RED_BLOCK * 2);
-    const int node_row_blocks = (M / G.num_nodes) / globals::ROW_BLOCK;
-    const int gemm_col_blocks = N / globals::COL_BLOCK;
-    const int num_local_blocks = local_row_blocks * intra_col_blocks;
-    const int num_compute_blocks = node_row_blocks * gemm_col_blocks * G.num_nodes;
-    const int intra_events = (G.num_intra_comm > 0)
-        ? (2 * (G.num_nodes - 1) + 1)
-          * ((num_local_blocks + G.num_intra_comm - 1) / G.num_intra_comm)
-        : 0;
-    const int comp_events = (G.num_comp_sms > 0)
-        ? (num_compute_blocks + G.num_comp_sms - 1) / G.num_comp_sms
-        : 0;
-    G.activity_max_events = std::max(64, 2 * std::max(intra_events, comp_events) + 64);
-
-    const size_t event_bytes =
-        (size_t)config::NUM_BLOCKS * (size_t)G.activity_max_events
-        * sizeof(globals::activity_event);
-    const size_t count_bytes = (size_t)config::NUM_BLOCKS * sizeof(uint32_t);
-    if (g_ag_gemm_trace_buf_cap[dev] < event_bytes) {
-        if (g_ag_gemm_trace_buf[dev] != nullptr) cudaFree(g_ag_gemm_trace_buf[dev]);
-        cudaMalloc(&g_ag_gemm_trace_buf[dev], event_bytes);
-        g_ag_gemm_trace_buf_cap[dev] = event_bytes;
-    }
-    if (g_ag_gemm_trace_counts[dev] == nullptr) cudaMalloc(&g_ag_gemm_trace_counts[dev], count_bytes);
-    if (g_ag_gemm_trace_start[dev] == nullptr) cudaMalloc(&g_ag_gemm_trace_start[dev], sizeof(unsigned long long));
-    if (g_ag_gemm_trace_end[dev] == nullptr) cudaMalloc(&g_ag_gemm_trace_end[dev], sizeof(unsigned long long));
-    cudaMemset(g_ag_gemm_trace_buf[dev], 0, event_bytes);
-    cudaMemset(g_ag_gemm_trace_counts[dev], 0, count_bytes);
-    cudaMemset(g_ag_gemm_trace_start[dev], 0, sizeof(unsigned long long));
-    cudaMemset(g_ag_gemm_trace_end[dev], 0, sizeof(unsigned long long));
-    G.activity_buf = g_ag_gemm_trace_buf[dev];
-    G.activity_counts = g_ag_gemm_trace_counts[dev];
-    G.kernel_start_ns = g_ag_gemm_trace_start[dev];
-    G.kernel_end_ns = g_ag_gemm_trace_end[dev];
-}
-
-__host__ inline void ag_gemm_dump_activity_trace(
-    globals& G, int M, int N, int node_idx, int dev_idx
-) {
-    if (G.activity_buf == nullptr || G.activity_counts == nullptr) return;
-    std::vector<globals::activity_event> host_events(
-        (size_t)config::NUM_BLOCKS * (size_t)G.activity_max_events);
-    std::vector<uint32_t> host_counts(config::NUM_BLOCKS, 0);
-    unsigned long long kernel_start_ns = 0;
-    unsigned long long kernel_end_ns = 0;
-    cudaDeviceSynchronize();
-    cudaMemcpy(host_events.data(), G.activity_buf,
-               host_events.size() * sizeof(globals::activity_event),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_counts.data(), G.activity_counts,
-               host_counts.size() * sizeof(uint32_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(&kernel_start_ns, G.kernel_start_ns,
-               sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&kernel_end_ns, G.kernel_end_ns,
-               sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-
-    unsigned long long min_event_start = ~0ull;
-    unsigned long long max_event_end = 0;
-    for (int b = 0; b < config::NUM_BLOCKS; ++b) {
-        const uint32_t count = std::min(host_counts[b], (uint32_t)G.activity_max_events);
-        for (uint32_t i = 0; i < count; ++i) {
-            const auto& ev = host_events[(size_t)b * (size_t)G.activity_max_events + i];
-            if (ev.start_ns != 0 && ev.start_ns < min_event_start) min_event_start = ev.start_ns;
-            if (ev.end_ns > max_event_end) max_event_end = ev.end_ns;
-        }
-    }
-    if (min_event_start != ~0ull && (kernel_start_ns == 0 || kernel_start_ns > min_event_start)) {
-        kernel_start_ns = min_event_start;
-    }
-    if (kernel_end_ns < max_event_end) kernel_end_ns = max_event_end;
-
-    G.activity_buf = nullptr;
-    G.activity_counts = nullptr;
-    G.kernel_start_ns = nullptr;
-    G.kernel_end_ns = nullptr;
-
-    const char* base_out_path = std::getenv("AG_GEMM_ACTIVITY_TRACE_OUT");
-    if (base_out_path == nullptr || base_out_path[0] == '\0') return;
-    if (!ag_gemm_trace_dump_enabled(node_idx, dev_idx)) return;
-    char out_path[4096];
-    ag_gemm_trace_dump_path(node_idx, dev_idx, base_out_path, out_path, sizeof(out_path));
-    FILE* f = std::fopen(out_path, "w");
-    if (f == nullptr) {
-        std::fprintf(stderr, "[AG_GEMM_ACTIVITY_TRACE] failed to open %s\n", out_path);
-        return;
-    }
-    const int total_gemm_tiles =
-        ((M / G.num_nodes) / globals::ROW_BLOCK) * (N / globals::COL_BLOCK) * G.num_nodes;
-    std::fprintf(f,
-        "{\n"
-        "  \"kernel\": \"ag_gemm\",\n"
-        "  \"node_idx\": %d,\n"
-        "  \"dev_idx\": %d,\n"
-        "  \"M\": %d,\n"
-        "  \"N\": %d,\n"
-        "  \"num_blocks\": %d,\n"
-        "  \"num_intra_comm_sms\": %d,\n"
-        "  \"num_comp_sms\": %d,\n"
-        "  \"num_nodes\": %d,\n"
-        "  \"total_chunks\": %d,\n"
-        "  \"total_gemm_tiles\": %d,\n"
-        "  \"kernel_start_ns\": %llu,\n"
-        "  \"kernel_end_ns\": %llu,\n"
-        "  \"activity_max_events\": %d,\n"
-        "  \"blocks\": [\n",
-        node_idx, dev_idx, M, N, config::NUM_BLOCKS,
-        G.num_intra_comm, G.num_comp_sms, G.num_nodes, G.total_chunks,
-        total_gemm_tiles, kernel_start_ns, kernel_end_ns, G.activity_max_events);
-    for (int b = 0; b < config::NUM_BLOCKS; ++b) {
-        const uint32_t count = std::min(host_counts[b], (uint32_t)G.activity_max_events);
-        std::fprintf(f,
-            "    {\n"
-            "      \"block\": %d,\n"
-            "      \"role\": \"%s\",\n"
-            "      \"events\": [",
-            b, ag_gemm_block_role_name(b, G));
-        for (uint32_t i = 0; i < count; ++i) {
-            const auto& ev = host_events[(size_t)b * (size_t)G.activity_max_events + i];
-            if (i != 0) std::fprintf(f, ",");
-            std::fprintf(f,
-                "\n        {\"kind\":\"%s\",\"work_id\":%d,\"start_ns\":%llu,\"end_ns\":%llu}",
-                ag_gemm_activity_kind_name(ev.kind), ev.work_id, ev.start_ns, ev.end_ns);
-        }
-        if (count != 0) std::fprintf(f, "\n");
-        std::fprintf(f, "      ]\n    }%s\n", (b + 1 == config::NUM_BLOCKS) ? "" : ",");
-    }
-    std::fprintf(f, "  ]\n}\n");
-    std::fclose(f);
-    std::printf("[AG_GEMM_ACTIVITY_TRACE rank=%d node=%d M=%d N=%d file=%s]\n",
-                dev_idx, node_idx, M, N, out_path);
-}
 
 void entrypoint(
     dist::ParallelBuffer& A,
@@ -716,15 +495,11 @@ void entrypoint(
         .num_comp_sms = num_comp_sms,
     };
 
-    ag_gemm_alloc_activity_trace(G, M, K, N);
-
-    // Fast-path #1: barrier_reset is inlined into fused_kernel's exit (see
-    // fused_kernel in src/ag_gemm.cu). Saves one cudaLaunchKernel +
-    // persistent-CTA-startup per iter — measurable at small M where total
-    // time is sub-millisecond.
+    // barrier_reset is inlined into fused_kernel's exit (see fused_kernel
+    // in src/ag_gemm.cu). Saves one cudaLaunchKernel + persistent-CTA-
+    // startup per iter — measurable at small M where total time is
+    // sub-millisecond.
     launch_fused_ag_gemm(G, (unsigned int)active_sms);
-    ag_gemm_dump_activity_trace(G, M, N, node_idx, dev_idx);
-
 }
 
 }  // namespace ag_gemm_multinode

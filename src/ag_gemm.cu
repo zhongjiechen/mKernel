@@ -62,8 +62,6 @@ __device__ inline void intra_comm_sm(const globals& G) {
             for (int task_id = comm_sm_id * globals::NUM_COMM_CHUNKS + warp_id;
                  task_id < num_local_blocks;
                  task_id += G.num_intra_comm * globals::NUM_COMM_CHUNKS) {
-
-                const unsigned long long trace_start = ag_gemm_globaltimer();
                 const int row_idx = task_id / col_blocks;
                 const int global_row_idx = row_idx + G.dev_idx * local_row_blocks;
                 const int col_idx = task_id % col_blocks;
@@ -88,9 +86,6 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 // Per-(row,col) count is 1 because each task_id is processed by
                 // exactly one intra worker under the round-robin stripe.
                 signal_all(G.barrier, {0, global_row_idx, col_idx}, 1);
-                ag_gemm_record_activity_event(
-                    G, globals::ACTIVITY_LOCAL_GATHER, task_id,
-                    trace_start, ag_gemm_globaltimer());
             }
         }
     }
@@ -112,7 +107,7 @@ __device__ inline void intra_comm_sm(const globals& G) {
         return;
     }
 
-    // ========== Phase 2: receiver-side fan-out (#8) ==========
+    // ========== Phase 2: receiver-side fan-out ==========
     // intra_comm_sm ranks r on the peer node have each RDMA-written their
     // M_local-row slice of peer A_half into THIS rank's recv_buf at the
     // corresponding A_half row offset [r*M_local, (r+1)*M_local). Exactly
@@ -150,7 +145,6 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 const int row_idx = task_id / col_blocks;
                 const int global_row_idx = row_idx + G.dev_idx * local_row_blocks;
                 const int col_idx = task_id % col_blocks;
-                const unsigned long long trace_start = ag_gemm_globaltimer();
                 const int slot_row_store =
                     peer_slot * rows_per_peer_slot + global_row_idx;
                 const int slot_row_load = slot_row_store +
@@ -197,11 +191,6 @@ __device__ inline void intra_comm_sm(const globals& G) {
                     // waits for the whole row before consuming it.
                     signal_all(G.barrier, {2, slot_row_store, 0}, 1);
                 }
-
-                ag_gemm_record_activity_event(
-                    G, globals::ACTIVITY_REMOTE_PUBLISH,
-                    ring_step * num_local_blocks + task_id,
-                    trace_start, ag_gemm_globaltimer());
             }
         }
 
@@ -429,7 +418,6 @@ __device__ inline void fused_comp_sm(const globals& G) {
         } else if (warp_id == 1 && lane_id == 0) {
             // TMA store warp — same super-tile-swizzled task order as loader
             for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
-                const unsigned long long trace_start = ag_gemm_globaltimer();
                 const int shard_step = task_id / num_node_blocks;
                 const int shard_rank = ag_gemm_shard_rank_for_step(
                     G.node_idx, G.num_nodes, shard_step);
@@ -454,12 +442,6 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 // can race with downstream reads of C.
                 tma::store_async_wait();
                 arrive(outputs_finished);
-                ag_gemm_record_activity_event(
-                    G,
-                    shard_rank == G.node_idx
-                        ? globals::ACTIVITY_COMPUTE_LOCAL
-                        : globals::ACTIVITY_COMPUTE_REMOTE,
-                    task_id, trace_start, ag_gemm_globaltimer());
             }
         }
     } else {
@@ -526,10 +508,10 @@ __device__ inline void fused_kernel(const globals& G) {
         fused_comp_sm(G);
     }
 
-    // Fast-path #1: inline the iter-end barrier reset that used to be a
-    // separate CUDA launch. Grid-sync
-    // first so no CTA writes 0 to a flag plane while another CTA is still
-    // doing primary work that signals it.
+    // Inline the iter-end barrier reset so it shares the kernel launch
+    // rather than incurring a separate cudaLaunchKernel. Grid-sync first
+    // so no CTA clears a flag plane while another CTA is still signaling
+    // into it.
     if (G.debug_skip_reset != 0) {
         return;
     }
@@ -571,13 +553,7 @@ __device__ inline void barrier_reset(const globals& G) {
 
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
 void ag_gemm_fused_kernel_stub(const __grid_constant__ globals G) {
-    if (blockIdx.x == 0 && threadIdx.x == 0 && G.kernel_start_ns != nullptr) {
-        *G.kernel_start_ns = ag_gemm_globaltimer();
-    }
     fused_kernel(G);
-    if (blockIdx.x == 0 && threadIdx.x == 0 && G.kernel_end_ns != nullptr) {
-        *G.kernel_end_ns = ag_gemm_globaltimer();
-    }
 }
 
 // ============================================================================

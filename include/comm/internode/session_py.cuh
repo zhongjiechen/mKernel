@@ -87,11 +87,10 @@ inline FifoHandleTuple get_fifo_handles(Session* session) {
     if (!session) {
         return {0, 0, 0, 0, 0};
     }
-    // Always pass the session's D2HFifoDeviceBundle by pointer (negative
-    // capacity sentinel). Kernels used to reconstruct a bundle from raw FIFO
-    // pointers + MKERNEL_EFA_NUM_QPS default (16), which could disagree with the
-    // session's actual num_qps / logical_queues when num_fifos==1 (gemm_ar
-    // passes explicit num_qps into resolve_fifo_bundle; ag_gemm did not).
+    // Pass the session's D2HFifoDeviceBundle by pointer, signalled by a
+    // negative capacity sentinel in the returned tuple. Kernels then read
+    // the session's actual num_qps / logical_queues instead of guessing
+    // from raw FIFO pointers.
     const int nf = session->fifo_bundle.num_fifos > 0 ? session->fifo_bundle.num_fifos : 1;
     return {
         reinterpret_cast<int64_t>(&session->fifo_bundle),

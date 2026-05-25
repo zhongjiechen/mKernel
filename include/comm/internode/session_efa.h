@@ -318,12 +318,17 @@ inline Session* create_session(const SessionConfig& cfg) {
     }
 
     // Verify alignment: every proxy's contiguous QP slice must be single-rail.
+    //   qp_base = first global QP index owned by proxy t
+    //   qp_end  = one past the last (half-open range [qp_base, qp_end))
+    // Each proxy thread owns one CQ tied to one rail (ibv_context), so every
+    // QP in its slice must be on that same rail or its CQEs land on a CQ
+    // that can't receive them.
     for (int t = 0; t < num_proxy_threads; t++) {
-        const int qb = t * qps_per_proxy;
-        if (qb >= num_qps) break;
-        const int first_rail = s->qp_rail[qb];
-        const int qe = std::min(qb + qps_per_proxy, num_qps);
-        for (int i = qb; i < qe; i++) {
+        const int qp_base = t * qps_per_proxy;
+        if (qp_base >= num_qps) break;
+        const int first_rail = s->qp_rail[qp_base];
+        const int qp_end = std::min(qp_base + qps_per_proxy, num_qps);
+        for (int i = qp_base; i < qp_end; i++) {
             if (s->qp_rail[i] != first_rail) {
                 fprintf(stderr,
                     "session_efa: QP %d (rail %d) in proxy %d (rail %d) — "
@@ -342,8 +347,8 @@ inline Session* create_session(const SessionConfig& cfg) {
 
     // Per-proxy CQs. Proxy t's rail is determined by its first QP's rail.
     for (int t = 0; t < num_proxy_threads; t++) {
-        const int qb = t * qps_per_proxy;
-        const int rail = (qb < num_qps) ? s->qp_rail[qb] : 0;
+        const int qp_base = t * qps_per_proxy;
+        const int rail = (qp_base < num_qps) ? s->qp_rail[qp_base] : 0;
         s->proxy_cqs[t] = rdma::create_cq(s->rails[rail].ctx, 4096);
     }
     s->cq = s->proxy_cqs[0];
@@ -467,8 +472,8 @@ inline Session* create_session(const SessionConfig& cfg) {
     // Per-proxy flag staging. Register each staging buffer on its proxy's
     // rail PD (only the local NIC needs lkey access for the SGE source).
     for (int t = 0; t < num_proxy_threads; t++) {
-        const int qb = t * qps_per_proxy;
-        const int rail = (qb < num_qps) ? s->qp_rail[qb] : 0;
+        const int qp_base = t * qps_per_proxy;
+        const int rail = (qp_base < num_qps) ? s->qp_rail[qp_base] : 0;
         s->flag_stagings[t] = create_flag_staging(8192);
         s->flag_stagings[t].mr = rdma::reg_mr(
             s->rails[rail].pd, s->flag_stagings[t].host_ptr,
@@ -712,29 +717,26 @@ inline Session* create_session(const SessionConfig& cfg) {
         // peer_slot_by_rank[cmd.dst_rank] and reads per_peer[slot].
         for (int p = 0; p < sess_num_peers; ++p) {
             const ConnectionInfo& ri = s->remote_infos[p];
-            const int p_remote_rail = (ri.num_rails > 1)
+            const int peer_remote_rail = (ri.num_rails > 1)
                 ? ri.qp_to_rail[qp_base]
                 : 0;
-            const auto rkey_for = [&](uint32_t rail0, const RailExchangeInfo& er) {
-                return (p_remote_rail == 0) ? rail0 : er.data_rkey;  // unused
-            };
-            (void)rkey_for;
-            const RailExchangeInfo* extra = (ri.num_rails > 1 && p_remote_rail >= 1)
-                ? &ri.extra_rails[p_remote_rail - 1]
-                : nullptr;
-            PerPeerProxyData& pp = s->per_proxy_peer[t][p];
-            pp.dst_ah = s->rails[proxy_rail].dst_ah_per_peer[p];
+            const RailExchangeInfo* extra_rail =
+                (ri.num_rails > 1 && peer_remote_rail >= 1)
+                    ? &ri.extra_rails[peer_remote_rail - 1]
+                    : nullptr;
+            PerPeerProxyData& peer = s->per_proxy_peer[t][p];
+            peer.dst_ah = s->rails[proxy_rail].dst_ah_per_peer[p];
             for (int i = 0; i < local_qps; i++) {
-                pp.dst_qpns[i] = s->dst_qpns_per_peer[p][qp_base + i];
+                peer.dst_qpns[i] = s->dst_qpns_per_peer[p][qp_base + i];
             }
-            pp.remote_data_addr    = ri.data_addr;
-            pp.remote_data_rkey    = extra ? extra->data_rkey    : ri.data_rkey;
-            pp.remote_flags_addr   = ri.flags_addr;
-            pp.remote_flags_rkey   = extra ? extra->flags_rkey   : ri.flags_rkey;
-            pp.remote_tail_addr    = ri.tail_addr;
-            pp.remote_tail_rkey    = extra ? extra->tail_rkey    : ri.tail_rkey;
-            pp.remote_barrier_addr = ri.barrier_addr;
-            pp.remote_barrier_rkey = extra ? extra->barrier_rkey : ri.barrier_rkey;
+            peer.remote_data_addr    = ri.data_addr;
+            peer.remote_data_rkey    = extra_rail ? extra_rail->data_rkey    : ri.data_rkey;
+            peer.remote_flags_addr   = ri.flags_addr;
+            peer.remote_flags_rkey   = extra_rail ? extra_rail->flags_rkey   : ri.flags_rkey;
+            peer.remote_tail_addr    = ri.tail_addr;
+            peer.remote_tail_rkey    = extra_rail ? extra_rail->tail_rkey    : ri.tail_rkey;
+            peer.remote_barrier_addr = ri.barrier_addr;
+            peer.remote_barrier_rkey = extra_rail ? extra_rail->barrier_rkey : ri.barrier_rkey;
         }
         pcfg.num_peers         = sess_num_peers;
         pcfg.per_peer          = s->per_proxy_peer[t];

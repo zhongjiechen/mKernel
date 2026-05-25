@@ -449,12 +449,7 @@ def main():
         dist.barrier()
 
         samples_pairs = []
-        trace_out_base = os.environ.get("GEMM_AR_ACTIVITY_TRACE_OUT_BASE", "")
         for iter_idx in range(args.iters):
-            if trace_out_base:
-                os.environ["GEMM_AR_ACTIVITY_TRACE_OUT"] = (
-                    f"{trace_out_base}.iter{iter_idx + 1}.trace.json"
-                )
             C_dbuf.data_.zero_(); C_final.data_.zero_(); ar_done.zero_()
             if remote_accum is not None:
                 remote_accum.zero_()

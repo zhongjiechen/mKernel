@@ -333,27 +333,6 @@ run_one_2node() {
     if [[ -n "${GEMM_RS_RECV_PROGRESS_SMS:-}" ]]; then
         env_str="$env_str GEMM_RS_RECV_PROGRESS_SMS=$GEMM_RS_RECV_PROGRESS_SMS"
     fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_RS_ACTIVITY_TRACE_OUT:-}" ]]; then
-        env_str="$env_str GEMM_RS_ACTIVITY_TRACE_OUT=$GEMM_RS_ACTIVITY_TRACE_OUT"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_RS_ACTIVITY_TRACE_ALL_RANKS:-}" ]]; then
-        env_str="$env_str GEMM_RS_ACTIVITY_TRACE_ALL_RANKS=$GEMM_RS_ACTIVITY_TRACE_ALL_RANKS"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
-        env_str="$env_str GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS=$GEMM_RS_ACTIVITY_TRACE_ALL_LOCAL_RANKS"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
-        env_str="$env_str GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES=$GEMM_RS_ACTIVITY_TRACE_RANK0_ALL_NODES"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_AR_ACTIVITY_TRACE_OUT:-}" ]]; then
-        env_str="$env_str GEMM_AR_ACTIVITY_TRACE_OUT=$GEMM_AR_ACTIVITY_TRACE_OUT"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
-        env_str="$env_str GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES=$GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
-        env_str="$env_str GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS=$GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS"
-    fi
     if [[ -n "${AG_GEMM_ACTIVE_SMS:-}" ]]; then
         env_str="$env_str AG_GEMM_ACTIVE_SMS=$AG_GEMM_ACTIVE_SMS"
     fi
@@ -395,18 +374,6 @@ run_one_2node() {
     fi
     if [[ -n "${AG1_ADAPTIVE_COMM_SMS:-}" ]]; then
         env_str="$env_str AG1_ADAPTIVE_COMM_SMS=$AG1_ADAPTIVE_COMM_SMS"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${AG_GEMM_ACTIVITY_TRACE_OUT:-}" ]]; then
-        env_str="$env_str AG_GEMM_ACTIVITY_TRACE_OUT=$AG_GEMM_ACTIVITY_TRACE_OUT"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
-        env_str="$env_str AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS=$AG_GEMM_ACTIVITY_TRACE_ALL_LOCAL_RANKS"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${AG_GEMM_ACTIVITY_TRACE_ALL_RANKS:-}" ]]; then
-        env_str="$env_str AG_GEMM_ACTIVITY_TRACE_ALL_RANKS=$AG_GEMM_ACTIVITY_TRACE_ALL_RANKS"
-    fi
-    if [[ "$allow_profiler_logging" == "1" && -n "${AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES:-}" ]]; then
-        env_str="$env_str AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES=$AG_GEMM_ACTIVITY_TRACE_RANK0_ALL_NODES"
     fi
     if [[ -n "${MKERNEL_PREP_EPOCH_FAST:-}" ]]; then
         env_str="$env_str MKERNEL_PREP_EPOCH_FAST=$MKERNEL_PREP_EPOCH_FAST"

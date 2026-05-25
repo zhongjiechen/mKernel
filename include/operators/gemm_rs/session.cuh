@@ -4,7 +4,7 @@
 // Included from src/gemm_rs.cu after the kernel namespace closes.
 
 // ============================================================================
-// Session management (same as v1)
+// Session management
 // ============================================================================
 #include "comm/internode/session_py.cuh"
 #include <algorithm>
@@ -148,9 +148,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_intra_comm"),
           pybind11::arg("num_send_sms"),
           pybind11::arg("num_reduce_sms"),
-          pybind11::arg("use_acquire_poll") = (int64_t)0,
-          pybind11::arg("reduce_poll_sleep_ns") = (int64_t)100,
+          pybind11::arg("use_acquire_poll"),
+          pybind11::arg("reduce_poll_sleep_ns"),
           pybind11::arg("ready_chunk"),
-          pybind11::arg("staging") = pybind11::none(),
+          pybind11::arg("staging"),
           pybind11::arg("num_nodes"));
 }

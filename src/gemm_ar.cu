@@ -123,7 +123,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         } else if (warp_id == 1 && lane_id == 0) {
             // TMA store warp — write to C_distributed_tensor, signal barrier for intra-AR
             for (int task_id = blockIdx.x; task_id < num_blocks; task_id += G.num_comp_sms) {
-                unsigned long long trace_start = gemm_ar_globaltimer();
                 int row_idx, col_idx;
                 gemm_ar_decode_comp_task(
                     task_id, G.row_blocks_per_slice, col_blocks, G.dev_idx, row_idx, col_idx);
@@ -145,7 +144,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                         const int tiles_this_chunk = min(G.chunk_tiles, col_blocks - chunk_start);
                         uint32_t prev = atomicAdd(G.comp_chunk_tiles_done + flat_chunk, 1u);
                         if (prev == (uint32_t)(tiles_this_chunk - 1)) {
-                            const unsigned long long signal_start = gemm_ar_globaltimer();
                             int slice_owner = row_idx / G.row_blocks_per_slice;
                             if (G.intra_ready_multimem != 0) {
                                 comm::atomic_u32::release_store_sys(
@@ -153,14 +151,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                             } else {
                                 signal(G.barrier, {row_idx, chunk_col}, slice_owner, 1);
                             }
-                            gemm_ar_record_activity_event(
-                                G, fused_globals::ACTIVITY_COMPUTE_SIGNAL, flat_chunk,
-                                signal_start, gemm_ar_globaltimer());
                         }
                     }
-                    gemm_ar_record_activity_event(
-                        G, fused_globals::ACTIVITY_COMPUTE, task_id,
-                        trace_start, gemm_ar_globaltimer());
                 }
             }
         }
@@ -372,8 +364,6 @@ __device__ inline void fused_intra_ar_sm(const fused_globals& G) {
     for (int raw_step = 0; raw_step * stride < total_tiles; raw_step++) {
         int tile_id = my_offset + raw_step * stride;
         if (tile_id >= total_tiles) break;
-        unsigned long long wait_start = 0;
-        if (threadIdx.x == 0) wait_start = gemm_ar_globaltimer();
         // Decode tile_id → (rb_in_slice, row_idx, col_idx, chunk_id)
         const int rb_in_slice = tile_id / G.col_blocks;
         const int col_idx = tile_id - rb_in_slice * G.col_blocks;
@@ -396,14 +386,9 @@ __device__ inline void fused_intra_ar_sm(const fused_globals& G) {
             wait(G.barrier, {row_idx, chunk_col}, G.dev_idx, fused_globals::NUM_DEVICES);
         }
         if (threadIdx.x == 0) {
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTRA_AR_WAIT, tile_id,
-                wait_start, gemm_ar_globaltimer());
         }
         __syncthreads();
 
-        unsigned long long reduce_start = 0;
-        if (threadIdx.x == 0) reduce_start = gemm_ar_globaltimer();
         bf16* _tx_tile_base =
             G.staging_buf + (long)tile_id * fused_globals::TILE_ELEMS;
         gemm_ar_pipelined_rs_tile(G.C, row_idx, col_idx, G.C_local, G.N,
@@ -443,9 +428,6 @@ __device__ inline void fused_intra_ar_sm(const fused_globals& G) {
         }
         __syncthreads();
         if (threadIdx.x == 0) {
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTRA_AR_REDUCE, tile_id,
-                reduce_start, gemm_ar_globaltimer());
         }
     }
 }
@@ -488,7 +470,7 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
     const int send_id = blockIdx.x - send_base;
 
 
-    // Phase 2 (Step 2c): static row-block ownership. CTA at offset send_id
+    // Static row-block ownership. CTA at offset send_id
     // owns row-blocks {send_id, send_id + stride, ...}. Wait on each owned
     // row-block's chunks via local_done_flag (acquire), then either coalesce
     // them into one whole-row RDMA or send each chunk individually.
@@ -505,8 +487,6 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
         constexpr int kCoalesceK = 1;
         int c = first_chunk;
         while (c < first_chunk + chunks_per_row) {
-            unsigned long long wait_start = 0;
-            if (tid == 0) wait_start = gemm_ar_globaltimer();
             // How many consecutive chunks to bundle into a single RDMA write.
             int group_k = chunks_per_row - (c - first_chunk);
             if (group_k > kCoalesceK) group_k = kCoalesceK;
@@ -522,9 +502,6 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
                         __nanosleep(50);
                     }
                 }
-                gemm_ar_record_activity_event(
-                    G, fused_globals::ACTIVITY_INTER_SEND_WAIT, c,
-                    wait_start, gemm_ar_globaltimer());
             }
             __syncthreads();
 
@@ -555,7 +532,6 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
             __syncthreads();  // intra_ar wrote staging during reduce
 
             if (tid == 0) {
-                unsigned long long push_start = gemm_ar_globaltimer();
                 const uint32_t offset = (uint32_t)((long)pack_first_tile * TILE_BYTES);
                 // Per-peer slot offsets: at N == 2, sap == 0 so the offsets
                 // are zero (bit-identical). At N > 2 they partition the
@@ -584,14 +560,12 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
                     cmd.lane_id = (uint16_t)(sap * queues_per_peer + logical_q);
                     cmd.reserved0 = (uint8_t)(peer_slot * fused_globals::NUM_DEVICES + G.dev_idx);
                     cmd.enqueue_device_ns = gemm_ar_globaltimer();
-                    // v2 default: per-WR fence + DB. Safe across all shapes.
+                    // Default send path: per-WR fence + doorbell. Safe
+                    // across all shapes.
                     gemm_ar_post_send_cmd(G, send_id, logical_q, cmd);
                 }
                 atomicAdd(G.send_issued_chunks, 1u);
                 __threadfence();
-                gemm_ar_record_activity_event(
-                    G, fused_globals::ACTIVITY_INTER_SEND_PUSH, c,
-                    push_start, gemm_ar_globaltimer());
             }
             __syncthreads();
             c += group_k;
@@ -669,9 +643,6 @@ __device__ inline void fused_inter_recv_progress_sm(const fused_globals& G) {
         if (remote_done && enqueued_done) break;
         __nanosleep(50);
     }
-    gemm_ar_record_activity_event(
-        G, fused_globals::ACTIVITY_INTER_RECV_PROGRESS, progress_id,
-        start, gemm_ar_globaltimer());
 }
 
 __device__ inline bool gemm_ar_pop_recv_ready_chunk(const fused_globals& G, int& chunk_id) {
@@ -707,8 +678,6 @@ __device__ inline void shared_reduce_my_slice_recv_ready_queue(
 
     __shared__ int s_chunk_id;
     while (true) {
-        unsigned long long wait_start = 0;
-        if (tid == 0) wait_start = gemm_ar_globaltimer();
         if (tid == 0) {
             int chunk_id = -1;
             if (gemm_ar_pop_recv_ready_chunk(G, chunk_id)) {
@@ -730,13 +699,8 @@ __device__ inline void shared_reduce_my_slice_recv_ready_queue(
 
         const int chunk_id = s_chunk_id;
         if (tid == 0) {
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTER_REDUCE_WAIT, chunk_id,
-                wait_start, gemm_ar_globaltimer());
         }
         __syncthreads();
-        unsigned long long publish_start = 0;
-        if (tid == 0) publish_start = gemm_ar_globaltimer();
         int rb_in_slice, row_idx, col_start, tiles_this_chunk;
         gemm_ar_chunk_decode(
             chunk_id, G.row_blocks_per_slice, G.col_blocks, G.chunk_tiles, G.dev_idx,
@@ -773,9 +737,6 @@ __device__ inline void shared_reduce_my_slice_recv_ready_queue(
             __threadfence_system();
             const uint32_t published = atomicAdd(G.published_chunks, 1u) + 1u;
             gemm_ar_debug_log_transition(G, "published", chunk_id, published);
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTER_REDUCE_PUBLISH, chunk_id,
-                publish_start, gemm_ar_globaltimer());
         }
         __syncthreads();
     }
@@ -991,8 +952,6 @@ __device__ inline void shared_reduce_my_slice_worksteal(
     __shared__ int s_chunk_id;
 
     while (true) {
-        unsigned long long wait_start = 0;
-        if (tid == 0) wait_start = gemm_ar_globaltimer();
         if (tid == 0) {
             if (G.num_inter_recv_progress_sms == 0) {
                 gemm_ar_drain_owned_arrival_queues(G, red_id);
@@ -1035,13 +994,8 @@ __device__ inline void shared_reduce_my_slice_worksteal(
 
         const int chunk_id = s_chunk_id;
         if (tid == 0) {
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTER_REDUCE_WAIT, chunk_id,
-                wait_start, gemm_ar_globaltimer());
         }
         __syncthreads();
-        unsigned long long publish_start = 0;
-        if (tid == 0) publish_start = gemm_ar_globaltimer();
         int rb_in_slice, row_idx, col_start, tiles_this_chunk;
         gemm_ar_chunk_decode(
             chunk_id, G.row_blocks_per_slice, G.col_blocks, G.chunk_tiles, G.dev_idx,
@@ -1078,9 +1032,6 @@ __device__ inline void shared_reduce_my_slice_worksteal(
             __threadfence_system();
             const uint32_t published = atomicAdd(G.published_chunks, 1u) + 1u;
             gemm_ar_debug_log_transition(G, "published", chunk_id, published);
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTER_REDUCE_PUBLISH, chunk_id,
-                publish_start, gemm_ar_globaltimer());
         }
         __syncthreads();
     }
@@ -1116,8 +1067,6 @@ __device__ inline void shared_reduce_my_slice_static(
     // Process statically owned chunks: poll flags directly, no CAS.
     for (int chunk_id = red_id; chunk_id < G.total_chunks; chunk_id += stride) {
         uint32_t processed_peer_mask = 0u;
-        unsigned long long wait_start = 0;
-        if (tid == 0) wait_start = gemm_ar_globaltimer();
         // Spin until both the intra-AR result (local_done_flag == 1) and the
         // remote RDMA arrival (remote_arrived_flag != 0) are visible.
         // The owning queue drainer continues servicing arrivals in the loop.
@@ -1190,16 +1139,11 @@ __device__ inline void shared_reduce_my_slice_static(
             }
         }
         if (tid == 0) {
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTER_REDUCE_WAIT, chunk_id,
-                wait_start, gemm_ar_globaltimer());
         }
         __syncthreads();
 
         // Reduce C_local (intra-node AR result) + C_recv (remote node's data)
         // and publish the element-wise sum to C_final via NVLink multicast.
-        unsigned long long publish_start = 0;
-        if (tid == 0) publish_start = gemm_ar_globaltimer();
         int rb_in_slice, row_idx, col_start, tiles_this_chunk;
         gemm_ar_chunk_decode(
             chunk_id, G.row_blocks_per_slice, G.col_blocks, G.chunk_tiles, G.dev_idx,
@@ -1236,9 +1180,6 @@ __device__ inline void shared_reduce_my_slice_static(
         if (tid == 0) {
             __threadfence();
             atomicAdd(G.published_chunks, 1u);
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTER_REDUCE_PUBLISH, chunk_id,
-                publish_start, gemm_ar_globaltimer());
         }
         __syncthreads();
     }
@@ -1298,8 +1239,6 @@ __device__ inline void shared_reduce_my_slice(
     int scan_start = (int)((unsigned)blockIdx.x % (unsigned)max(1, G.total_chunks));
 
     while (true) {
-        unsigned long long wait_start = 0;
-        if (tid == 0) wait_start = gemm_ar_globaltimer();
         // Drain our arrival queue if we own one.
         if (tid == 0) {
             if (G.num_inter_recv_progress_sms == 0) {
@@ -1352,13 +1291,8 @@ __device__ inline void shared_reduce_my_slice(
 
         const int chunk_id = s_chunk_id;
         if (tid == 0) {
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTER_REDUCE_WAIT, chunk_id,
-                wait_start, gemm_ar_globaltimer());
         }
         __syncthreads();
-        unsigned long long publish_start = 0;
-        if (tid == 0) publish_start = gemm_ar_globaltimer();
         int rb_in_slice, row_idx, col_start, tiles_this_chunk;
         gemm_ar_chunk_decode(
             chunk_id, G.row_blocks_per_slice, G.col_blocks, G.chunk_tiles, G.dev_idx,
@@ -1395,9 +1329,6 @@ __device__ inline void shared_reduce_my_slice(
             __threadfence_system();
             const uint32_t published = atomicAdd(G.published_chunks, 1u) + 1u;
             gemm_ar_debug_log_transition(G, "published", chunk_id, published);
-            gemm_ar_record_activity_event(
-                G, fused_globals::ACTIVITY_INTER_REDUCE_PUBLISH, chunk_id,
-                publish_start, gemm_ar_globaltimer());
         }
         __syncthreads();
 
@@ -1426,9 +1357,6 @@ __device__ inline void fused_inter_reduce_and_publish_sm(const fused_globals& G)
 // ============================================================================
 
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    if (G.kernel_start_ns != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
-        *G.kernel_start_ns = gemm_ar_globaltimer();
-    }
     if (blockIdx.x < G.num_comp_sms) {
         fused_comp_sm(G);
         shared_reduce_my_slice(G);
@@ -1462,9 +1390,6 @@ __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
             gemm_ar_hierarchical_xnode_barrier(G, reduce_base);
         }
     }
-    if (G.kernel_end_ns != nullptr && threadIdx.x == 0) {
-        atomicMax(reinterpret_cast<unsigned long long*>(G.kernel_end_ns), gemm_ar_globaltimer());
-    }
 }
 
 __device__ inline void fused_epilogue_kernel(const fused_globals& G) {
@@ -1483,9 +1408,6 @@ __device__ inline void fused_epilogue_kernel(const fused_globals& G) {
         // next-iter RDMA writes behind our push means no clobber race.
         gemm_ar_iter_end_reset_arrival_flags(G, reduce_base, G.num_inter_reduce_store_sms);
         gemm_ar_hierarchical_xnode_barrier(G, reduce_base);
-    }
-    if (G.kernel_end_ns != nullptr && threadIdx.x == 0) {
-        atomicMax(reinterpret_cast<unsigned long long*>(G.kernel_end_ns), gemm_ar_globaltimer());
     }
 }
 

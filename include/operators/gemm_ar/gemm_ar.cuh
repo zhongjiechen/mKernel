@@ -300,7 +300,7 @@ struct fused_globals {
     uint32_t* owner_pending_pop_count; // per-owner successfully claimed chunks
     int owner_pending_capacity;        // power-of-2 per owner queue
 
-    // --- Phase 2 static-ownership flags (additive; coexist with chunk_state) ---
+    // Static-ownership flag arrays for the inter-reduce stage.
     // Written with st.release.gpu.global by the unique owner CTA for each chunk.
     // Read with ld.acquire.gpu.global by downstream role CTAs (static ownership).
     // Sized `total_chunks` each. Allocated from the ar_done scratch buffer.
@@ -357,35 +357,6 @@ struct fused_globals {
                                       // sets local_done_flag. Size = total_chunks.
     // remaining CTAs = inter-reduce-and-publish
     unsigned int* epilogue_blocks_done;
-
-    enum activity_kind : int {
-        ACTIVITY_COMPUTE = 0,
-        ACTIVITY_INTRA_AR_WAIT = 1,
-        ACTIVITY_INTRA_AR_REDUCE = 2,
-        ACTIVITY_INTER_SEND_WAIT = 3,
-        ACTIVITY_INTER_SEND_PUSH = 4,
-        ACTIVITY_INTER_REDUCE_WAIT = 5,
-        ACTIVITY_INTER_REDUCE_PUBLISH = 6,
-        ACTIVITY_INTER_RECV_PROGRESS = 7,
-        ACTIVITY_COMPUTE_SIGNAL = 8,
-        ACTIVITY_INTER_REDUCE_ACCUM = 9,
-        ACTIVITY_INTER_FINAL_WAIT = 10,
-        ACTIVITY_INTER_PUBLISH_COPY = 11,
-    };
-    struct activity_event {
-        unsigned long long start_ns;
-        unsigned long long end_ns;
-        int work_id;
-        int kind;
-    };
-    activity_event* activity_buf = nullptr;
-    uint32_t* activity_counts = nullptr;
-    unsigned long long* kernel_start_ns = nullptr;
-    unsigned long long* kernel_end_ns = nullptr;
-    int activity_max_events = 0;
-
-
-
 
 
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
@@ -713,7 +684,7 @@ __device__ inline uint32_t gemm_ar_load_arrival_queue_tail(const fused_globals& 
     return gemm_ar_load_arrival_word(G.arrival_tails + q);
 }
 
-// Phase 2 (Step 2d): drain any new arrivals on a single queue and publish
+// Drain any new arrivals on a single queue and publish
 // the per-chunk remote_arrived_flag (release-store) so static-ownership
 // reducers can wait on it. Caller must be a single thread (uses
 // non-atomic head advance). Returns true if any arrival was processed.
@@ -800,24 +771,6 @@ __device__ inline bool gemm_ar_deadlock_debug_enabled(const fused_globals& G) {
 __device__ inline unsigned long long gemm_ar_globaltimer() {
     return comm::globaltimer();
 }
-
-__device__ inline void gemm_ar_record_activity_event(
-    const fused_globals& G, int kind, int work_id,
-    unsigned long long start_ns, unsigned long long end_ns
-) {
-    if (G.activity_buf == nullptr || G.activity_counts == nullptr) return;
-    uint32_t idx = atomicAdd(&G.activity_counts[blockIdx.x], 1u);
-    if (idx < (uint32_t)G.activity_max_events) {
-        auto& ev = G.activity_buf[
-            (size_t)blockIdx.x * (size_t)G.activity_max_events + (size_t)idx];
-        ev.start_ns = start_ns;
-        ev.end_ns = end_ns;
-        ev.work_id = work_id;
-        ev.kind = kind;
-    }
-}
-
-
 
 
 __device__ inline void gemm_ar_debug_log_transition(
@@ -1088,7 +1041,7 @@ struct gemm_ar_scratch_layout {
     int owner_pending_pop_count_offset;
     int owner_pending_capacity;
     int slice_tiles;
-    // Phase 2 static-ownership flag arrays (u32, one entry per chunk)
+    // Static-ownership flag arrays (u32, one entry per chunk)
     int local_done_flag_offset;
     int remote_arrived_flag_offset;
     int remote_arrived_peer_mask_offset;
@@ -1109,233 +1062,6 @@ struct gemm_ar_scratch_layout {
     int remote_queue_stride;
 };
 
-static fused_globals::activity_event* g_gemm_ar_trace_buf[fused_globals::NUM_DEVICES] = {};
-static uint32_t* g_gemm_ar_trace_counts[fused_globals::NUM_DEVICES] = {};
-static unsigned long long* g_gemm_ar_trace_start[fused_globals::NUM_DEVICES] = {};
-static unsigned long long* g_gemm_ar_trace_end[fused_globals::NUM_DEVICES] = {};
-static size_t g_gemm_ar_trace_buf_cap[fused_globals::NUM_DEVICES] = {};
-
-__host__ inline const char* gemm_ar_activity_kind_name(int kind) {
-    switch (kind) {
-        case fused_globals::ACTIVITY_COMPUTE: return "compute";
-        case fused_globals::ACTIVITY_INTRA_AR_WAIT: return "intra_ar_wait";
-        case fused_globals::ACTIVITY_INTRA_AR_REDUCE: return "intra_ar_reduce";
-        case fused_globals::ACTIVITY_INTER_SEND_WAIT: return "inter_send_wait";
-        case fused_globals::ACTIVITY_INTER_SEND_PUSH: return "inter_send_push";
-        case fused_globals::ACTIVITY_INTER_REDUCE_WAIT: return "inter_reduce_wait";
-        case fused_globals::ACTIVITY_INTER_REDUCE_PUBLISH: return "inter_reduce_publish";
-        case fused_globals::ACTIVITY_INTER_RECV_PROGRESS: return "inter_recv_progress";
-        case fused_globals::ACTIVITY_COMPUTE_SIGNAL: return "compute_signal";
-        case fused_globals::ACTIVITY_INTER_REDUCE_ACCUM: return "inter_reduce_accum";
-        case fused_globals::ACTIVITY_INTER_FINAL_WAIT: return "inter_final_wait";
-        case fused_globals::ACTIVITY_INTER_PUBLISH_COPY: return "inter_publish_copy";
-        default: return "unknown";
-    }
-}
-
-__host__ inline const char* gemm_ar_block_role_name(
-    int block_idx, const gemm_ar_role_split& split
-) {
-    if (block_idx < split.num_comp_sms) return "compute";
-    if (block_idx < split.num_comp_sms + split.num_intra_ar_sms) return "intra_ar";
-    if (block_idx < split.num_comp_sms + split.num_intra_ar_sms + split.num_inter_send_sms) {
-        return "inter_send";
-    }
-    if (block_idx < split.num_comp_sms + split.num_intra_ar_sms + split.num_inter_send_sms
-                    + split.num_inter_recv_progress_sms) {
-        return "inter_recv_progress";
-    }
-    return "inter_reduce";
-}
-
-__host__ inline bool gemm_ar_trace_dump_enabled(int node_idx, int dev_idx) {
-    const char* all_ranks = std::getenv("GEMM_AR_ACTIVITY_TRACE_ALL_RANKS");
-    if (all_ranks != nullptr && all_ranks[0] == '1') return true;
-    const char* all_local = std::getenv("GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS");
-    if (all_local != nullptr && all_local[0] == '1') return node_idx == 0;
-    const char* all_nodes = std::getenv("GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES");
-    if (all_nodes != nullptr && all_nodes[0] == '1') return dev_idx == 0;
-    return node_idx == 0 && dev_idx == 0;
-}
-
-__host__ inline void gemm_ar_trace_dump_path(
-    int node_idx, int dev_idx, const char* base_path,
-    char* out_path, size_t out_path_size
-) {
-    const char* all_ranks = std::getenv("GEMM_AR_ACTIVITY_TRACE_ALL_RANKS");
-    if (all_ranks != nullptr && all_ranks[0] == '1') {
-        std::snprintf(out_path, out_path_size, "%s.node%d_rank%d.json",
-                      base_path, node_idx, dev_idx);
-        return;
-    }
-    const char* all_local = std::getenv("GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS");
-    if (all_local != nullptr && all_local[0] == '1') {
-        std::snprintf(out_path, out_path_size, "%s.node%d_rank%d.json",
-                      base_path, node_idx, dev_idx);
-        return;
-    }
-    const char* all_nodes = std::getenv("GEMM_AR_ACTIVITY_TRACE_RANK0_ALL_NODES");
-    if (all_nodes != nullptr && all_nodes[0] == '1') {
-        std::snprintf(out_path, out_path_size, "%s.node%d_rank%d.json",
-                      base_path, node_idx, dev_idx);
-        return;
-    }
-    std::snprintf(out_path, out_path_size, "%s", base_path);
-}
-
-__host__ inline void gemm_ar_alloc_activity_trace(
-    fused_globals& G, const gemm_ar_role_split& split,
-    const gemm_ar_scratch_layout& scratch
-) {
-    const char* out_path = std::getenv("GEMM_AR_ACTIVITY_TRACE_OUT");
-    if (out_path == nullptr || out_path[0] == '\0') return;
-    const int dev = G.dev_idx;
-    const int compute_max = (split.num_comp_sms > 0)
-        ? (scratch.total_tiles + split.num_comp_sms - 1) / split.num_comp_sms
-        : 0;
-    const int intra_max = (split.num_intra_ar_sms > 0)
-        ? (scratch.slice_tiles + split.num_intra_ar_sms - 1) / split.num_intra_ar_sms
-        : 0;
-    const int send_max = (split.num_inter_send_sms > 0)
-        ? (scratch.total_chunks + split.num_inter_send_sms - 1) / split.num_inter_send_sms
-        : 0;
-    const int reduce_max = (split.num_inter_reduce_store_sms > 0)
-        ? (scratch.total_chunks + split.num_inter_reduce_store_sms - 1) / split.num_inter_reduce_store_sms
-        : 0;
-    // Some roles emit wait+useful sub-events for the same logical work item.
-    G.activity_max_events = std::max(64, 5 * std::max(std::max(compute_max, intra_max),
-                                                      std::max(send_max, reduce_max)) + 64);
-
-    const size_t event_bytes =
-        (size_t)config::NUM_BLOCKS * (size_t)G.activity_max_events
-        * sizeof(fused_globals::activity_event);
-    const size_t count_bytes = (size_t)config::NUM_BLOCKS * sizeof(uint32_t);
-
-    if (g_gemm_ar_trace_buf_cap[dev] < event_bytes) {
-        if (g_gemm_ar_trace_buf[dev] != nullptr) cudaFree(g_gemm_ar_trace_buf[dev]);
-        cudaMalloc(&g_gemm_ar_trace_buf[dev], event_bytes);
-        g_gemm_ar_trace_buf_cap[dev] = event_bytes;
-    }
-    if (g_gemm_ar_trace_counts[dev] == nullptr) cudaMalloc(&g_gemm_ar_trace_counts[dev], count_bytes);
-    if (g_gemm_ar_trace_start[dev] == nullptr) cudaMalloc(&g_gemm_ar_trace_start[dev], sizeof(unsigned long long));
-    if (g_gemm_ar_trace_end[dev] == nullptr) cudaMalloc(&g_gemm_ar_trace_end[dev], sizeof(unsigned long long));
-
-    cudaMemset(g_gemm_ar_trace_buf[dev], 0, event_bytes);
-    cudaMemset(g_gemm_ar_trace_counts[dev], 0, count_bytes);
-    cudaMemset(g_gemm_ar_trace_start[dev], 0, sizeof(unsigned long long));
-    cudaMemset(g_gemm_ar_trace_end[dev], 0, sizeof(unsigned long long));
-
-    G.activity_buf = g_gemm_ar_trace_buf[dev];
-    G.activity_counts = g_gemm_ar_trace_counts[dev];
-    G.kernel_start_ns = g_gemm_ar_trace_start[dev];
-    G.kernel_end_ns = g_gemm_ar_trace_end[dev];
-}
-
-__host__ inline void gemm_ar_dump_activity_trace(
-    fused_globals& G, int M, int N, int node_idx, int dev_idx,
-    const gemm_ar_role_split& split, const gemm_ar_scratch_layout& scratch
-) {
-    if (G.activity_buf == nullptr || G.activity_counts == nullptr) return;
-
-    std::vector<fused_globals::activity_event> host_events(
-        (size_t)config::NUM_BLOCKS * (size_t)G.activity_max_events);
-    std::vector<uint32_t> host_counts(config::NUM_BLOCKS, 0);
-    unsigned long long kernel_start_ns = 0;
-    unsigned long long kernel_end_ns = 0;
-
-    cudaDeviceSynchronize();
-    cudaMemcpy(host_events.data(), G.activity_buf,
-               host_events.size() * sizeof(fused_globals::activity_event),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_counts.data(), G.activity_counts,
-               host_counts.size() * sizeof(uint32_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(&kernel_start_ns, G.kernel_start_ns,
-               sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&kernel_end_ns, G.kernel_end_ns,
-               sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-
-    unsigned long long min_event_start = ~0ull;
-    unsigned long long max_event_end = 0;
-    for (int b = 0; b < config::NUM_BLOCKS; ++b) {
-        const uint32_t count = std::min(host_counts[b], (uint32_t)G.activity_max_events);
-        for (uint32_t i = 0; i < count; ++i) {
-            const auto& ev = host_events[(size_t)b * (size_t)G.activity_max_events + i];
-            if (ev.start_ns != 0 && ev.start_ns < min_event_start) min_event_start = ev.start_ns;
-            if (ev.end_ns > max_event_end) max_event_end = ev.end_ns;
-        }
-    }
-    if (min_event_start != ~0ull && (kernel_start_ns == 0 || kernel_start_ns > min_event_start)) {
-        kernel_start_ns = min_event_start;
-    }
-    if (kernel_end_ns < max_event_end) kernel_end_ns = max_event_end;
-
-    G.activity_buf = nullptr;
-    G.activity_counts = nullptr;
-    G.kernel_start_ns = nullptr;
-    G.kernel_end_ns = nullptr;
-
-    const char* base_out_path = std::getenv("GEMM_AR_ACTIVITY_TRACE_OUT");
-    if (base_out_path == nullptr || base_out_path[0] == '\0') return;
-    if (!gemm_ar_trace_dump_enabled(node_idx, dev_idx)) return;
-
-    char out_path[4096];
-    gemm_ar_trace_dump_path(node_idx, dev_idx, base_out_path, out_path, sizeof(out_path));
-    FILE* f = std::fopen(out_path, "w");
-    if (f == nullptr) {
-        std::fprintf(stderr, "[GEMM_AR_ACTIVITY_TRACE] failed to open %s\n", out_path);
-        return;
-    }
-
-    const int total_gemm_tiles = (M / fused_globals::ROW_BLOCK) * (N / fused_globals::COL_BLOCK);
-    std::fprintf(f,
-        "{\n"
-        "  \"kernel\": \"gemm_ar\",\n"
-        "  \"node_idx\": %d,\n"
-        "  \"dev_idx\": %d,\n"
-        "  \"M\": %d,\n"
-        "  \"N\": %d,\n"
-        "  \"num_blocks\": %d,\n"
-        "  \"num_comp_sms\": %d,\n"
-        "  \"num_intra_ar_sms\": %d,\n"
-        "  \"num_inter_send_sms\": %d,\n"
-        "  \"num_inter_recv_progress_sms\": %d,\n"
-        "  \"num_inter_reduce_sms\": %d,\n"
-        "  \"total_chunks\": %d,\n"
-        "  \"total_gemm_tiles\": %d,\n"
-        "  \"kernel_start_ns\": %llu,\n"
-        "  \"kernel_end_ns\": %llu,\n"
-        "  \"activity_max_events\": %d,\n"
-        "  \"blocks\": [\n",
-        node_idx, dev_idx, M, N, config::NUM_BLOCKS,
-        split.num_comp_sms, split.num_intra_ar_sms, split.num_inter_send_sms,
-        split.num_inter_recv_progress_sms, split.num_inter_reduce_store_sms,
-        scratch.total_chunks, total_gemm_tiles,
-        kernel_start_ns, kernel_end_ns, G.activity_max_events);
-
-    for (int b = 0; b < config::NUM_BLOCKS; ++b) {
-        const uint32_t count = std::min(host_counts[b], (uint32_t)G.activity_max_events);
-        std::fprintf(f,
-            "    {\n"
-            "      \"block\": %d,\n"
-            "      \"role\": \"%s\",\n"
-            "      \"events\": [",
-            b, gemm_ar_block_role_name(b, split));
-        for (uint32_t i = 0; i < count; ++i) {
-            const auto& ev = host_events[(size_t)b * (size_t)G.activity_max_events + i];
-            if (i != 0) std::fprintf(f, ",");
-            std::fprintf(f,
-                "\n        {\"kind\":\"%s\",\"work_id\":%d,\"start_ns\":%llu,\"end_ns\":%llu}",
-                gemm_ar_activity_kind_name(ev.kind), ev.work_id, ev.start_ns, ev.end_ns);
-        }
-        if (count != 0) std::fprintf(f, "\n");
-        std::fprintf(f, "      ]\n    }%s\n", (b + 1 == config::NUM_BLOCKS) ? "" : ",");
-    }
-    std::fprintf(f, "  ]\n}\n");
-    std::fclose(f);
-    std::printf("[GEMM_AR_ACTIVITY_TRACE rank=%d node=%d M=%d N=%d file=%s]\n",
-                dev_idx, node_idx, M, N, out_path);
-}
 
 __host__ inline gemm_ar_role_split gemm_ar_compute_role_split(
     int num_intra_comm_sms, int num_inter_comm_sms, int row_blocks_per_slice = 0
@@ -1391,7 +1117,6 @@ __host__ inline gemm_ar_scratch_layout gemm_ar_compute_scratch_layout(
     scratch.total_tiles = (M / fused_globals::ROW_BLOCK) * scratch.col_blocks;
     scratch.chunk_tiles = gemm_ar_chunk_tiles(scratch.col_blocks);
     scratch.chunks_per_row = gemm_ar_chunks_per_row(scratch.col_blocks);
-    // (chunk_state buffer removed in Phase 2)
     scratch.chunk_remote_arrived_offset = 0;
     scratch.arrival_queue_head_offset = scratch.chunk_remote_arrived_offset + scratch.total_chunks;
     scratch.local_ar_done_offset = scratch.arrival_queue_head_offset + num_remote_queues;
@@ -1445,7 +1170,7 @@ __host__ inline gemm_ar_scratch_layout gemm_ar_compute_scratch_layout(
         scratch.owner_pending_max_depth_offset + num_remote_queues;
     scratch.owner_pending_pop_count_offset =
         scratch.owner_pending_push_count_offset + num_remote_queues;
-    // Phase 2 static-ownership flag arrays: one u32 per chunk each.
+    // Static-ownership flag arrays: one u32 per chunk each.
     scratch.local_done_flag_offset =
         scratch.owner_pending_pop_count_offset + num_remote_queues;
     scratch.remote_arrived_flag_offset =
@@ -1757,10 +1482,6 @@ void entrypoint(
         G.early_remote_accum =
             (remote_accum_ptr != 0 && accum_env != nullptr && accum_env[0] == '1') ? 1 : 0;
     }
-    gemm_ar_alloc_activity_trace(G, split, scratch);
-
-
-
     gemm_ar_host_debug_log(node_idx, dev_idx, "entrypoint before launch_kernel");
     launch_fused_gemm_ar(G);
     gemm_ar_host_debug_log(node_idx, dev_idx, "entrypoint after launch_kernel");
@@ -1769,8 +1490,6 @@ void entrypoint(
         launch_fused_gemm_ar_epilogue(G);
         gemm_ar_host_debug_log(node_idx, dev_idx, "entrypoint after launch_epilogue_kernel");
     }
-    gemm_ar_dump_activity_trace(G, M, N, node_idx, dev_idx, split, scratch);
-
 }
 // -- END inlined from gemm_ar_multinode_host_entrypoint.cuh
 
