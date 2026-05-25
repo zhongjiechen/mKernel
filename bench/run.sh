@@ -135,11 +135,6 @@ fi
 if [[ -n "${GEMM_AR_NUM_INTRA_COMM_SMS:-}" ]]; then
     COMMON_ENV+=("GEMM_AR_NUM_INTRA_COMM_SMS=$GEMM_AR_NUM_INTRA_COMM_SMS")
 fi
-if [[ "$BACKEND" == "efa" ]]; then
-    # gemm_ar (and gemm_rs) need verbs notify mode for EFA proxy publication path.
-    COMMON_ENV+=("MKERNEL_EFA_VERBS_NOTIFY_MODE=remote_flag")
-fi
-
 KERNELS_ALL="dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention"
 STALE_BENCH_PATTERN='[d]ispatch_gemm_bench.py|[g]emm_rs_bench.py|[a]g_gemm_bench.py|[g]emm_ar_bench.py|[r]ing_attention_bench.py|[n]ccl_baseline_bench.py|[b]enchmark_gemm_ar_multinode.py'
 
@@ -171,6 +166,18 @@ run_one_2node() {
     local kernel=$1
     local script
     local extra_args=""
+    # write_imm avoids the EFA SRD unordered-delivery race (data WR vs flag
+    # WR), but gemm_ar's kernel polls an arrival queue and the write_imm CQE
+    # handler only publishes to the flat array — so gemm_ar stays on
+    # remote_flag for now.
+    local kernel_notify_mode="${MKERNEL_EFA_VERBS_NOTIFY_MODE:-}"
+    if [[ "$BACKEND" == "efa" && -z "$kernel_notify_mode" ]]; then
+        if [[ "$kernel" == "gemm_ar" ]]; then
+            kernel_notify_mode=remote_flag
+        else
+            kernel_notify_mode=write_imm
+        fi
+    fi
     if [[ "$kernel" == "nccl_baseline" ]]; then
         script="$HERE/nccl_baseline_bench.py"
         if [[ ! -f "$script" ]]; then
@@ -263,6 +270,9 @@ run_one_2node() {
     local best_of_env=" MKERNEL_BENCH_BEST_OF_N=${MKERNEL_BENCH_BEST_OF_N:-0}"
     local broker_key="${DIST_BROKER_KEY:-mkernel_${kernel}_${master_port}_${tcp_port_base}}"
     local env_str="${COMMON_ENV[*]} MASTER_PORT=$master_port DIST_BROKER_KEY=$broker_key MKERNEL_BIND_RETAINED_HANDLE=$bind_retained$efa_num_qps_env$best_of_env"
+    if [[ -n "$kernel_notify_mode" ]]; then
+        env_str="$env_str MKERNEL_EFA_VERBS_NOTIFY_MODE=$kernel_notify_mode"
+    fi
     local allow_profiler_logging=1
     if [[ "$MODE" == "bench" && "${MKERNEL_ALLOW_PROFILER_LOGGING:-0}" != "1" ]]; then
         # Plot-generating benchmark runs should not carry trace/profiler output

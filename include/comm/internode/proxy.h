@@ -214,28 +214,52 @@ public:
      */
     void post_stage_barrier(int slot, uint32_t token) {
         barrier_token_ = token;
-        ibv_sge sge{};
-        sge.addr   = (uint64_t)&barrier_token_;
-        sge.length = sizeof(uint32_t);
-        sge.lkey   = 0; // ignored for INLINE sends
+        // Fan the barrier to every peer. With channelize_gpu_peers, each
+        // peer owns a contiguous QP block of size qps_per_peer; we post the
+        // barrier on the first QP of every block so peers 1..N-1 actually
+        // receive their signal. Without channelize, the proxy can only reach
+        // peer 0 anyway, so we post once on cfg_.qp.
+        // Untested at N>2 on CX7 (no hardware available); mirrors the EFA
+        // post_stage_barrier per-peer fan-out.
+        const int n_peers = cfg_.num_nodes - 1;
+        const bool channelize = cfg_.channelize_gpu_peers && n_peers > 1
+                                && cfg_.num_qps >= n_peers;
+        const int num_iters = channelize ? n_peers : 1;
+        const int qps_per_peer = channelize ? (cfg_.num_qps / n_peers) : cfg_.num_qps;
+        for (int p = 0; p < num_iters; ++p) {
+            const int qp_idx = channelize ? (p * qps_per_peer) : 0;
+            const uint64_t remote_addr = channelize
+                ? cfg_.remote_barrier_addr_by_qp[qp_idx]
+                : cfg_.remote_barrier_addr;
+            const uint32_t remote_rkey = channelize
+                ? cfg_.remote_barrier_rkey_by_qp[qp_idx]
+                : cfg_.remote_barrier_rkey;
+            ibv_qp* post_qp = (qp_idx == 0) ? cfg_.qp : cfg_.extra_qps[qp_idx - 1];
 
-        ibv_send_wr wr{};
-        wr.wr_id   = encode_wr_id(/*local_qp=*/0, /*count=*/1);
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.opcode  = IBV_WR_RDMA_WRITE;
-        wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = cfg_.remote_barrier_addr + (uint64_t)slot * sizeof(uint32_t);
-        wr.wr.rdma.rkey        = cfg_.remote_barrier_rkey;
-        wr.next = nullptr;
+            ibv_sge sge{};
+            sge.addr   = (uint64_t)&barrier_token_;
+            sge.length = sizeof(uint32_t);
+            sge.lkey   = 0; // ignored for INLINE sends
 
-        ibv_send_wr* bad = nullptr;
-        int ret = ibv_post_send(cfg_.qp, &wr, &bad);
-        if (ret != 0) {
-            fprintf(stderr, "proxy: post_stage_barrier failed: %s\n", strerror(ret));
-            return;
+            ibv_send_wr wr{};
+            wr.wr_id   = encode_wr_id(/*local_qp=*/qp_idx, /*count=*/1);
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.opcode  = IBV_WR_RDMA_WRITE;
+            wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+            wr.wr.rdma.remote_addr = remote_addr + (uint64_t)slot * sizeof(uint32_t);
+            wr.wr.rdma.rkey        = remote_rkey;
+            wr.next = nullptr;
+
+            ibv_send_wr* bad = nullptr;
+            int ret = ibv_post_send(post_qp, &wr, &bad);
+            if (ret != 0) {
+                fprintf(stderr, "proxy: post_stage_barrier peer %d failed: %s\n",
+                        p, strerror(ret));
+                continue;
+            }
+            inflight_.fetch_add(1, std::memory_order_release);
         }
-        inflight_.fetch_add(1, std::memory_order_release);
     }
 
     /**
@@ -659,12 +683,13 @@ private:
     }
 
     bool forward_notify_enabled_for_cmd(const TransferCmd& cmd) const {
-        if (!cfg_.enable_forward_notify || cfg_.num_nodes <= 2 ||
+        if (!cfg_.enable_forward_notify ||
             cfg_.total_chunks <= 0 || cfg_.a_half_bytes == 0) {
             return false;
         }
         if (cmd.tile_id >= (uint32_t)cfg_.forward_notify_slots) return false;
         const int n_peers = cfg_.num_nodes - 1;
+        if (n_peers < 1) return false;
         const int src_virtual = (int)cmd.tile_id / cfg_.total_chunks;
         const int src_bank = src_virtual / n_peers;
         return src_bank + 1 < n_peers;

@@ -198,10 +198,9 @@ struct Session {
     int           peer_slot_by_rank[kMaxPeers + 1];
 
     // Translate a cmd.dst_rank (global node rank) to a peer slot for
-    // dst_qpns_per_peer / remote_infos lookup. Returns 0 in the legacy
-    // 2-node configuration regardless of dst_rank value.
+    // dst_qpns_per_peer / remote_infos lookup. peer_slot_by_rank is
+    // populated for every session (slot 0 holds the single peer at N=2).
     inline int peer_slot_of_rank(int dst_rank) const {
-        if (num_peers <= 1) return 0;
         if (dst_rank < 0 || dst_rank > kMaxPeers) return 0;
         int s = peer_slot_by_rank[dst_rank];
         return s < 0 ? 0 : s;
@@ -254,7 +253,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     s->rank = cfg.rank;
     s->epoch = 1;
 
-    // --- 0. Clamp knobs and derive session-wide counters.
+    // Clamp knobs and derive session-wide counters.
     int num_rails = cfg.num_rails <= 0 ? 1 : cfg.num_rails;
     if (num_rails > kMaxRails) num_rails = kMaxRails;
     // Allow MKERNEL_EFA_NUM_RAILS env override.
@@ -302,7 +301,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     memset(s->qp_rail, 0, sizeof(s->qp_rail));
     memset(s->rails, 0, sizeof(s->rails));
 
-    // --- 1. Open EFA devices (PCIe-root-aware, multi-rail).
+    // Open EFA devices (PCIe-root-aware, multi-rail).
     auto opened_devs = rdma::open_efa_devices(cfg.device_id, num_rails);
     num_rails = (int)opened_devs.size();
     s->num_rails = num_rails;
@@ -316,7 +315,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     s->ctx = s->rails[0].ctx;
     s->pd  = s->rails[0].pd;
 
-    // --- 1a. Block-assign QPs to rails.
+    // Block-assign QPs to rails.
     // QP i → rail = i * num_rails / num_qps. This groups the first
     // ceil(num_qps/num_rails) QPs onto rail 0, the next block onto rail 1, etc.
     // Block assignment ensures each proxy's contiguous QP slice lands entirely
@@ -349,7 +348,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         if (num_rails == 1) break;
     }
 
-    // --- 1b. Per-proxy CQs. Proxy t's rail is determined by its first QP's rail.
+    // Per-proxy CQs. Proxy t's rail is determined by its first QP's rail.
     for (int t = 0; t < num_proxy_threads; t++) {
         const int qb = t * qps_per_proxy;
         const int rail = (qb < num_qps) ? s->qp_rail[qb] : 0;
@@ -357,7 +356,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     }
     s->cq = s->proxy_cqs[0];
 
-    // --- 1c. Create SRD QPs on their assigned rail's ctx/pd, sharing the
+    // Create SRD QPs on their assigned rail's ctx/pd, sharing the
     // owning proxy's CQ.
     s->sq_depth = 512;
     for (int i = 0; i < num_qps; i++) {
@@ -379,13 +378,13 @@ inline Session* create_session(const SessionConfig& cfg) {
         }
     }
 
-    // --- 2. Register the caller-owned GPU send buffer on every rail's PD.
+    // Register the caller-owned GPU send buffer on every rail's PD.
     for (int r = 0; r < num_rails; r++) {
         s->rails[r].local_data_mr = gpu_mr::register_gpu_buffer(
             s->rails[r].pd, cfg.local_gpu_buf, cfg.local_gpu_buf_size);
     }
 
-    // --- 2b. Optional: register the direct-send GPU source buffer (e.g.
+    // Optional: register the direct-send GPU source buffer (e.g.
     // output_local) as a DMA-BUF MR on every rail's PD. Skipping the staging
     // pack + gather on the send critical path. Hard-fails if DMA-BUF export
     // is unavailable — callers opt in explicitly.
@@ -407,7 +406,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         }
     }
 
-    // --- 3. GPU receive buffer.
+    // GPU receive buffer.
     // Two modes:
     //   (a) Default — allocate via cudaMalloc and register on every rail's PD.
     //   (b) external_recv_buf set — register the caller-owned buffer instead.
@@ -436,7 +435,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         }
     }
 
-    // --- 4. D2H FIFOs.
+    // D2H FIFOs.
     // Default: one FIFO per proxy thread (num_fifos = num_proxy_threads).
     // MKERNEL_FIFO_PER_QP=1 enables one-fifo-per-QP mode (num_fifos = num_qps),
     // which decouples FIFO count from thread count and reduces GPU-side
@@ -461,7 +460,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         s->fifo_bundle.fifos[t] = s->fifos[t].device;
     }
 
-    // --- 5. Arrival flags. Register on every rail's PD so the peer can target
+    // Arrival flags. Register on every rail's PD so the peer can target
     // any of our NICs and the rkey will be valid on the receiving device.
     const size_t arrival_bytes =
         ((size_t)total_arrival_slots + (size_t)total_logical_queues) * sizeof(uint32_t);
@@ -473,7 +472,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     }
     s->arrival.mr = s->rails[0].arrival_mr;
 
-    // --- 6. Per-proxy flag staging. Register each staging buffer on its proxy's
+    // Per-proxy flag staging. Register each staging buffer on its proxy's
     // rail PD (only the local NIC needs lkey access for the SGE source).
     for (int t = 0; t < num_proxy_threads; t++) {
         const int qb = t * qps_per_proxy;
@@ -486,7 +485,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         s->rails[rail].staging_mrs[t] = s->flag_stagings[t].mr;
     }
 
-    // --- 6b. Stage-barrier flags: register on every rail's PD.
+    // Stage-barrier flags: register on every rail's PD.
     s->stage_barrier = create_stage_barrier_flags(kEfaStageBarrierSlots);
     for (int r = 0; r < num_rails; r++) {
         s->rails[r].barrier_mr = rdma::reg_mr(
@@ -496,7 +495,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     }
     s->stage_barrier.mr = s->rails[0].barrier_mr;
 
-    // --- 7. TCP exchange — pack primary QP + extras + multi-rail info.
+    // TCP exchange — pack primary QP + extras + multi-rail info.
     ConnectionInfo local_info{};
     rdma::fill_local_info(local_info, s->qp, s->rails[0].ctx);
     // Rail 0 rkeys (primary fields).
@@ -546,10 +545,11 @@ inline Session* create_session(const SessionConfig& cfg) {
         for (int p = 0; p < sess_num_peers; ++p) {
             sess_peer_ips[p]   = cfg.peer_ips[p];
             sess_peer_ports[p] = cfg.peer_tcp_ports[p];
-            // Peer rank: explicit override, else "skip self" ordering.
+            // Ring order matches Python's get_peer_ips() so slot p here
+            // refers to the same peer that supplied peer_ips[p].
             sess_peer_ranks[p] = cfg.peer_ranks
                 ? cfg.peer_ranks[p]
-                : (p < cfg.rank ? p : p + 1);
+                : (cfg.rank + 1 + p) % (sess_num_peers + 1);
         }
     } else {
         sess_peer_ips[0]   = cfg.peer_ip;
@@ -565,42 +565,44 @@ inline Session* create_session(const SessionConfig& cfg) {
         if (r >= 0 && r <= kMaxPeers) s->peer_slot_by_rank[r] = p;
     }
 
-    // --- 7-8. Per-peer TCP exchange + AH creation.
-    //
-    // For each peer slot p, run an independent TCP info exchange to get
-    // remote_infos[p], then build per-rail AHs for that peer's GID. The
-    // server/client convention is by rank: lower-ranked side is the server.
-    //
-    // Two ranks must use a symmetric port for their pair. Today's 2-node
-    // setup uses a single shared port — in that degenerate case each rank
-    // has only one peer and they trivially agree. For N>2 callers must pass
-    // peer_tcp_ports[] aligned across nodes (e.g., port_base + symmetric_pair_offset).
-    // The loop below is correct for any well-formed input; it has only been
-    // exercised end-to-end with num_peers == 1.
+    // TCP handshake order: iterate global (lo, hi) pairs. Peer-slot order
+    // deadlocks at N>2 because slot-0 maps to a different peer per rank,
+    // leaving every rank waiting on accept() for a peer that hasn't dialed.
+    int inferred_num_nodes = sess_num_peers + 1;
+    for (int lo = 0; lo < inferred_num_nodes; ++lo) {
+        for (int hi = lo + 1; hi < inferred_num_nodes; ++hi) {
+            if (cfg.rank != lo && cfg.rank != hi) continue;
+            const int peer_rank = (cfg.rank == lo) ? hi : lo;
+            // Look up which slot this peer occupies in sess_peer_ranks.
+            int p = -1;
+            for (int i = 0; i < sess_num_peers; ++i) {
+                if (sess_peer_ranks[i] == peer_rank) { p = i; break; }
+            }
+            if (p < 0) continue;
+            const bool is_server = (cfg.rank < peer_rank);
+            ConnectionInfo remote = rdma::exchange_info_tcp(
+                local_info, sess_peer_ips[p], sess_peer_ports[p], is_server);
+            s->remote_infos[p] = remote;
+        }
+    }
+
+    // Peer-slot order so slot-0 aliases the legacy single-peer fields the
+    // proxy hot path reads.
     for (int p = 0; p < sess_num_peers; ++p) {
-        const int peer_rank = sess_peer_ranks[p];
-        const bool is_server = (cfg.rank < peer_rank);
-        ConnectionInfo remote = rdma::exchange_info_tcp(
-            local_info, sess_peer_ips[p], sess_peer_ports[p], is_server);
-        s->remote_infos[p] = remote;
+        ConnectionInfo remote = s->remote_infos[p];
         if (p == 0) {
-            // Slot 0 aliases the legacy single-peer fields so existing
-            // single-peer code paths (proxy hot path, diagnostic prints)
-            // continue to read the same data without changes.
             s->remote_info = remote;
             s->dst_qpns[0] = remote.qp_num;
             for (int i = 1; i < num_qps; i++) {
                 s->dst_qpns[i] = remote.extra_qp_nums[i - 1];
             }
         }
-        // Per-peer dst_qpns table.
         s->dst_qpns_per_peer[p][0] = remote.qp_num;
         for (int i = 1; i < num_qps; i++) {
             s->dst_qpns_per_peer[p][i] = remote.extra_qp_nums[i - 1];
         }
-        // Per-rail AH for this peer. All QPs on the same rail share the AH
-        // (they all reach this peer's matching remote NIC via the same
-        // local NIC). With multi-rail, local rail r pairs with remote rail r.
+        // Per-rail AH for this peer. With multi-rail, local rail r pairs
+        // with remote rail r.
         for (int r = 0; r < num_rails; r++) {
             const uint8_t* remote_gid = (r == 0)
                 ? remote.gid
@@ -610,14 +612,12 @@ inline Session* create_session(const SessionConfig& cfg) {
             ibv_ah* ah = rdma::create_ah(s->rails[r].pd, remote_gid);
             s->rails[r].dst_ah_per_peer[p] = ah;
             if (p == 0) {
-                // Legacy single-peer AH alias used by the existing proxy
-                // hot path until per-peer routing lands.
                 s->rails[r].dst_ah = ah;
             }
         }
     }
 
-    // --- 9. Spawn proxy threads. Each proxy handles QPs on its assigned rail.
+    // Spawn proxy threads. Each proxy handles QPs on its assigned rail.
     for (int t = 0; t < num_proxy_threads; t++) {
         const int qp_base = t * qps_per_proxy;
         const int proxy_rail = (qp_base < num_qps) ? s->qp_rail[qp_base] : 0;
