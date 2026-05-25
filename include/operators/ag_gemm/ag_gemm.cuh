@@ -590,8 +590,7 @@ void entrypoint(
     dist::ParallelBuffer& A_recv,  // #8: multicast-backed peer A_half
     const int active_sms = config::NUM_BLOCKS,
     int num_intra_comm_override = 0,
-    int num_nodes = 2  // total node count (>= 2). N == 2 reproduces the
-                       // legacy 2-node behavior bit-for-bit.
+    int num_nodes
 ) {
     TORCH_CHECK(B.is_cuda() && B.is_contiguous(), "B must be contiguous CUDA");
     TORCH_CHECK(C.is_cuda() && C.is_contiguous(), "C must be contiguous CUDA");

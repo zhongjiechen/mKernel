@@ -227,7 +227,7 @@ static constexpr int kMaxQPs = 24;
 static constexpr int kStageBarrierSlots = 2;
 
 struct Session {
-    // RDMA resources (QP 0 / CQ 0 — used by proxy today)
+    // RDMA resources (QP 0 / CQ 0).
     ibv_context*  ctx;
     ibv_pd*       pd;
     ibv_cq*       cq;       // CQ 0
@@ -326,7 +326,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     memset(s->proxies, 0, sizeof(s->proxies));
     memset(s->flag_stagings, 0, sizeof(s->flag_stagings));
 
-    // --- 1. RDMA resources (QP 0 / CQ 0) ---
+    // RDMA resources (QP 0 / CQ 0).
     // NIC selection priority:
     //   1. Explicit cfg.nic_name (highest priority)
     //   2. PCIe-topology-aware auto-select (matches GPU's NUMA node)
@@ -373,14 +373,14 @@ inline Session* create_session(const SessionConfig& cfg) {
     s->qp  = rdma::create_rc_qp(s->pd, s->cq, qp_max_send_wr, qp_max_send_sge);
     rdma::modify_qp_init(s->qp);
 
-    // --- 1b. Extra QPs (indices 1..num_qps-1), sharing one CQ per proxy thread ---
+    // Extra QPs (indices 1..num_qps-1), sharing one CQ per proxy thread.
     for (int i = 1; i < s->num_qps; i++) {
         const int owner_thread = std::min(s->num_proxy_threads - 1, i / qps_per_proxy);
         s->extra_qps[i - 1] = rdma::create_rc_qp(s->pd, s->proxy_cqs[owner_thread], qp_max_send_wr, qp_max_send_sge);
         rdma::modify_qp_init(s->extra_qps[i - 1]);
     }
 
-    // --- 2. Register local GPU buffer ---
+    // Register local GPU buffer.
     // Try DMA-BUF first for VMM-backed buffers, then fall back to nvidia_peermem
     // for cudaMalloc pointers. Raw ibv_reg_mr does not work for VMM pointers.
     s->local_data_mr = gpu_mr::register_gpu_buffer(
@@ -393,7 +393,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         exit(EXIT_FAILURE);
     }
 
-    // --- 2b. Optional: DMA-BUF-only registration of C_local (direct-send MR) ---
+    // Optional: DMA-BUF-only registration of C_local (direct-send MR).
     if (cfg.direct_dmabuf_enabled) {
         if (cfg.clocal_gpu_buf == nullptr || cfg.clocal_gpu_buf_size == 0) {
             fprintf(stderr,
@@ -414,7 +414,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         }
     }
 
-    // --- 3. Allocate + register receive buffer ---
+    // Allocate + register receive buffer.
     if (cfg.external_recv_buf != nullptr) {
         s->recv_buf.gpu_ptr = cfg.external_recv_buf;
         s->recv_buf.size = cfg.recv_buf_size;
@@ -430,7 +430,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         exit(EXIT_FAILURE);
     }
 
-    // --- 4. D2H FIFO ---
+    // D2H FIFO.
     int fifo_cap = cfg.fifo_capacity > 0 ? cfg.fifo_capacity : 1024;
     s->fifo_bundle = D2HFifoDeviceBundle{};
     s->fifo_bundle.num_fifos = s->num_proxy_threads;
@@ -442,7 +442,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         s->fifo_bundle.fifos[t] = s->fifos[t].device;
     }
 
-    // --- 5. Arrival flags ---
+    // Arrival flags.
     s->arrival = create_arrival_flags(total_arrival_slots, total_logical_queues);
     // Register arrival flags for RDMA (remote writes 4-byte epoch here)
     s->arrival.mr = rdma::reg_mr(s->pd, (void*)s->arrival.device_ptr,
@@ -450,7 +450,7 @@ inline Session* create_session(const SessionConfig& cfg) {
                                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
                                   | IBV_ACCESS_RELAXED_ORDERING);
 
-    // --- 6. Per-proxy flag staging ---
+    // Per-proxy flag staging.
     for (int t = 0; t < s->num_proxy_threads; t++) {
         // +2 extra slots reserved for strided-direct single-cmd posts
         // (flag and tail scratch, read via IBV_SEND_INLINE).
@@ -461,14 +461,14 @@ inline Session* create_session(const SessionConfig& cfg) {
             IBV_ACCESS_LOCAL_WRITE);
     }
 
-    // --- 6b. Stage barrier flags ---
+    // Stage barrier flags.
     s->stage_barrier = create_stage_barrier_flags(kStageBarrierSlots);
     s->stage_barrier.mr = rdma::reg_mr(s->pd, (void*)s->stage_barrier.host_ptr,
                                        kStageBarrierSlots * sizeof(uint32_t),
                                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
                                        | IBV_ACCESS_RELAXED_ORDERING);
 
-    // --- 6c. Optional host-polled forward notifications ---
+    // Optional host-polled forward notifications.
     if (cfg.enable_forward_notify) {
         s->forward_notify = create_forward_notify_table(total_arrival_slots);
         s->forward_notify.mr = rdma::reg_mr(
@@ -478,7 +478,7 @@ inline Session* create_session(const SessionConfig& cfg) {
             | IBV_ACCESS_RELAXED_ORDERING);
     }
 
-    // --- 7. TCP exchange ---
+    // TCP exchange.
     ConnectionInfo local_info{};
     rdma::fill_local_info(local_info, s->qp, s->ctx);
 
@@ -564,7 +564,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     }
     s->remote_info = s->remote_infos[0];
 
-    // --- 8. QP transitions ---
+    // QP transitions.
     for (int peer_slot = 0; peer_slot < num_remote_peers; ++peer_slot) {
         const int peer_rank = cfg.peer_ranks
             ? cfg.peer_ranks[peer_slot]
@@ -593,7 +593,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         }
     }
 
-    // --- 9. Proxy threads ---
+    // Proxy threads.
     const int64_t gpu_to_host_offset_ns = calibrate_gpu_to_host_offset_ns(64);
     for (int t = 0; t < s->num_proxy_threads; t++) {
         const int qp_base = t * qps_per_proxy;

@@ -203,14 +203,11 @@ public:
 
     /** Post a 4-byte RDMA write to the peer's stage barrier slot.
      *
-     * Uses IBV_SEND_INLINE so the 4-byte token is copied into the WQE
-     * at ibv_post_send time — the NIC does NOT later DMA-read any host
-     * memory for the payload. This is critical: previously we pointed
-     * the SGE at cfg_.flag_staging->host_ptr[0], but that same buffer
-     * is reused by subsequent WRITE batches (see Step 2, line ~749/779
-     * in the run loop) which can clobber the token BEFORE the NIC DMAs
-     * the barrier WR, causing the peer to spin on a stale/zero value
-     * forever. INLINE avoids the DMA-read race entirely.
+     * Uses IBV_SEND_INLINE so the token is copied into the WQE at
+     * post time; the NIC never DMA-reads host memory for the payload.
+     * Sharing the staging buffer with WRITE batches would otherwise
+     * race — a later WRITE could overwrite the token before the NIC
+     * read the barrier WR.
      */
     void post_stage_barrier(int slot, uint32_t token) {
         barrier_token_ = token;

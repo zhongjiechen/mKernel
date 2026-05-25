@@ -1383,7 +1383,7 @@ __host__ inline gemm_ar_role_split gemm_ar_compute_role_split(
 
 __host__ inline gemm_ar_scratch_layout gemm_ar_compute_scratch_layout(
     int M, int N, int num_remote_queues, int num_allocated_remote_queues,
-    int num_nodes = 2
+    int num_nodes
 ) {
     gemm_ar_scratch_layout scratch{};
     scratch.slice_rows = M / fused_globals::NUM_DEVICES;
@@ -1528,8 +1528,8 @@ __host__ inline fused_globals gemm_ar_make_globals(
     int num_qps, int num_remote_queues,
     const gemm_ar_role_split& split,
     const gemm_ar_scratch_layout& scratch,
-    int64_t cross_node_barrier_ptr = 0,
-    int num_nodes = 2
+    int64_t cross_node_barrier_ptr,
+    int num_nodes
 ) {
     fused_globals G{
         .A = ::dist::local_tensor_from_tensor<fused_globals::A_local_tensor>(A),

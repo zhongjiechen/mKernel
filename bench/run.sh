@@ -354,23 +354,14 @@ run_one_2node() {
     if [[ "$allow_profiler_logging" == "1" && -n "${GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS:-}" ]]; then
         env_str="$env_str GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS=$GEMM_AR_ACTIVITY_TRACE_ALL_LOCAL_RANKS"
     fi
-    if [[ -n "${AG_GEMM_INTERNODE_COLLECTIVE:-}" ]]; then
-        env_str="$env_str AG_GEMM_INTERNODE_COLLECTIVE=$AG_GEMM_INTERNODE_COLLECTIVE"
-    fi
     if [[ -n "${AG_GEMM_ACTIVE_SMS:-}" ]]; then
         env_str="$env_str AG_GEMM_ACTIVE_SMS=$AG_GEMM_ACTIVE_SMS"
-    fi
-    if [[ -n "${AG_GEMM_PERF_PRESET:-}" ]]; then
-        env_str="$env_str AG_GEMM_PERF_PRESET=$AG_GEMM_PERF_PRESET"
     fi
     if [[ -n "${AG_GEMM_RING_PROXY_FORWARD:-}" ]]; then
         env_str="$env_str AG_GEMM_RING_PROXY_FORWARD=$AG_GEMM_RING_PROXY_FORWARD"
     fi
     if [[ -n "${AG_GEMM_REMOTE_READY_PER_COL:-}" ]]; then
         env_str="$env_str AG_GEMM_REMOTE_READY_PER_COL=$AG_GEMM_REMOTE_READY_PER_COL"
-    fi
-    if [[ -n "${AG_GEMM_TILED_DIRECT:-}" ]]; then
-        env_str="$env_str AG_GEMM_TILED_DIRECT=$AG_GEMM_TILED_DIRECT"
     fi
     if [[ -n "${AG_GEMM_SKIP_REMOTE_COMPUTE:-}" ]]; then
         env_str="$env_str AG_GEMM_SKIP_REMOTE_COMPUTE=$AG_GEMM_SKIP_REMOTE_COMPUTE"
@@ -489,12 +480,6 @@ run_one_2node() {
     if [[ -n "${GEMM_AR_RECV_PROGRESS_SMS:-}" ]]; then
         env_str="$env_str GEMM_AR_RECV_PROGRESS_SMS=$GEMM_AR_RECV_PROGRESS_SMS"
     fi
-    if [[ -n "${GEMM_AR_RING_EXPERIMENT:-}" ]]; then
-        env_str="$env_str GEMM_AR_RING_EXPERIMENT=$GEMM_AR_RING_EXPERIMENT"
-    fi
-    if [[ -n "${GEMM_AR_RING_RS_EXPERIMENT:-}" ]]; then
-        env_str="$env_str GEMM_AR_RING_RS_EXPERIMENT=$GEMM_AR_RING_RS_EXPERIMENT"
-    fi
     if [[ -n "${GEMM_AR_INTRA_READY_MULTIMEM:-}" ]]; then
         env_str="$env_str GEMM_AR_INTRA_READY_MULTIMEM=$GEMM_AR_INTRA_READY_MULTIMEM"
     fi
@@ -509,9 +494,6 @@ run_one_2node() {
     fi
     if [[ -n "${MKERNEL_MAX_INFLIGHT:-}" ]]; then
         env_str="$env_str MKERNEL_MAX_INFLIGHT=$MKERNEL_MAX_INFLIGHT"
-    fi
-    if [[ -n "${MKERNEL_ALLOW_NOSYNC_NGT2:-}" ]]; then
-        env_str="$env_str MKERNEL_ALLOW_NOSYNC_NGT2=$MKERNEL_ALLOW_NOSYNC_NGT2"
     fi
     # Forward per-shape GEMM_RS split overrides.
     for var in $(compgen -e | grep '^MKERNEL_GEMM_RS_SPLIT_' || true); do

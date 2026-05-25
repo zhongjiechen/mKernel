@@ -63,13 +63,10 @@ struct config {
     static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + PRODUCER_WARPGROUPS;
     static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
-    // Register split: P + N·C ≤ 512 (per-CTA reg file).
-    //   N=3 consumers: 24 + 3×160 = 504 — fits the budget. An earlier attempt
-    //   at 24/168 silently exceeded it (24+3×168 = 528 > 512) and deadlocked
-    //   ROLE_SPLIT — the 3rd consumer's setmaxnreg.inc could never be
-    //   satisfied because the per-CTA register file (65536) was fully claimed
-    //   by producer + first 2 consumers. Compiler accepted the over-
-    //   allocation; the runtime hung. Fixed 2026-04-28.
+    // Register split: PRODUCER_REGISTERS + CONSUMER_WARPGROUPS *
+    // CONSUMER_REGISTERS must stay ≤ 512 (per-CTA reg file budget).
+    // Over-allocation is silently accepted by the compiler but hangs at
+    // runtime when setmaxnreg.inc can't be satisfied.
     static constexpr int PRODUCER_REGISTERS = 24;
     static constexpr int CONSUMER_REGISTERS = 160;
 };
@@ -238,7 +235,7 @@ inline void entrypoint(
     int num_comm_sms,
     int num_send_sms,
     int num_copy_sms,
-    int num_nodes = 2  // total node count (>= 2).
+    int num_nodes
 ) {
     const int dev_idx = barrier.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);

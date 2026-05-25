@@ -255,7 +255,7 @@ void fused(
     int num_send_sms,
     int num_copy_sms,
     int num_comm_sms_intra,
-    int num_nodes = 2  // total node count (>= 2).
+    int num_nodes
 ) {
     const int dev_idx = barrier.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);

@@ -321,14 +321,10 @@ def main():
         C_final.data_.zero_()
 
         staging_buf = torch.empty(staging_bytes // 2, device="cuda", dtype=torch.bfloat16)
-        ring_experiment = (
-            os.environ.get("GEMM_AR_RING_EXPERIMENT", "0") == "1"
-            or os.environ.get("GEMM_AR_RING_RS_EXPERIMENT", "0") == "1"
-        )
         early_remote_accum = os.environ.get("GEMM_AR_EARLY_REMOTE_ACCUM", "0") == "1"
         remote_accum = (
             torch.empty(staging_bytes // 2, device="cuda", dtype=torch.bfloat16)
-            if (early_remote_accum or ring_experiment) else None
+            if early_remote_accum else None
         )
 
         # Per-peer sizing (1× at N == 2, identical to legacy).
@@ -341,8 +337,8 @@ def main():
         while fifo_cap < recv_buf_tiles * 2: fifo_cap *= 2
         clocal_ptr = int(C_dbuf.data_.data_ptr())
         clocal_bytes = int(C_dbuf.data_.numel() * C_dbuf.data_.element_size())
-        direct_src_ptr = int(remote_accum.data_ptr()) if ring_experiment and remote_accum is not None else clocal_ptr
-        direct_src_bytes = staging_bytes if ring_experiment and remote_accum is not None else clocal_bytes
+        direct_src_ptr = clocal_ptr
+        direct_src_bytes = clocal_bytes
         row_stride_bytes = N * 2
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(

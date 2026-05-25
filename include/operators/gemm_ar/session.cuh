@@ -44,9 +44,7 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     cfg.clocal_gpu_buf_size = (size_t)clocal_buf_size;
     cfg.row_stride_bytes = (size_t)row_stride_bytes;
     cfg.direct_dmabuf_enabled =
-        (std::getenv("GEMM_AR_RING_EXPERIMENT") != nullptr
-         || std::getenv("GEMM_AR_RING_RS_EXPERIMENT") != nullptr
-         || std::getenv("GEMM_AR_DIRECT_SRC_VIEW") != nullptr)
+        std::getenv("GEMM_AR_DIRECT_SRC_VIEW") != nullptr
         && clocal_buf_ptr != 0 && clocal_buf_size > 0;
     // EFA/libfabric backends support these extended session fields
     cfg.use_write_imm = false;

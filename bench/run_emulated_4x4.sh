@@ -1,20 +1,18 @@
 #!/bin/bash
 # Emulated 4-node × 4-GPU correctness launcher.
 #
-# Spawns 4 torchrun process groups (2 per physical host) so the kernels run
-# as if they were on 4 physical nodes. Used for testing N>2 code paths on
-# limited hardware. Requires .so's built with INTRA_NUM_DEVICES=4:
+# Spawns 4 torchrun process groups (2 per physical host) so the kernels
+# run as if they were on 4 physical nodes. Used for testing N>2 code
+# paths on limited hardware.
 #
-#     make INTRA_NUM_DEVICES=4 all
-#
-# Usage:
-# Required build: dispatch_gemm hardcodes its peer count via TK_MOE_NUM_NODES,
-# so the .so must be built with TK_MOE_NUM_NODES=4:
+# Build: dispatch_gemm hardcodes its peer count via TK_MOE_NUM_NODES, so
+# the .so must be built with both INTRA_NUM_DEVICES=4 and
+# TK_MOE_NUM_NODES=4:
 #
 #     make INTRA_NUM_DEVICES=4 TK_MOE_NUM_NODES=4 all
 #
 # Usage:
-#     bash run_4x4.sh <kernel|all>
+#     bash run_emulated_4x4.sh <kernel|all>
 #
 # Required env:
 #     NODE_A_IP    — IP of host A (this machine, becomes nodes 0 and 1)

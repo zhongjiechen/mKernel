@@ -774,7 +774,7 @@ void entrypoint_fused(
     dist::ParallelBuffer &ready_chunk,
     // Staging DistBuffer used as the chunk-major intra-RS atomic-add target.
     pybind11::object staging_obj,
-    int num_nodes = 2  // total node count (>= 2).
+    int num_nodes
 ) {
     const int dev_idx = output.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
