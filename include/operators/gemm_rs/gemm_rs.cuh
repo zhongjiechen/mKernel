@@ -1,28 +1,32 @@
 #pragma once
 
 /**
- * @file gemm_rs_multinode.cu
- * @brief 2-node × 8-GPU GEMM + Reduce-Scatter.
+ * @file gemm_rs.cuh
+ * @brief Multi-node GEMM + Reduce-Scatter.
  *
- * Uses the intra-node 8-GPU pattern
- * (output_distributed_tensor + tma::store_add_async + per-task ready flags + atomic
- * task claiming) plus an inter-node phase that exchanges each
- * GPU's owned M/8 rows with its same-index peer on the other node.
+ * Uses the intra-node M-GPU pattern (output_distributed_tensor +
+ * tma::store_add_async + per-task ready flags + atomic task claiming) plus
+ * an inter-node phase that exchanges each GPU's owned rows with the
+ * same-index GPU on every remote node.
  *
- * Data flow per GPU (g ∈ [0, 8) within node n ∈ [0, 2)):
- *   Initial: A[g] (M, K), B[g] (K, N)            ← partial inputs (different per GPU)
+ * Let M = INTRA_NUM_DEVICES (GPUs per node) and N = num_nodes. Data flow
+ * per GPU (g ∈ [0, M) within node n ∈ [0, N)):
+ *   Initial: A[g] (M_rows, K), B[g] (K, N_cols)   ← partial inputs.
  *   Phase A: local workspace = A[g] @ B[g]
- *           tma::store_add_async to output_distributed_tensor[owner_in_node]
- *           After A: output[g] has M/8 rows summed over 8 LOCAL GPUs.
- *   Sync 1:  intra-node barrier_all (all 8 local GPUs done with Phase A)
- *   Phase B: copy output[g] → staging_buf (contiguous), push RDMA to peer
- *           node's GPU g, which receives into recv_buf. Set sender_done[tile].
- *   Phase C: poll arrival_flags + sender_done, add recv_buf to output[g]
- *           in-place. Final: output[g] has M/8 rows summed over all 16 GPUs.
+ *            tma::store_add_async to output_distributed_tensor[owner_in_node].
+ *            After A: output[g] holds M_rows/M rows summed over M local GPUs.
+ *   Sync 1:  intra-node barrier_all (all M local GPUs done with Phase A).
+ *   Phase B: copy output[g] → staging_buf, push RDMA to GPU g on every
+ *            remote node. Peers land in recv_buf at per-sender offsets.
+ *            Set sender_done[tile].
+ *   Phase C: poll arrival_flags + sender_done, add each peer slot of
+ *            recv_buf to output[g] in-place. Final: output[g] holds
+ *            M_rows/M rows summed over all N*M GPUs.
  *
- * Output shape per GPU: (M/8, N) — true 16-way RS divided 1/8 per node.
+ * Output shape per GPU: (M_rows/M, N_cols) — a true N*M-way reduce-scatter
+ * partitioned 1/M per node.
  *
- * Current in-tree hot path is a single CTA-specialized kernel:
+ * Hot path is a single CTA-specialized kernel:
  *   compute CTAs -> intranode RS CTAs -> inter send CTAs -> inter reduce CTAs
  * with fine-grained per-tile handoff between each phase.
  */

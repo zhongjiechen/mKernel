@@ -28,7 +28,7 @@ enum class CmdType : uint8_t {
 #pragma pack(push, 1)
 struct TransferCmd {
     CmdType  cmd_type;       // WRITE or FENCE
-    uint8_t  dst_rank;       // target node rank (0/1 in the 2-node setup)
+    uint8_t  dst_rank;       // target node rank (0..num_nodes-1)
     uint16_t tile_id;        // first tile of this transfer (arrival metadata payload base)
     uint32_t bytes;          // transfer size in bytes
     uint32_t local_offset;   // byte offset into RDMA-registered local buffer
@@ -85,9 +85,8 @@ __host__ __device__ inline uint32_t unpack_arrival_num_tiles(uint32_t packed) {
 
 static constexpr int kMaxExchangeQPs = 24;
 static constexpr int kMaxRails = 4;
-// Cap on inter-node peer slots per session (== num_nodes - 1). The 2-node
-// case uses 1; left generous so a single header bump can support larger
-// N-node tests.
+// Cap on inter-node peer slots per session (== num_nodes - 1). Set high
+// enough that a single header bump can support larger N-node tests.
 static constexpr int kMaxPeers = 16;
 
 // Map a peer slot index to a global node rank, in "skip self" ordering:

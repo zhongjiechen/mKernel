@@ -165,16 +165,10 @@ inline std::string select_nic_for_device(int device_id) {
 // ---------------------------------------------------------------------------
 
 struct SessionConfig {
-    int         rank;                // 0 or 1 (our node rank)
-    const char* peer_ip   = nullptr; // legacy single peer; honored when
-                                     // num_peers == 0 (peer_ips unused).
-    int         tcp_port  = 0;       // legacy single TCP port for bootstrap.
-    // Multi-peer (N-node) fields. When num_peers > 0 the create_session()
-    // implementation should iterate over peer_ips[]/peer_tcp_ports[] for
-    // its TCP exchange + RC RTR transition. Today CX7's create_session
-    // still requires num_peers <= 1; >1 aborts with a clear message.
-    // (The EFA backend has the per-peer loop wired through; CX7 mirror
-    // is the natural next step at a CX7 testbed.)
+    int         rank;                // 0..num_nodes-1
+    // peer_ips[i] / peer_tcp_ports[i] describe peer slot i. peer_ranks[i]
+    // optionally overrides the implicit "skip self" mapping from slot →
+    // global rank.
     int                num_peers       = 0;
     const char* const* peer_ips        = nullptr;
     const int*         peer_tcp_ports  = nullptr;
@@ -508,9 +502,9 @@ inline Session* create_session(const SessionConfig& cfg) {
     // Multi-peer normalization. Slot order is the same skip-self order used by
     // peer_rank_for_slot(), so device-side reserved0=peer_slot*8+gpu maps to
     // the QP subset connected to that peer.
-    const int num_remote_peers = (cfg.num_peers > 0) ? cfg.num_peers : 1;
-    if (num_remote_peers > kMaxPeers) {
-        fprintf(stderr, "session.h (CX7): num_peers=%d exceeds kMaxPeers=%d\n",
+    const int num_remote_peers = cfg.num_peers;
+    if (num_remote_peers <= 0 || num_remote_peers > kMaxPeers) {
+        fprintf(stderr, "session.h (CX7): num_peers=%d out of range [1, %d]\n",
                 num_remote_peers, kMaxPeers);
         delete s;
         return nullptr;
@@ -555,8 +549,8 @@ inline Session* create_session(const SessionConfig& cfg) {
                 delete s;
                 return nullptr;
             }
-            const char* sess_peer_ip = (cfg.num_peers > 0) ? cfg.peer_ips[peer_slot] : cfg.peer_ip;
-            const int sess_tcp_port  = (cfg.num_peers > 0) ? cfg.peer_tcp_ports[peer_slot] : cfg.tcp_port;
+            const char* sess_peer_ip = cfg.peer_ips[peer_slot];
+            const int sess_tcp_port  = cfg.peer_tcp_ports[peer_slot];
             const bool is_server = (cfg.rank == lo);
             s->remote_infos[peer_slot] =
                 rdma::exchange_info_tcp(local_info, sess_peer_ip, sess_tcp_port, is_server);

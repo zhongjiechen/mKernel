@@ -16,10 +16,14 @@ namespace internode::py {
 
 using FifoHandleTuple = std::tuple<int64_t, int64_t, int64_t, int64_t, int>;
 
+// peer_ip / tcp_port are kept as positional args for the Python ABI
+// (`mod.create_session(rank, peer_ip, tcp_port, ...)`); the actual peer
+// list is set via apply_peer_ips. apply_peer_ips uses tcp_port as the
+// default port when its peer_tcp_ports vector is empty.
 inline SessionConfig make_base_config(
     int rank,
-    const char* peer_ip,
-    int tcp_port,
+    const char* /*peer_ip*/,
+    int /*tcp_port*/,
     int64_t send_buf_ptr,
     int64_t send_buf_size,
     int64_t recv_buf_size,
@@ -29,8 +33,6 @@ inline SessionConfig make_base_config(
 ) {
     SessionConfig cfg{};
     cfg.rank = rank;
-    cfg.peer_ip = peer_ip;
-    cfg.tcp_port = tcp_port;
     cfg.local_gpu_buf = reinterpret_cast<void*>(send_buf_ptr);
     cfg.local_gpu_buf_size = static_cast<size_t>(send_buf_size);
     cfg.recv_buf_size = static_cast<size_t>(recv_buf_size);
@@ -44,8 +46,8 @@ inline SessionConfig make_base_config(
 // the SessionConfig's multi-peer fields. The C arrays in cfg point at the
 // caller-supplied vector storage; the caller must keep that storage alive
 // until the session is destroyed (typically file-scope statics in each
-// operator shim). When peer_ips is empty, leaves cfg unchanged so the
-// legacy single-peer path (cfg.peer_ip / cfg.tcp_port) is used.
+// operator shim). default_tcp_port fills peer_tcp_ports[i] when the
+// peer_tcp_ports vector is empty.
 inline void apply_peer_ips(
     SessionConfig& cfg,
     std::vector<std::string>& peer_ips,

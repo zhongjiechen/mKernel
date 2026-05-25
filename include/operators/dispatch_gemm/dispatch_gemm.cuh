@@ -1,35 +1,39 @@
 #pragma once
 
 /**
- * @file moe_dispatch_gemm_multinode.cu
- * @brief 2-node × 8-GPU MoE Dispatch + Group GEMM.
+ * @file dispatch_gemm.cuh
+ * @brief Multi-node MoE Dispatch + Group GEMM.
  *
- * Uses the intra-node 8-GPU dispatch pattern
- * (pre_tokens_distributed_tensor + pull-based dispatch + per-row-block barrier counter +
- * per-expert GEMM with NUM_EXPERTS_PER_DEV experts per GPU) plus an
- * inter-node phase that exchanges pre_tokens with the peer node so each node
- * can dispatch from the FULL 16-GPU token set.
+ * Uses the intra-node dispatch pattern (pre_tokens_distributed_tensor +
+ * pull-based dispatch + per-row-block barrier counter + per-expert GEMM
+ * with NUM_EXPERTS_PER_DEV experts per GPU) plus an inter-node phase that
+ * exchanges pre_tokens with every remote node so each node can dispatch
+ * from the full N*M-GPU token set.
  *
- * Layout:
- *   - 16 GPUs, 8 per node, NUM_EXPERTS_PER_DEV = NUM_EXPERTS / 16
- *   - Each GPU has its own num_local_tokens tokens (in pre_tokens DistBuffer)
+ * Let M = INTRA_NUM_DEVICES, N = num_nodes:
+ *   - N*M GPUs total, M per node.
+ *   - NUM_EXPERTS_PER_DEV = NUM_EXPERTS / (N*M).
+ *   - Each GPU has its own num_local_tokens tokens in pre_tokens DistBuffer.
  *   - After inter-node exchange, each GPU has access to:
- *       (a) Local node's 8 GPU pre_tokens via dbuf (pre_tokens_distributed_tensor)
- *       (b) Peer node's 8 GPU pre_tokens via a second dbuf (peer_tokens_distributed_tensor)
- *           — populated by RDMA writes from peer node + a local D2D copy
- *           into the IPC-shared DistBuffer.
+ *       (a) Local node's M pre_tokens slots via pre_tokens_distributed_tensor.
+ *       (b) Every remote node's M pre_tokens slots via
+ *           peer_tokens_distributed_tensor[peer_slot] — populated by RDMA
+ *           writes from each peer node plus a local D2D copy into the
+ *           IPC-shared DistBuffer.
  *
  * Three logical phases:
  *   Phase 1 (inter-node exchange):
- *     RDMA send pre_tokens to peer node's same-index GPU.
- *     Peer receives into a regular cudaMalloc'd recv_buf (RDMA-registered).
+ *     RDMA send pre_tokens to the same-index GPU on every remote node.
+ *     Each peer lands in its own slot of recv_buf (RDMA-registered).
  *   Phase 2 (intra-node copy + dispatch):
- *     Each GPU copies its recv_buf into its slot of peer_tokens_distributed_tensor
- *     (DistBuffer, IPC-shared across local 8 GPUs).
- *     Then dispatch SM pulls tokens from either pre_tokens_distributed_tensor or peer_tokens_distributed_tensor
- *     based on pull_dispatch_indices (which now has 3 columns: src_node, src_dev, src_token).
+ *     Each GPU copies its recv_buf slots into peer_tokens_distributed_tensor
+ *     (IPC-shared across the M local GPUs). Dispatch SMs then pull tokens
+ *     from either pre_tokens_distributed_tensor or
+ *     peer_tokens_distributed_tensor[peer_slot] based on
+ *     pull_dispatch_indices (columns: src_node, src_dev, src_token).
  *   Phase 3 (group GEMM):
- *     Same as intranode kernel — each GPU computes GEMMs for its assigned experts.
+ *     Same as the intranode kernel — each GPU computes GEMMs for its
+ *     assigned experts.
  *
  * Hot path is a single fused kernel launch (`fused()`) that overlaps the
  * inter-node RDMA exchange, intra-node D2D copy, dispatch, and per-expert

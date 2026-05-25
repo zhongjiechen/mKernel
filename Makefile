@@ -2,8 +2,8 @@
 #
 # Usage:
 #   make all       — build all 5 .so's into build/
-#   make check     — run correctness check across all 5 kernels (2-node)
-#   make bench     — run wall-time bench across all 5 kernels (2-node)
+#   make check     — run correctness check across all 5 kernels
+#   make bench     — run wall-time bench across all 5 kernels
 #   make plots     — regenerate TFLOPS bar charts under plots/
 #   make clean     — remove build/
 
@@ -47,8 +47,8 @@ TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; 
 # === Common compile flags ===
 ARCH            := -gencode arch=compute_90a,code=sm_90a
 # INTRA_NUM_DEVICES = GPUs per logical node (multicast group size). Default 8
-# matches the production 2-node × 8-GPU layout. Override to test emulated
-# multinode (e.g. `make INTRA_NUM_DEVICES=4 all` for 4 GPUs / "node").
+# matches an 8-GPU-per-node deployment. Override to test emulated multinode
+# (e.g. `make INTRA_NUM_DEVICES=4 all` for 4 GPUs / "node").
 INTRA_NUM_DEVICES ?= 8
 COMMON_DEFINES  := -DKITTENS_HOPPER -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES)
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH)

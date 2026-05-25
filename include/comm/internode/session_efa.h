@@ -55,16 +55,10 @@ static constexpr int kMaxQPs = kEfaMaxQPs;
 
 struct SessionConfig {
     int         rank;
-    // Legacy single-peer fields. Still honored when `num_peers == 0`, which
-    // create_session() interprets as "treat (peer_ip, tcp_port) as the sole
-    // peer". New callers should set num_peers + peer_ips + peer_tcp_ports
-    // and leave peer_ip/tcp_port null/0.
-    const char* peer_ip   = nullptr;
-    int         tcp_port  = 0;
-    // Multi-peer (N-node) fields. When num_peers > 0, peer_ips[i] /
-    // peer_tcp_ports[i] describe peer slot i (i in [0, num_peers)). Peer slots
-    // are local to this session — they do NOT correspond to global ranks
-    // directly. The proxy maps cmd.dst_rank → peer slot via peer_slot_of_rank.
+    // peer_ips[i] / peer_tcp_ports[i] describe peer slot i (i in
+    // [0, num_peers)). Peer slots are local to this session — they do NOT
+    // correspond to global ranks directly. The proxy maps cmd.dst_rank →
+    // peer slot via peer_slot_of_rank.
     int                num_peers       = 0;
     const char* const* peer_ips        = nullptr;
     const int*         peer_tcp_ports  = nullptr;
@@ -153,7 +147,7 @@ struct RailResources {
     ibv_mr*      arrival_mr     = nullptr;  // arrival flags, registered on this rail's PD
     ibv_mr*      staging_mrs[kMaxProxyThreads] = {};  // per-proxy staging MRs
     ibv_mr*      barrier_mr     = nullptr;  // stage-barrier, registered on this rail's PD
-    ibv_ah*      dst_ah         = nullptr;  // legacy: AH for the single peer slot (slot 0)
+    ibv_ah*      dst_ah         = nullptr;  // slot-0 alias of dst_ah_per_peer[0] (CX7 ProxyConfig compat)
     ibv_ah*      dst_ah_per_peer[kMaxPeers] = {};  // AH per peer slot, on this rail's PD
 };
 
@@ -176,20 +170,18 @@ struct Session {
     ibv_cq*       proxy_cqs[kMaxProxyThreads];
     int           qp_rail[kEfaMaxQPs];       // which rail each QP belongs to
 
-    // Per-QP destination QPN (remote QP number). Single-peer slice; the
-    // multi-peer table below is what proxy_efa.h reads when dispatching a
-    // TransferCmd. dst_qpns[i] aliases dst_qpns_per_peer[0][i] for the
-    // 2-node case (num_peers == 1) so legacy code paths that read dst_qpns
-    // directly still see the right values.
+    // Per-QP destination QPN. Slot-0 alias of dst_qpns_per_peer[0][:];
+    // populated for ProxyConfig source-compat with the CX7 backend, which
+    // reads this scalar on its non-channelized path. The EFA proxy hot
+    // path reads dst_qpns_per_peer[peer_slot] directly.
     uint32_t      dst_qpns[kEfaMaxQPs];
 
-    // Multi-peer destination QPN table. Indexed [peer_slot][qp_idx].
-    // Populated for every session — for the 2-node case num_peers == 1 and
-    // dst_qpns_per_peer[0][:] == dst_qpns[:].
+    // Multi-peer destination QPN table, indexed [peer_slot][qp_idx]. The
+    // EFA proxy hot path resolves peer_slot from cmd.dst_rank and reads
+    // dst_qpns_per_peer[peer_slot][qp_idx].
     int           num_peers;
     uint32_t      dst_qpns_per_peer[kMaxPeers][kEfaMaxQPs];
-    // Per-peer remote_info (one entry per peer slot). Slot 0 aliases
-    // remote_info for legacy code paths.
+    // Per-peer remote_info, indexed by peer slot.
     ConnectionInfo remote_infos[kMaxPeers];
     // Map from this->rank to peer slot. Indexed by global node rank, returns
     // peer slot in [0, num_peers) or -1 if rank == self. Populated by
@@ -531,30 +523,27 @@ inline Session* create_session(const SessionConfig& cfg) {
         ri.barrier_rkey = s->rails[r].barrier_mr->rkey;
     }
 
-    // Multi-peer config resolution. Today the EFA path's TCP exchange + RTR
-    // is single-peer; this block normalizes the (legacy peer_ip, multi-peer
-    // peer_ips[]) inputs into a single uniform "(peer_slot, ip, port,
-    // remote_rank)" tuple list so subsequent code can iterate. For N=2 the
-    // list has length 1 and the loop body runs once, identical to before.
-    int            sess_num_peers = (cfg.num_peers > 0) ? cfg.num_peers : 1;
-    if (sess_num_peers > kMaxPeers) sess_num_peers = kMaxPeers;
+    // Multi-peer config resolution. Normalizes the (legacy peer_ip,
+    // multi-peer peer_ips[]) inputs into a single uniform "(peer_slot, ip,
+    // port, remote_rank)" tuple list so subsequent code can iterate.
+    int            sess_num_peers = cfg.num_peers;
+    if (sess_num_peers <= 0 || sess_num_peers > kMaxPeers) {
+        fprintf(stderr, "create_session_efa: num_peers=%d out of range [1, %d]\n",
+                sess_num_peers, kMaxPeers);
+        delete s;
+        return nullptr;
+    }
     const char*    sess_peer_ips[kMaxPeers];
     int            sess_peer_ports[kMaxPeers];
     int            sess_peer_ranks[kMaxPeers];
-    if (cfg.num_peers > 0) {
-        for (int p = 0; p < sess_num_peers; ++p) {
-            sess_peer_ips[p]   = cfg.peer_ips[p];
-            sess_peer_ports[p] = cfg.peer_tcp_ports[p];
-            // Ring order matches Python's get_peer_ips() so slot p here
-            // refers to the same peer that supplied peer_ips[p].
-            sess_peer_ranks[p] = cfg.peer_ranks
-                ? cfg.peer_ranks[p]
-                : (cfg.rank + 1 + p) % (sess_num_peers + 1);
-        }
-    } else {
-        sess_peer_ips[0]   = cfg.peer_ip;
-        sess_peer_ports[0] = cfg.tcp_port;
-        sess_peer_ranks[0] = 1 - cfg.rank;  // 2-node binary peer
+    for (int p = 0; p < sess_num_peers; ++p) {
+        sess_peer_ips[p]   = cfg.peer_ips[p];
+        sess_peer_ports[p] = cfg.peer_tcp_ports[p];
+        // Ring order matches Python's get_peer_ips() so slot p here
+        // refers to the same peer that supplied peer_ips[p].
+        sess_peer_ranks[p] = cfg.peer_ranks
+            ? cfg.peer_ranks[p]
+            : (cfg.rank + 1 + p) % (sess_num_peers + 1);
     }
 
     // Populate Session.peer_slot_by_rank: rank → slot, -1 for self / unused.
@@ -586,8 +575,8 @@ inline Session* create_session(const SessionConfig& cfg) {
         }
     }
 
-    // Peer-slot order so slot-0 aliases the legacy single-peer fields the
-    // proxy hot path reads.
+    // Iterate in peer-slot order so the slot-0 alias of the single-peer
+    // ProxyConfig fields stays consistent with per_peer[0].
     for (int p = 0; p < sess_num_peers; ++p) {
         ConnectionInfo remote = s->remote_infos[p];
         if (p == 0) {
@@ -719,9 +708,8 @@ inline Session* create_session(const SessionConfig& cfg) {
 
         // Multi-peer endpoint table for the proxy hot path. Each entry
         // covers a single peer slot from the perspective of THIS proxy's
-        // rail. For the validated 2-node configuration (sess_num_peers ==
-        // 1) the proxy hot path reads the legacy scalar fields above and
-        // ignores per_peer; the table is still populated for symmetry.
+        // rail. The EFA proxy resolves the slot from
+        // peer_slot_by_rank[cmd.dst_rank] and reads per_peer[slot].
         for (int p = 0; p < sess_num_peers; ++p) {
             const ConnectionInfo& ri = s->remote_infos[p];
             const int p_remote_rail = (ri.num_rails > 1)
