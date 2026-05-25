@@ -9,21 +9,34 @@
  * Python/session glue + pybind module live in
  *   include/operators/ring_attention/session.cuh
  *
- * Original design notes (from src/ring_attention.cu pre-split):
+ * Algorithm.
  *
- *  2-node x 8-GPU Ring Attention.
+ *   N nodes x M GPUs/node (M = INTRA_NUM_DEVICES). Total ring length is
+ *   N * M stages. The ring is decomposed into N rounds of M intra-node
+ *   stages each:
  *
- *  Algorithm (16 logical ring stages = 8 local + 1 inter-node hop + 8 local):
- *    Stage 0:        Each GPU computes attention(Q, local KV in K0/V0) -> O, L
- *    Stages 1..7:    Intra-node ring rotation around the 8 local GPUs.
- *    Stage 7.5:      Inter-node RDMA exchange — each GPU sends K_local/V_local
- *                    to peer node's same-index GPU; peer receives into
- *                    K_recv/V_recv; D2D-copy into K0/V0.
- *    Stages 8..15:   Intra-node ring rotation again on peer KV.
- *    Final reduction: Merge per-stage partials via online softmax.
+ *     Round 0 (local):
+ *       Stage 0:           attention(Q, K0[dev_idx], V0[dev_idx]) -> O, L
+ *       Stages 1..M-1:     intra-node ring rotation across local GPUs.
  *
- *  The intra-node ring_attn primitive (attn_partial / attn_comm / attn_reduction)
- *  is invoked repeatedly with an RDMA hop at the midpoint.
+ *     Rounds 1..N-1 (each remote peer):
+ *       Before round:      wait for peer's K/V to arrive in recv_buf;
+ *                          D2D copy peer_slot's K/V into K0/V0[dev_idx].
+ *       Stages r*M..r*M+M-1:
+ *                          intra-node ring rotation on the freshly copied
+ *                          peer KV, merging into the running (O, L).
+ *
+ *     Final reduction:     online softmax merge of per-stage partials.
+ *
+ *   RDMA: kv_send_kernel posts WRs from every rank to every peer at the
+ *   start, so the (N-1) peer copies overlap with the round-0 compute.
+ *   kv_copy_kernel(peer_slot) is launched once per remote round and
+ *   reads from recv_buf + peer_slot * single_peer_bytes.
+ *
+ *   The intra-node ring_attn primitive (attn_partial / attn_comm /
+ *   attn_reduction) is invoked once per stage, ping-ponging between K0/V0
+ *   and K1/V1 on stage parity so each rank sees every shard exactly once
+ *   per round.
  */
 
 #include "common/types.cuh"
@@ -121,27 +134,21 @@ struct globals {
 
 };
 
-// Tiny launch config for the cross-GPU barrier-only kernel (1 CTA, 32 threads).
-struct barrier_config {
-    static constexpr int CLUSTER_SIZE = 1;
-    static constexpr int NUM_BLOCKS = 1;
-    static constexpr int NUM_THREADS = 1;
-    static constexpr int DYNAMIC_SHARED_MEMORY = 0;
-};
-
 // ============================================================================
 // Inter-node KV exchange globals
 // ============================================================================
 //
-// Each GPU does:
-//   1. Push RDMA WR to send K_local + V_local to peer node's same-index GPU
-//   2. Wait for peer's K + V to arrive in K_recv/V_recv
-//   3. D2D copy K_recv → K0[dev_idx] (DistBuffer slot for this GPU)
-//      D2D copy V_recv → V0[dev_idx]
+// At session bringup kv_send_kernel posts RDMA WRs from every GPU to its
+// same-index counterpart on every remote node. The peers' K/V land in this
+// rank's recv_buf, partitioned into (num_nodes - 1) [K | V] slots.
 //
-// After this kernel, K0/V0 contain peer node's KV (originally for this GPU's
-// counterpart on the other node). The next ring round of stages 8..15 will
-// rotate this KV around the local 8-GPU ring just like stages 0..7.
+// Between rounds, kv_copy_kernel(peer_slot) does:
+//   1. Wait for that peer slot's K/V to fully arrive (arrival_flags).
+//   2. D2D copy recv_buf[peer_slot * single_peer_bytes ..] into the local
+//      slot of K0/V0 (overwriting whatever the previous round left there).
+//
+// After each kv_copy, the next M intra-node ring stages rotate the freshly
+// copied peer KV around the local M-GPU ring just like the round-0 local KV.
 
 struct kv_exchange_globals {
     bf16 *send_buf;          // registered [K | V] staging buffer
@@ -149,8 +156,10 @@ struct kv_exchange_globals {
     // The host stages K0_local→send_buf[0:K_bytes], V0_local→send_buf[K_bytes:]
     // before launching this kernel. The kernel pushes FIFO commands referencing
     // local_offset within that send buffer.
-    bf16 *K_recv;            // points to recv_buf + 0           (peer K)
-    bf16 *V_recv;            // points to recv_buf + K_bytes      (peer V)
+    // Base pointer to the receive buffer. At N peers the buffer is laid out
+    // as (N-1) consecutive [K | V] slots; the kv_copy kernel takes a peer
+    // slot argument and reads from `recv_buf + peer_slot * single_peer_bytes`.
+    bf16 *recv_buf_base;
     bf16 *K0_local;          // local slot of K0 dbuf, D2D copy destination
     bf16 *V0_local;          // local slot of V0 dbuf
     int   K_bytes;           // K tensor byte size
@@ -172,7 +181,7 @@ struct kv_exchange_globals {
 // Cross-GPU barrier-only kernel config (declared here so entrypoint can launch
 // it; the kernel itself lives in the .cu).
 // ============================================================================
-struct zm_barrier_config {
+struct barrier_config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int NUM_BLOCKS = 1;
     static constexpr int NUM_THREADS = 32;
@@ -185,34 +194,38 @@ struct zm_barrier_config {
 // sufficient (no launch_kernel<> template instantiation that would require a
 // launch wrapper).
 // ============================================================================
-__global__ void zm_attn_comm_partial_stage_kernel(
+__global__ void attn_comm_partial_stage_kernel(
     const __grid_constant__ globals G, const int stage);
-__global__ void zm_attn_reduction_stage_kernel(
+__global__ void attn_reduction_stage_kernel(
     const __grid_constant__ globals G);
-__global__ void zm_kv_send_kernel(
+__global__ void kv_send_kernel(
     const __grid_constant__ kv_exchange_globals KE);
-__global__ void zm_kv_copy_kernel(
-    const __grid_constant__ kv_exchange_globals KE);
-__global__ void zm_barrier_only_kernel(
+__global__ void kv_copy_kernel(
+    const __grid_constant__ kv_exchange_globals KE,
+    const int peer_slot);
+__global__ void barrier_only_kernel(
     const __grid_constant__ globals::barrier_distributed_tensor barrier, const int dev_idx);
 
 // ============================================================================
 // Host orchestration entrypoint
 // ============================================================================
 //
-// Sequence (per call):
-//   1. Launch zm_kv_send_kernel (RDMA prologue — fires WRs, returns immediately
-//      so EFA transfers overlap with stages 0..7)
-//   2. Loop ring_stage = 0..7:
-//        - Launch zm_attn_comm_partial_stage_kernel(ring_stage) [intranode ring]
-//        - If ring_stage > 0: launch zm_attn_reduction_stage_kernel
-//        - Launch zm_barrier_only_kernel (cross-GPU barrier_all)
-//   3. Launch zm_kv_copy_kernel (wait for peer KV arrival + D2D copy → K0/V0)
-//   4. Loop ring_stage = 8..15: same as step 2 but on peer-sourced KV.
+// Sequence (per call). Let M = INTRA_NUM_DEVICES (GPUs per node).
+//   1. Launch kv_send_kernel (RDMA prologue — fans WRs to every remote
+//      peer; returns immediately so EFA transfers overlap with the round-0
+//      compute).
+//   2. Round 0 — local KV. Loop ring_stage = 0..M-1:
+//        - attn_comm_partial_stage_kernel(ring_stage)
+//        - if ring_stage > 0: attn_reduction_stage_kernel
+//        - barrier_only_kernel
+//   3. For each remote peer slot p in 0..num_nodes-2:
+//        - kv_copy_kernel(peer_slot=p) (wait for peer p's KV, D2D into K0/V0)
+//        - barrier_only_kernel
+//        - Loop ring_stage = (p+1)*M .. (p+2)*M - 1 with the same pattern as
+//          step 2 but reduction always runs.
 //
-// The intra-node ring naturally rotates K0↔K1 / V0↔V1 every stage; we re-use
-// the same K0/K1 buffers for both rounds. zm_kv_copy_kernel re-initializes
-// K0/V0 to peer's KV before the second round.
+// The intra-node ring ping-pongs K0↔K1 / V0↔V1 every stage; kv_copy_kernel
+// re-initializes K0/V0 to the current peer's KV before each remote round.
 
 inline void entrypoint(
     const at::Tensor &Q,
@@ -274,8 +287,7 @@ inline void entrypoint(
 
     kv_exchange_globals KE{
         .send_buf = reinterpret_cast<bf16*>(send_buf_ptr),
-        .K_recv = reinterpret_cast<bf16*>(recv_buf_ptr),
-        .V_recv = reinterpret_cast<bf16*>(recv_buf_ptr + K_bytes),
+        .recv_buf_base = reinterpret_cast<bf16*>(recv_buf_ptr),
         .K0_local = reinterpret_cast<bf16*>(K0.data_.data_ptr()),
         .V0_local = reinterpret_cast<bf16*>(V0.data_.data_ptr()),
         .K_bytes = K_bytes,
@@ -302,9 +314,9 @@ inline void entrypoint(
         // union forced ~150 bytes of silent spills in a single kernel that no
         // amount of __noinline__ refactoring or FA3 layout could eliminate
         // without halving wgmma throughput.
-        cudaFuncSetAttribute(zm_attn_comm_partial_stage_kernel,
+        cudaFuncSetAttribute(attn_comm_partial_stage_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, config::DYNAMIC_SHARED_MEMORY);
-        cudaFuncSetAttribute(zm_attn_reduction_stage_kernel,
+        cudaFuncSetAttribute(attn_reduction_stage_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, config::DYNAMIC_SHARED_MEMORY);
 
         int comm_partial_grid = num_comm_sms + n_partial;
@@ -315,41 +327,44 @@ inline void entrypoint(
 
         // Prologue: post RDMA WRs so peer-KV transfer overlaps with stages 0-7.
         // kv_send/kv_copy don't use dynamic smem — launch with smem=0.
-        zm_kv_send_kernel<<<kv_send_grid, config::NUM_THREADS, 0, stream>>>(KE);
+        kv_send_kernel<<<kv_send_grid, config::NUM_THREADS, 0, stream>>>(KE);
         // Match persistent kernel: barrier_all after send, before stages start.
         {
             globals Gb = make_G(0);
-            zm_barrier_only_kernel<<<1, 32, 0, stream>>>(Gb.barrier, dev_idx);
+            barrier_only_kernel<<<1, 32, 0, stream>>>(Gb.barrier, dev_idx);
         }
 
-        // Round A: ring stages 0..7 on local KV.
-        for (int stage = 0; stage < 8; ++stage) {
-            globals Gs = make_G(stage);
-            zm_attn_comm_partial_stage_kernel<<<comm_partial_grid, config::NUM_THREADS,
-                config::DYNAMIC_SHARED_MEMORY, stream>>>(Gs, stage);
-            if (stage > 0) {
-                zm_attn_reduction_stage_kernel<<<reduction_grid, config::NUM_THREADS,
-                    config::DYNAMIC_SHARED_MEMORY, stream>>>(Gs);
+        // Total ring is `num_nodes` rounds of `M` intra-node stages each,
+        // where M = INTRA_NUM_DEVICES (the per-node ring length). Round 0
+        // processes the local node's KV; each subsequent round first fetches
+        // a peer node's KV into K0/V0, then runs the intra-node ring on it.
+        constexpr int M = globals::NUM_DEVICES;
+        for (int round = 0; round < num_nodes; ++round) {
+            if (round > 0) {
+                // Wait for the (round-1)-th peer's KV to land and D2D-copy
+                // it into this rank's K0[dev_idx] / V0[dev_idx]. Subsequent
+                // intra-node ring stages will rotate it.
+                kv_copy_kernel<<<kv_copy_grid, config::NUM_THREADS, 0, stream>>>(
+                    KE, /*peer_slot=*/round - 1);
+                globals Gb = make_G(round * M);
+                barrier_only_kernel<<<1, 32, 0, stream>>>(Gb.barrier, dev_idx);
             }
-            zm_barrier_only_kernel<<<1, 32, 0, stream>>>(Gs.barrier, dev_idx);
-        }
-
-        // Stage 8 prep: wait for peer KV to land, D2D-copy into K0/V0.
-        zm_kv_copy_kernel<<<kv_copy_grid, config::NUM_THREADS, 0, stream>>>(KE);
-        {
-            globals Gb = make_G(0);
-            zm_barrier_only_kernel<<<1, 32, 0, stream>>>(Gb.barrier, dev_idx);
-        }
-
-        // Round B: ring stages 8..15 on peer KV.
-        for (int stage = 8; stage < 16; ++stage) {
-            globals Gs = make_G(stage);
-            zm_attn_comm_partial_stage_kernel<<<comm_partial_grid, config::NUM_THREADS,
-                config::DYNAMIC_SHARED_MEMORY, stream>>>(Gs, stage);
-            // Reduction always runs in round B (stage > 0 condition is always true).
-            zm_attn_reduction_stage_kernel<<<reduction_grid, config::NUM_THREADS,
-                config::DYNAMIC_SHARED_MEMORY, stream>>>(Gs);
-            zm_barrier_only_kernel<<<1, 32, 0, stream>>>(Gs.barrier, dev_idx);
+            for (int local_stage = 0; local_stage < M; ++local_stage) {
+                const int stage = round * M + local_stage;
+                globals Gs = make_G(stage);
+                attn_comm_partial_stage_kernel<<<comm_partial_grid,
+                    config::NUM_THREADS, config::DYNAMIC_SHARED_MEMORY,
+                    stream>>>(Gs, stage);
+                // Reduction merges the per-stage partial into the running
+                // accumulator. Skip only on the very first stage of the
+                // very first round where there is nothing to merge yet.
+                if (stage > 0) {
+                    attn_reduction_stage_kernel<<<reduction_grid,
+                        config::NUM_THREADS, config::DYNAMIC_SHARED_MEMORY,
+                        stream>>>(Gs);
+                }
+                barrier_only_kernel<<<1, 32, 0, stream>>>(Gs.barrier, dev_idx);
+            }
         }
         (void)num_comm_sms;
     }

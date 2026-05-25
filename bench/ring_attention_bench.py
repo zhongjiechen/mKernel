@@ -282,17 +282,23 @@ def main():
         wall_ms = median_then_max_cuda(samples)
         if is_chief:
             print(f"[ring_attn] seq={seq_per_dev} wall={wall_ms:.3f} ms", flush=True)
-        if seq_per_dev <= 1536:
-            K_full = torch.cat(gather_cpu_tensors(K_local), dim=2).to("cuda")
-            V_full = torch.cat(gather_cpu_tensors(V_local), dim=2).to("cuda")
-            O_ref = F.scaled_dot_product_attention(Q, K_full, V_full)
-            correctness_ok = check_close(
-                f"ring_attention seq={seq_per_dev}",
-                O, O_ref, atol=0.55, rtol=0.12
-            ) and correctness_ok
-        elif is_chief:
-            print(f"[correctness] ring_attention seq={seq_per_dev}: "
-                  "skipped full reference (shape too large)", flush=True)
+        K_full = torch.cat(gather_cpu_tensors(K_local), dim=2).to("cuda")
+        V_full = torch.cat(gather_cpu_tensors(V_local), dim=2).to("cuda")
+        # fp32 reference so we have a real ground truth, not bf16 noise.
+        O_ref = F.scaled_dot_product_attention(
+            Q.float(), K_full.float(), V_full.float()
+        ).to(torch.bfloat16)
+        # Scale atol with output magnitude. Without this, a fixed atol that's
+        # large relative to ref_mean lets garbage outputs short-circuit the
+        # check via the max_abs <= atol branch. The 0.05 floor accounts for
+        # bf16 accumulation drift on small-magnitude outputs at NUM_NODES > 2,
+        # where the per-stage running softmax compounds across more rounds.
+        ref_mag = float(O_ref.abs().mean().item())
+        atol = max(0.05, 5.0 * ref_mag)
+        correctness_ok = check_close(
+            f"ring_attention seq={seq_per_dev}",
+            O, O_ref, atol=atol, rtol=0.12
+        ) and correctness_ok
         # Store as total_seq to match NCCL reference + published chart x-axis.
         result_sizes.append(seq_per_dev)
         result_fused.append(wall_ms)
