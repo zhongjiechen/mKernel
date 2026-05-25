@@ -112,5 +112,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_comm_sms"),
           pybind11::arg("num_send_sms"),
           pybind11::arg("num_copy_sms"),
-          pybind11::arg("num_nodes") = 2);
+          pybind11::arg("num_nodes"));
 }

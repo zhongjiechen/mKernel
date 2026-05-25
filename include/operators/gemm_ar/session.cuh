@@ -199,6 +199,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_intra_comm_sms"),
           pybind11::arg("num_inter_comm_sms"),
           pybind11::arg("ar_done_ptr"),
+          pybind11::arg("num_nodes"),
           pybind11::arg("arrival_tails_ptr") = (int64_t)0,
           pybind11::arg("scratch_ints") = 0,
           pybind11::arg("num_qps") = 1,
@@ -212,7 +213,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("cross_node_barrier_ptr") = (int64_t)0,
           pybind11::arg("trace_slot") = -1,
           pybind11::arg("use_acquire_poll") = false,
-          pybind11::arg("num_nodes") = 2,
           pybind11::arg("remote_accum_ptr") = (int64_t)0);
 }
 // -- END inlined from gemm_ar_multinode_module.cuh

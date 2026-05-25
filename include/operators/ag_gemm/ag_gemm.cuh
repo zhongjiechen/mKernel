@@ -111,10 +111,10 @@ struct globals {
 
     A_local_tensor A_local;
     A_local_tensor A_recv_local_tensor;      // per-rank unicast view of recv_buf (RDMA landing zone)
-    // Plan federated-weaving-ocean #8: multicast-backed A_recv buffer. Each
-    // rank r on node N publishes the 1/NUM_DEVICES slice of peer A_half it
-    // received via RDMA into this dbuf, so all ranks on node N see the full
-    // peer A_half after phase-2. Compute remote-tile loads read from this.
+    // Multicast-backed A_recv buffer. Each rank r on node N publishes the
+    // 1/NUM_DEVICES slice of peer A_half it received via RDMA into this
+    // dbuf, so all ranks on node N see the full peer A_half after phase-2.
+    // Compute remote-tile loads read from this.
     A_distributed_tensor A_recv;
     B_local_tensor B;
     C_local_tensor C;
@@ -587,9 +587,9 @@ void entrypoint(
     int node_idx,
     int num_comm_sms,
     int64_t a_half_bytes,
-    dist::ParallelBuffer& A_recv,  // #8: multicast-backed peer A_half
-    const int active_sms = config::NUM_BLOCKS,
-    int num_intra_comm_override = 0,
+    dist::ParallelBuffer& A_recv,  // multicast-backed peer A_half
+    const int active_sms,
+    int num_intra_comm_override,
     int num_nodes
 ) {
     TORCH_CHECK(B.is_cuda() && B.is_contiguous(), "B must be contiguous CUDA");

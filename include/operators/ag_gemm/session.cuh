@@ -226,5 +226,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_recv"),
           pybind11::arg("active_sms") = 132,
           pybind11::arg("num_intra_comm_override") = 0,
-          pybind11::arg("num_nodes") = 2);
+          pybind11::arg("num_nodes"));
 }

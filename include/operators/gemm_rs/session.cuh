@@ -152,5 +152,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("reduce_poll_sleep_ns") = (int64_t)100,
           pybind11::arg("ready_chunk"),
           pybind11::arg("staging") = pybind11::none(),
-          pybind11::arg("num_nodes") = 2);
+          pybind11::arg("num_nodes"));
 }

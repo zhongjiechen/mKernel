@@ -1686,6 +1686,7 @@ void entrypoint(
     int64_t arrival_flags_ptr, int epoch, int node_idx,
     int num_intra_comm_sms, int num_inter_comm_sms,
     int64_t ar_done_ptr,
+    int num_nodes,
     int64_t arrival_tails_ptr = 0,
     int scratch_ints = 0,
     int num_qps = 1,
@@ -1699,7 +1700,6 @@ void entrypoint(
     int trace_slot = -1,
     // Select acquire vs relaxed loads for the intra-AR xdev barrier wait.
     bool use_acquire_poll = false,
-    int num_nodes = 2,
     int64_t remote_accum_ptr = 0
 ) {
     const int dev_idx = C.local_rank_;

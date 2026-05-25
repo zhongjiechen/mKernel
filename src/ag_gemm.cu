@@ -168,12 +168,11 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 // cheap correctness safeguard and matches how plane-0 flags on
                 // col=0 already ratchet visibility for later cols.
                 //
-                // #1 streaming: inter-comm pushes per-chunk WRs striped across
-                // 4 QPs. Cross-QP arrival is unordered so poll every chunk flag
-                // in each inter rb. Under the non-streaming path one big WR per
-                // rb sets the first_chunk flag only, so poll just first_chunk.
-                // One intra tile is 256 rows, but RDMA arrivals are tracked in
-                // 128-row blocks, so wait for the lower and upper halves.
+                // Inter-comm pushes per-chunk WRs striped across 4 QPs.
+                // Cross-QP arrival is unordered so poll every chunk flag in
+                // each inter rb. One intra tile is 256 rows but RDMA
+                // arrivals are tracked in 128-row blocks — wait for both
+                // halves.
                 const int first_chunk_a = (2 * global_row_idx)     * chunks_per_inter_rb;
                 const int first_chunk_b = (2 * global_row_idx + 1) * chunks_per_inter_rb;
                 ag_gemm_wait_arrival_slot(G, virt_arrival_slot, first_chunk_a);
@@ -369,21 +368,18 @@ __device__ inline void fused_comp_sm(const globals& G) {
 
                 if (!is_remote) {
                     row_idx = rb;
-                    // Plan federated-weaving-ocean #4: the fine per-(row,col)
-                    // wait moves INSIDE the red_idx loop below (keyed on
-                    // red_idx/2 since 1 intra col_chunk = 2 compute K-strips).
-                    // No coarse per-row wait here for local tiles.
+                    // Local tiles: the fine per-(row,col) wait moves inside
+                    // the red_idx loop below (keyed on red_idx/2 since one
+                    // intra col_chunk = 2 compute K-strips).
                 } else {
                     recv_peer_slot = internode::slot_at_peer(
                         shard_rank, G.node_idx, G.num_nodes);
                     row_idx = recv_peer_slot * node_row_blocks + rb;
 
-                    // Plan federated-weaving-ocean #8: remote data is now
-                    // landed in recv_buf (sharded, rank-local) AND republished
-                    // via phase-2 intra-AG into G.A_recv. Comp reads from the
-                    // multicast-backed G.A_recv and waits on plane 2, which
-                    // signals once phase-2 has stored the row's tiles.
-                    //
+                    // Remote tiles land in recv_buf via RDMA, then phase-2
+                    // intra-AG republishes them into G.A_recv. Comp reads
+                    // from the multicast-backed G.A_recv and waits on
+                    // plane 2 once phase-2 has stored the row's tiles.
                     if (G.remote_ready_per_col == 0) {
                         // Plane 2 default is per-row count=col_blocks from all
                         // phase-2 workers for this intra row.
@@ -398,8 +394,9 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
 
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
-                    // #4: per-K-strip wait on plane 0. Each intra col_chunk
-                    // covers 2 compute K-strips, so wait when crossing boundary.
+                    // Per-K-strip wait on plane 0. Each intra col_chunk
+                    // covers 2 compute K-strips, so wait when crossing the
+                    // boundary.
                     if (!is_remote && (red_idx & 1) == 0) {
                         wait(G.barrier, {0, row_idx / 2, red_idx / 2},
                              G.dev_idx, 1);
@@ -415,9 +412,9 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     #pragma unroll
                     for (int i = 0; i < 2; i++) {
                         if (is_remote) {
-                            // #8: remote tiles live in the multicast-backed
-                            // A_recv dbuf after phase-2. Read from this rank's
-                            // unicast view (G.A_recv[dev_idx]).
+                            // Remote tiles live in the multicast-backed
+                            // A_recv dbuf after phase-2. Read from this
+                            // rank's unicast view (G.A_recv[dev_idx]).
                             tma::load_async(inputs[stage].A[i], G.A_recv[G.dev_idx],
                                             {(recv_peer_slot * node_row_blocks + shard_rb) * 2 + i, red_idx}, inputs_arrived[stage]);
                         } else {
@@ -541,11 +538,10 @@ __device__ inline void fused_kernel(const globals& G) {
 }
 
 __device__ inline void barrier_reset(const globals& G) {
-    // Plan federated-weaving-ocean #4 + #8: barrier uses two active planes.
-    //   plane 0: [row_blocks, col_blocks] per-(row,col), count=1
-    //   plane 2 default: [row_blocks,          1] per-row,       count=num_cols
-    //   plane 2 experiment: [row_blocks, num_cols] per-(row,col), count=1
-    // Reset used planes.
+    // Barrier uses two active planes:
+    //   plane 0:            [row_blocks, col_blocks] per-(row,col), count=1
+    //   plane 2 default:    [row_blocks,          1] per-row,       count=num_cols
+    //   plane 2 experiment: [row_blocks,  num_cols] per-(row,col),  count=1
     const int num_rows = G.A.rows() / (globals::ROW_BLOCK * 2);
     const int num_cols = G.A.cols() / (globals::RED_BLOCK * 2);
     const int total_p0 = num_rows * num_cols;
