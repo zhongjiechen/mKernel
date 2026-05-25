@@ -561,28 +561,27 @@ __device__ inline void kv_send_sm(const kv_exchange_globals &G) {
     }
 }
 
-__device__ inline void kv_copy_sm(const kv_exchange_globals &G) {
-    // Wait for arrival, then D2D copy from K_recv/V_recv to K0/V0 local slots.
+__device__ inline void kv_copy_sm(const kv_exchange_globals &G, int peer_slot) {
+    // Wait for the requested peer slot's KV to arrive, then D2D copy from
+    // recv_buf[peer_slot * single_peer_bytes ..] into this rank's K0/V0.
     int copy_id = blockIdx.x - G.num_send_sms;
     int total_chunks = G.total_chunks_K + G.total_chunks_V;
 
-    // Multi-peer: arrival_flags is laid out [peer_slot * total_chunks + chunk_id].
-    // For each chunk, wait for all (N-1) peers' KV writes. At N == 2 the loop
-    // runs once with slot == 0.
-    const int n_peers = G.num_nodes - 1;
+    // arrival_flags is laid out [peer_slot * total_chunks + chunk_id].
     const int single_peer_chunks = total_chunks;
+    const int single_peer_bytes = G.K_bytes + G.V_bytes;
+    bf16 *K_src_base = G.recv_buf_base + (peer_slot * single_peer_bytes) / 2;
+    bf16 *V_src_base = K_src_base + G.K_bytes / 2;
+
     for (int chunk_id = copy_id; chunk_id < total_chunks; chunk_id += G.num_copy_sms) {
-        // Wait for this chunk's arrival from every peer slot.
         if (threadIdx.x == 0) {
-            for (int slot = 0; slot < n_peers; ++slot) {
-                const int flag_idx = slot * single_peer_chunks + chunk_id;
-                uint32_t v;
-                do {
-                    v = comm::atomic_u32::volatile_load(&G.arrival_flags[flag_idx]);
-                    if (v == G.epoch) break;
-                    __nanosleep(100);
-                } while (true);
-            }
+            const int flag_idx = peer_slot * single_peer_chunks + chunk_id;
+            uint32_t v;
+            do {
+                v = comm::atomic_u32::volatile_load(&G.arrival_flags[flag_idx]);
+                if (v == G.epoch) break;
+                __nanosleep(100);
+            } while (true);
         }
         __syncthreads();
         __threadfence_system();
@@ -594,13 +593,13 @@ __device__ inline void kv_copy_sm(const kv_exchange_globals &G) {
         if (!is_v) {
             off = (uint32_t)(chunk_id * CHUNK_BYTES);
             bytes = min(CHUNK_BYTES, G.K_bytes - (int)off);
-            src = G.K_recv + off / 2;
+            src = K_src_base + off / 2;
             dst = G.K0_local + off / 2;
         } else {
             int v_chunk = chunk_id - G.total_chunks_K;
             off = (uint32_t)(v_chunk * CHUNK_BYTES);
             bytes = min(CHUNK_BYTES, G.V_bytes - (int)off);
-            src = G.V_recv + off / 2;
+            src = V_src_base + off / 2;
             dst = G.V0_local + off / 2;
         }
 
@@ -632,7 +631,7 @@ __device__ inline void kv_copy_sm(const kv_exchange_globals &G) {
 // SKIP_REG_ALLOC=false lets ptxas split the register frame at the function
 // boundary the same way it does for the intranode kernel (STACK:0 / STACK:48).
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
-void zm_attn_comm_partial_stage_kernel(
+void attn_comm_partial_stage_kernel(
     const __grid_constant__ globals G,
     const int stage
 ) {
@@ -645,7 +644,7 @@ void zm_attn_comm_partial_stage_kernel(
 
 // Launch grid: num_reduction_blks. One CTA per reduction block.
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
-void zm_attn_reduction_stage_kernel(
+void attn_reduction_stage_kernel(
     const __grid_constant__ globals G
 ) {
     attn_reduction<false>(G, blockIdx.x);
@@ -654,7 +653,7 @@ void zm_attn_reduction_stage_kernel(
 // Send-only: posts RDMA WRs for local K0/V0 → peer node. Non-blocking; kernel
 // returns once WRs are queued. Used as prologue so RDMA overlaps with stages 0-7.
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
-void zm_kv_send_kernel(
+void kv_send_kernel(
     const __grid_constant__ kv_exchange_globals KE
 ) {
     if ((int)blockIdx.x < KE.num_send_sms) {
@@ -666,17 +665,18 @@ void zm_kv_send_kernel(
 // kv_copy_sm internally indexes by (blockIdx.x - num_send_sms), so launch
 // num_send + num_copy CTAs and gate the active range to keep the indexing.
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
-void zm_kv_copy_kernel(
-    const __grid_constant__ kv_exchange_globals KE
+void kv_copy_kernel(
+    const __grid_constant__ kv_exchange_globals KE,
+    const int peer_slot
 ) {
     if ((int)blockIdx.x >= KE.num_send_sms &&
         (int)blockIdx.x < KE.num_send_sms + KE.num_copy_sms) {
-        kv_copy_sm(KE);
+        kv_copy_sm(KE, peer_slot);
     }
 }
 
 // Cross-GPU barrier only. One CTA, one thread does barrier_all.
-__global__ void zm_barrier_only_kernel(
+__global__ void barrier_only_kernel(
     const __grid_constant__ globals::barrier_distributed_tensor barrier,
     const int dev_idx
 ) {
