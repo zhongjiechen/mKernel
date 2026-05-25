@@ -359,8 +359,6 @@ def main():
         num_qps = max(1, int(mod.get_num_qps()))
         arrival_tails_ptr = mod.get_arrival_tails_ptr() if hasattr(mod, "get_arrival_tails_ptr") else 0
         barrier_device_ptr = mod.get_barrier_device_ptr() if hasattr(mod, "get_barrier_device_ptr") else 0
-        if NUM_NODES > 2:
-            barrier_device_ptr = 0
 
         logical_queues_per_qp = max(1, int(os.environ.get("GEMM_AR_LOGICAL_QUEUES_PER_QP", "1")))
         # Apply per-shape intra override (small-M shapes benefit from fewer
@@ -420,10 +418,6 @@ def main():
         if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1":
             steady_state = False
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
-            steady_state = False
-        if NUM_NODES > 2 and os.environ.get("MKERNEL_ALLOW_NOSYNC_NGT2") != "1":
-            if steady_state and is_chief:
-                print("[gemm_ar] forcing legacy-sync timing for NUM_NODES > 2", flush=True)
             steady_state = False
 
         # Warmup. Under steady_state, only first iter does barrier/arrival reset.

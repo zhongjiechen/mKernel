@@ -341,9 +341,6 @@ struct fused_globals {
     int remote_queue_stride;
     int defer_final_multicast_finish;
     int work_steal_enabled;
-    int single_remote_peer;
-    int ring_experiment;
-    int ring_rs_experiment;
     int intra_ready_multimem;
     // When true, intra-AR xdev barrier waits use acquire loads instead of
     // relaxed loads. The branch is outside the spin body.
@@ -406,10 +403,15 @@ __device__ __forceinline__ internode::D2HFifoDevice gemm_ar_send_fifo_for_lane(
 }
 
 // Per-CTA TX path for gemm_ar. `send_id` selects this CTA's logical sender,
-// `target_rx_id` selects the remote logical queue. The current proxy backend
-// delegates to the FIFO push path.
+// `target_rx_id` selects the remote logical queue.
 //
-// `cmd` is the same TransferCmd the proxy backend reads.
+// FIFO routing splits by topology:
+//   N == 2: lane = target_rx_id (work-keyed; better load balancing across
+//           QPs when 8 devices share K logical queues).
+//   N >  2: lane = cmd.reserved0 = peer_slot * NUM_DEVICES + dev_idx
+//           (peer-coherent so the proxy batches never mix dst_ranks).
+// A/B tested in 5/2026 — unifying on reserved0 cost 2x at M=2048; on
+// target_rx_id the proxy can't batch at all at N>2.
 __device__ __forceinline__ void gemm_ar_post_send_cmd(
     const fused_globals& G,
     int send_id,
@@ -763,9 +765,7 @@ __device__ inline bool gemm_ar_drain_arrival_queue_publish_flags(
                 reinterpret_cast<unsigned int*>(G.remote_arrived_peer_mask + chunk_id),
                 peer_bit);
             const uint32_t new_mask = old_mask | peer_bit;
-            const int needed_peers =
-                (G.single_remote_peer != 0 || G.ring_experiment != 0 || G.ring_rs_experiment != 0)
-                    ? 1 : (G.num_nodes - 1);
+            const int needed_peers = G.num_nodes - 1;
             if (__popc(old_mask) < needed_peers && __popc(new_mask) >= needed_peers) {
                 atomicAdd(G.remote_arrived_chunks, 1u);
                 gemm_ar_release_store_u32(G.remote_arrived_flag + chunk_id, 1u);
@@ -893,9 +893,7 @@ __device__ inline uint4 gemm_ar_sum_local_and_remote_vec8(
     __nv_bfloat162 acc1 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.y);
     __nv_bfloat162 acc2 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.z);
     __nv_bfloat162 acc3 = *reinterpret_cast<const __nv_bfloat162*>(&local_vec.w);
-    const int n_peers =
-        (G.single_remote_peer != 0 || G.ring_experiment != 0 || G.ring_rs_experiment != 0)
-            ? 1 : (G.num_nodes - 1);
+    const int n_peers = G.num_nodes - 1;
     for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
         const bf16* recv = G.C_recv
             + ((long)peer_slot * G.total_tiles_per_device + tile_id)
@@ -1645,9 +1643,6 @@ __host__ inline fused_globals gemm_ar_make_globals(
         .remote_queue_stride = scratch.remote_queue_stride,
         .defer_final_multicast_finish = 0,
         .work_steal_enabled = 0,
-        .single_remote_peer = 0,
-        .ring_experiment = 0,
-        .ring_rs_experiment = 0,
         .intra_ready_multimem = 0,
         .total_chunks = scratch.total_chunks,
         .total_tiles_per_device = scratch.slice_tiles,
@@ -1669,18 +1664,6 @@ __host__ inline fused_globals gemm_ar_make_globals(
         reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.comp_chunk_tiles_done_offset;
     G.intra_chunk_tiles_done =
         reinterpret_cast<uint32_t*>(ar_done_ptr) + scratch.intra_chunk_tiles_done_offset;
-    if (const char* env_single_peer = std::getenv("GEMM_AR_SINGLE_REMOTE_PEER")) {
-        G.single_remote_peer =
-            (env_single_peer[0] != '\0' && env_single_peer[0] != '0') ? 1 : 0;
-    }
-    if (const char* env_ring = std::getenv("GEMM_AR_RING_EXPERIMENT")) {
-        G.ring_experiment =
-            (env_ring[0] != '\0' && env_ring[0] != '0' && remote_accum_ptr != 0) ? 1 : 0;
-    }
-    if (const char* env_ring_rs = std::getenv("GEMM_AR_RING_RS_EXPERIMENT")) {
-        G.ring_rs_experiment =
-            (env_ring_rs[0] != '\0' && env_ring_rs[0] != '0' && remote_accum_ptr != 0) ? 1 : 0;
-    }
     if (const char* env_multimem = std::getenv("GEMM_AR_INTRA_READY_MULTIMEM")) {
         G.intra_ready_multimem =
             (env_multimem[0] != '\0' && env_multimem[0] != '0') ? 1 : 0;

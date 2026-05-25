@@ -46,7 +46,11 @@ TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; 
 
 # === Common compile flags ===
 ARCH            := -gencode arch=compute_90a,code=sm_90a
-COMMON_DEFINES  := -DKITTENS_HOPPER -DINTRA_NUM_DEVICES=8 $(BACKEND_DEFINES)
+# INTRA_NUM_DEVICES = GPUs per logical node (multicast group size). Default 8
+# matches the production 2-node × 8-GPU layout. Override to test emulated
+# multinode (e.g. `make INTRA_NUM_DEVICES=4 all` for 4 GPUs / "node").
+INTRA_NUM_DEVICES ?= 8
+COMMON_DEFINES  := -DKITTENS_HOPPER -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES)
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH)
 LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
@@ -96,7 +100,14 @@ bench: all
 check: all
 	cd bench && bash run.sh all check
 
+# Host-only unit test for internode slot math (peer_rank_for_slot,
+# slot_at_peer, ring origin). Pins down the N>2 invariants without needing
+# real multi-node hardware.
+test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
+	g++ -std=c++17 -O2 -I include -D__host__= -D__device__= $< -o $(BUILD)/test_internode_slot_math
+	$(BUILD)/test_internode_slot_math
+
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all clean bench check plots
+.PHONY: all clean bench check test-slot-math plots

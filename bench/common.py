@@ -48,26 +48,22 @@ def get_peer_ips(node_idx: int, num_nodes: int) -> list[str]:
 def get_peer_ports(node_idx: int, num_nodes: int, base_port: int) -> list[int]:
     """Compute symmetric per-pair TCP ports (length num_nodes - 1) for this node.
 
-    For N == 2 returns [base_port], a single shared port per pair.
-
-    For N > 2 peers follow internode::peer_rank_for_slot() ring order. Each
-    unordered (lo, hi) rank pair gets a unique port computed as
-    `base_port + (lo * num_nodes + hi) * local_world_size`, so both sides of a
-    pair derive the same port from `(min(self, peer), max(self, peer))`.
+    Peers follow internode::peer_rank_for_slot() ring order. Each unordered
+    (lo, hi) rank pair gets a unique port computed as
+    `base_port + (lo * num_nodes + hi) * local_world_size`, so both sides of
+    a pair derive the same port from `(min(self, peer), max(self, peer))`.
+    At N==2 the loop has one slot and produces `base_port + local_world_size`.
 
     `base_port` is already per-local-rank (`TCP_PORT + LOCAL_RANK`) in the
     bench scripts. Striding pair offsets by local_world_size prevents adjacent
     local ranks on the same host from colliding on the same listen port.
     """
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "8"))
     ports = []
     for slot in range(num_nodes - 1):
         i = (node_idx + 1 + slot) % num_nodes
-        if num_nodes == 2:
-            ports.append(base_port)
-        else:
-            lo, hi = (node_idx, i) if node_idx < i else (i, node_idx)
-            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "8"))
-            ports.append(base_port + (lo * num_nodes + hi) * local_world_size)
+        lo, hi = (node_idx, i) if node_idx < i else (i, node_idx)
+        ports.append(base_port + (lo * num_nodes + hi) * local_world_size)
     return ports
 
 

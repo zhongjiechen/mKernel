@@ -130,11 +130,9 @@ struct globals {
     // Total node count (>= 2). For N > 2, recv/A_recv are laid out as
     // (num_nodes - 1) peer slots in local peer-slot order.
     const int num_nodes;
-    // 0 = direct fanout, 1 = next-hop ring all-gather.
-    const int collective_mode;
-    // Ring mode stages each hop in a separate recv/arrival bank so a forward
-    // cannot RDMA-overwrite a slot another GPU is still TMA-reading (intra-node
-    // sync does not order remote sends). Banks = (num_nodes-1); direct uses 1.
+    // Each hop in the ring uses a separate recv/arrival bank so a forward
+    // cannot RDMA-overwrite a slot another GPU is still TMA-reading (intra-
+    // node sync does not order remote sends). Banks = num_nodes - 1.
     const int ring_recv_banks;
     const int debug_skip_remote_compute;
     const int debug_skip_phase1;
@@ -144,7 +142,6 @@ struct globals {
     const int debug_skip_reset;
     const int ring_proxy_forward;
     const int remote_ready_per_col;
-    const int tiled_direct;
     const int num_intra_comm;  // CTAs for intra-node IPC gather + RDMA push
     const int num_comp_sms;    // CTAs for GEMM compute
 
@@ -268,16 +265,13 @@ __device__ inline void post_merge_wrs_for_intra_row(
         int chunks_per_sub = chunks_per_rb / split;
         uint32_t bytes_per_sub = (uint32_t)(chunks_per_sub * CHUNK_BYTES);
 
-        const int n_peers = G.num_nodes - 1;
         // Per-peer recv_buf / arrival-flag layout: peer p's data lands at
         //   recv_buf  + slot_at_peer * G.a_half_bytes
         //   arrival   + slot_at_peer * G.total_chunks
-        // For N == 2, slot_at_peer is always 0, so this is bit-identical to
-        // the legacy path. For N > 2, every peer receives a private slot.
         if (split == 1) {
-            // Fast-path unchanged behavior: single WR per rb, keyed by rb.
-            const int send_peer_count = (G.collective_mode == 1) ? 1 : n_peers;
-            for (int peer_slot = 0; peer_slot < send_peer_count; ++peer_slot) {
+            // Fast-path: single WR per rb, keyed by rb. Ring sends to one
+            // next-hop peer per step (n_peers steps over the kernel's life).
+            for (int peer_slot = 0; peer_slot < 1; ++peer_slot) {
                 const int peer_rank = internode::peer_rank_for_slot(
                     G.node_idx, G.num_nodes, peer_slot);
                 const int sap = internode::slot_at_peer(G.node_idx, peer_rank, G.num_nodes);
@@ -303,8 +297,7 @@ __device__ inline void post_merge_wrs_for_intra_row(
                 uint32_t sub_end = sub_base + bytes_per_sub;
                 if (sw == split - 1 && sub_end > end_offset) sub_end = end_offset;
                 uint32_t sub_bytes = sub_end - sub_base;
-                const int send_peer_count = (G.collective_mode == 1) ? 1 : n_peers;
-                for (int peer_slot = 0; peer_slot < send_peer_count; ++peer_slot) {
+                for (int peer_slot = 0; peer_slot < 1; ++peer_slot) {
                     const int peer_rank = internode::peer_rank_for_slot(
                         G.node_idx, G.num_nodes, peer_slot);
                     const int sap = internode::slot_at_peer(G.node_idx, peer_rank, G.num_nodes);
@@ -323,57 +316,6 @@ __device__ inline void post_merge_wrs_for_intra_row(
                             G.d2h_fifos, (uint32_t)cmd.lane_id);
                     fifo.push(cmd);
                 }
-            }
-        }
-    }
-}
-
-// Direct-send layout for the two 128x128 K-slice halves consumed by one
-// phase-2 remote_publish tile. The proxy gathers strided rows from A and writes
-// adjacent packed half-tiles into recv_buf, so two arrival flags unlock one
-// 256x128 multicast publish tile.
-__device__ inline void post_tiled_direct_wrs_for_intra_row(
-    const globals& G, int global_row_idx) {
-    const int col_blocks = G.A_local.cols() / (globals::RED_BLOCK * 2);
-    const int n_peers = G.num_nodes - 1;
-    constexpr int half_tile_rows = globals::ROW_BLOCK;
-    constexpr int tile_cols = globals::RED_BLOCK * 2;
-    constexpr int half_tile_bytes =
-        half_tile_rows * tile_cols * (int)sizeof(bf16);
-    for (int col_idx = 0; col_idx < col_blocks; ++col_idx) {
-        for (int half = 0; half < 2; ++half) {
-            const int rb = 2 * global_row_idx + half;
-            const uint32_t local_offset =
-                (uint32_t)(((uint64_t)rb * half_tile_rows *
-                            (uint64_t)G.A_local.cols() +
-                            (uint64_t)col_idx * tile_cols) *
-                           (uint64_t)sizeof(bf16));
-            const uint32_t tile_idx =
-                (uint32_t)((global_row_idx * col_blocks + col_idx) * 2 + half);
-            for (int peer_slot = 0; peer_slot < n_peers; ++peer_slot) {
-                const int peer_rank = internode::peer_rank_for_slot(
-                    G.node_idx, G.num_nodes, peer_slot);
-                const int sap = internode::slot_at_peer(
-                    G.node_idx, peer_rank, G.num_nodes);
-                internode::TransferCmd cmd{};
-                cmd.cmd_type = internode::CmdType::WRITE;
-                cmd.dst_rank = (uint8_t)peer_rank;
-                cmd.tile_id = (uint16_t)(sap * G.total_chunks + tile_idx);
-                cmd.bytes = half_tile_bytes;
-                cmd.local_offset = local_offset;
-                cmd.remote_offset =
-                    (uint32_t)(sap * G.total_chunks + tile_idx) *
-                    (uint32_t)half_tile_bytes;
-                cmd.src_view = 2;
-                cmd.lane_id = (uint16_t)tile_idx;
-                cmd.reserved0 =
-                    (uint8_t)(peer_slot * globals::NUM_DEVICES + G.dev_idx);
-                cmd.row_span = tile_cols * (uint16_t)sizeof(bf16);
-                cmd.row_count = half_tile_rows;
-                internode::D2HFifoDevice fifo =
-                    internode::gemm_ar_select_fifo_for_lane(
-                        G.d2h_fifos, (uint32_t)cmd.lane_id);
-                fifo.push(cmd);
             }
         }
     }
@@ -679,20 +621,11 @@ void entrypoint(
 
     uint64_t a_half_bytes_u64 = (uint64_t)a_half_bytes;
     int total_chunks = (int)((a_half_bytes_u64 + CHUNK_BYTES - 1) / CHUNK_BYTES);
-    const bool tiled_direct_host =
-        std::getenv("AG_GEMM_TILED_DIRECT") != nullptr &&
-        std::getenv("AG_GEMM_TILED_DIRECT")[0] == '1';
-    if (tiled_direct_host) {
-        total_chunks *= 2;
-    }
 
     // Split CTAs between intra-comm and compute. Intra-gather CTAs also post
     // zero-copy inter-node RDMA WRs, so there is no separate inter-comm pool.
     int adaptive_comm_sms = num_comm_sms;
-    const char* perf_preset = std::getenv("AG_GEMM_PERF_PRESET");
-    const bool perf_legacy =
-        perf_preset != nullptr && std::strcmp(perf_preset, "legacy") == 0;
-    int adaptive_cap_large_m = perf_legacy ? 8 : 16;
+    int adaptive_cap_large_m = 16;
     if (const char* e = std::getenv("AG_GEMM_ADAPTIVE_CAP_LARGE_M")) {
         adaptive_cap_large_m = std::max(1, std::atoi(e));
     }
@@ -729,40 +662,11 @@ void entrypoint(
     auto fifo_bundle = internode::resolve_fifo_bundle(
         fifo_triggers, fifo_head, fifo_tail, fifo_tail_cache, fifo_capacity,
         16, logical_lq);
-    // Internode AG pattern: ring when num_nodes > 2 unless overridden.
-    //   unset / "auto"  → ring if num_nodes > 2 else direct (2-node)
-    //   "ring" / "direct" → force that mode
-    int collective_mode = 0;
-    const char* ic = std::getenv("AG_GEMM_INTERNODE_COLLECTIVE");
-    if (ic != nullptr && ic[0] != '\0') {
-        if (std::strcmp(ic, "ring") == 0) {
-            collective_mode = 1;
-        } else if (std::strcmp(ic, "direct") == 0) {
-            collective_mode = 0;
-        } else if (std::strcmp(ic, "auto") == 0) {
-            collective_mode = (num_nodes > 2) ? 1 : 0;
-        } else {
-            collective_mode = (num_nodes > 2) ? 1 : 0;
-        }
-    } else {
-        collective_mode = (num_nodes > 2) ? 1 : 0;
-    }
-    if (perf_legacy) {
-        collective_mode = 0;
-    }
-    int ring_recv_banks = 1;
-    if (collective_mode == 1) {
-        ring_recv_banks = std::max(1, num_nodes - 1);
-    }
-    const bool tiled_direct =
-        collective_mode == 0 &&
-        tiled_direct_host;
-    const int recv_tensor_rows = tiled_direct
-        ? (num_nodes - 1) * total_chunks * globals::ROW_BLOCK
-        : M_node * (num_nodes - 1) * ring_recv_banks;
-    const int recv_tensor_cols = tiled_direct
-        ? (globals::RED_BLOCK * 2)
-        : K;
+    // Ring all-gather: n_peers hops, each into its own recv bank so a
+    // forward never overwrites a slot another GPU is still TMA-reading.
+    const int ring_recv_banks = std::max(1, num_nodes - 1);
+    const int recv_tensor_rows = M_node * (num_nodes - 1) * ring_recv_banks;
+    const int recv_tensor_cols = K;
     auto A_recv_local_tensor = ::dist::make_local_tensor<globals::A_local_tensor>(
         (uint64_t)recv_buf_ptr, 1, 1,
         recv_tensor_rows, recv_tensor_cols);
@@ -784,7 +688,6 @@ void entrypoint(
         .dev_idx = dev_idx,
         .node_idx = node_idx,
         .num_nodes = num_nodes,
-        .collective_mode = collective_mode,
         .ring_recv_banks = ring_recv_banks,
         .debug_skip_remote_compute =
             (std::getenv("AG_GEMM_SKIP_REMOTE_COMPUTE") != nullptr &&
@@ -810,7 +713,6 @@ void entrypoint(
         .remote_ready_per_col =
             (std::getenv("AG_GEMM_REMOTE_READY_PER_COL") != nullptr &&
              std::getenv("AG_GEMM_REMOTE_READY_PER_COL")[0] == '1') ? 1 : 0,
-        .tiled_direct = tiled_direct ? 1 : 0,
         .num_intra_comm = num_intra_comm,
         .num_comp_sms = num_comp_sms,
     };

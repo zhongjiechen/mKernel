@@ -216,8 +216,6 @@ def main():
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
             legacy_sync = True
-        if NUM_NODES > 2:
-            legacy_sync = True
         if not legacy_sync:
             # Pick N so total ≥ ~100 ms at smaller shapes but bounded ≤ ~2s at
             # the largest. For ring_attn, expected per-iter ms ≈ shape-dependent

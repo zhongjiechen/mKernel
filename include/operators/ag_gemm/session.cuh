@@ -35,9 +35,6 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     internode::py::apply_peer_ips(
         cfg, peer_ips, peer_tcp_ports, tcp_port,
         g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
-    const char* perf_preset = std::getenv("AG_GEMM_PERF_PRESET");
-    const bool perf_legacy =
-        perf_preset != nullptr && std::strcmp(perf_preset, "legacy") == 0;
     cfg.max_inflight = 256;
     if (const char* e = std::getenv("MKERNEL_MAX_INFLIGHT")) {
         int v = std::atoi(e);
@@ -46,25 +43,18 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
         }
     }
     if (clocal_buf_ptr == 0 || clocal_buf_size == 0) {
-        fprintf(stderr, "create_session_py: AG1 direct sends require clocal_buf_ptr/size\n");
+        fprintf(stderr, "create_session_py: AG1 direct-from-A sends require clocal_buf_ptr/size\n");
         std::exit(EXIT_FAILURE);
     }
     cfg.clocal_gpu_buf = reinterpret_cast<void*>(clocal_buf_ptr);
     cfg.clocal_gpu_buf_size = (size_t)clocal_buf_size;
     cfg.direct_dmabuf_enabled = true;
     cfg.row_stride_bytes = 0;
-    if (const char* env_stride = std::getenv("AG_GEMM_ROW_STRIDE_BYTES")) {
-        long long stride = std::atoll(env_stride);
-        if (stride > 0) {
-            cfg.row_stride_bytes = (size_t)stride;
-        }
-    }
     // Ring AG forwards received shards from the same A_recv buffer that is
     // used as the RDMA landing zone. Keeping receive and forward source in
     // one registered MR avoids a session-private recv buffer -> multicast
-    // buffer handoff on the ring critical path. Direct fanout still uses the
-    // session-owned receive buffer because its send buffer is the local A.
-    if (peer_ips.size() > 1 && send_buf_size == recv_buf_size) {
+    // buffer handoff on the ring critical path.
+    if (send_buf_size == recv_buf_size) {
         cfg.external_recv_buf = reinterpret_cast<void*>(send_buf_ptr);
     }
     // Early-send posts per-row WRs in a burst, so use multiple QPs by default.
@@ -87,9 +77,8 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
         cfg.logical_queues_per_qp = std::max(1, std::atoi(env_logical));
     } else if (const char* env_logical = std::getenv("AG_GEMM_LOGICAL_QUEUES_PER_QP")) {
         cfg.logical_queues_per_qp = std::max(1, std::atoi(env_logical));
-    } else if (!perf_legacy && cfg.num_peers > 1) {
-        // gemm_ar-style software striping on arrivals (see GEMM_AR_LOGICAL_QUEUES_PER_QP);
-        // opt out with MKERNEL_INTERNODE_LOGICAL_QUEUES_PER_QP=1 or legacy preset.
+    } else if (cfg.num_peers > 1) {
+        // Software striping on arrivals at N>2 (see GEMM_AR_LOGICAL_QUEUES_PER_QP).
         cfg.logical_queues_per_qp = 2;
     }
     cfg.num_proxy_threads = 1;
@@ -98,10 +87,9 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     } else if (const char* env_proxy = std::getenv("AG_GEMM_PROXY_THREADS")) {
         cfg.num_proxy_threads = std::atoi(env_proxy);
     }
-    // Throughput-oriented defaults for true multi-node (N>2 peers): more QPs +
-    // more D2H FIFO / proxy threads reduce host-side serialization. Opt out
-    // with AG_GEMM_PERF_PRESET=legacy (2-node regression / A/B parity).
-    if (!perf_legacy && cfg.num_peers > 1) {
+    // Throughput-oriented defaults for true multi-node (N>2 peers): more QPs
+    // + more D2H FIFO / proxy threads reduce host-side serialization.
+    if (cfg.num_peers > 1) {
         if (std::getenv("MKERNEL_EFA_NUM_QPS") == nullptr &&
             std::getenv("MKERNEL_INTERNODE_NUM_QPS") == nullptr &&
             std::getenv("MKERNEL_IB_NUM_QPS") == nullptr) {

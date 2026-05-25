@@ -260,17 +260,19 @@ def main():
 
         use_acquire_poll, reduce_poll_sleep_ns = poll_tuning(m)
 
+        use_prepare_epoch = hasattr(mod, "prepare_epoch")
+
         def reset_state():
             workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
             barrier.data_.zero_(); ready_chunk.data_.zero_()
             staging_dbuf.data_.zero_()
-            if NUM_NODES > 2 and hasattr(mod, "zero_recv_buf"):
+            if hasattr(mod, "zero_recv_buf"):
                 mod.zero_recv_buf()
 
         def advance_epoch(next_epoch: int):
             # Queue-mode arrivals carry packed work, not an epoch value. Keep
             # all nodes quiesced before any rank clears arrival slots.
-            if NUM_NODES > 2 and hasattr(mod, "prepare_epoch"):
+            if use_prepare_epoch:
                 mod.prepare_epoch()
                 dist.barrier()
                 mod.commit_epoch(next_epoch)
@@ -292,7 +294,7 @@ def main():
 
         def start_iter():
             nonlocal epoch
-            if NUM_NODES > 2 and hasattr(mod, "prepare_epoch"):
+            if use_prepare_epoch:
                 epoch += 1
                 advance_epoch(epoch)
                 reset_state()
@@ -314,10 +316,6 @@ def main():
         # MKERNEL_BENCH_NO_SYNC=0) to opt back into per-iter sync.
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
-            legacy_sync = True
-        if NUM_NODES > 2 and os.environ.get("MKERNEL_ALLOW_NOSYNC_NGT2") != "1":
-            if not legacy_sync and is_chief:
-                print("[gemm_rs] forcing legacy-sync timing for NUM_NODES > 2", flush=True)
             legacy_sync = True
         if not legacy_sync:
             # No-sync (steady-state): per-iter reset_state + epoch bump (which

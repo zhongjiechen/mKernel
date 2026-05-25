@@ -133,20 +133,14 @@ __device__ inline void intra_comm_sm(const globals& G) {
     const int ring_steps = n_peers;
     const int rows_per_peer_slot = global_row_blocks;
 
-    // Drain every recv_buf peer slot. Ring uses ring_step as hop order
-    // (origin = node - 1 - step); direct uses ring_step as peer_slot
-    // (phase-0 already sent to all peers).
+    // Drain every recv_buf peer slot. ring_step is the hop order
+    // (origin = node - 1 - step).
     for (int ring_step = 0; ring_step < ring_steps; ++ring_step) {
-        const int peer_slot = (G.collective_mode == 1)
-            ? internode::slot_at_peer(
-                ag_gemm_ring_origin_for_step(G.node_idx, G.num_nodes, ring_step),
-                G.node_idx, G.num_nodes)
-            : ring_step;
-        const int origin_rank = (G.collective_mode == 1)
-            ? ag_gemm_ring_origin_for_step(G.node_idx, G.num_nodes, ring_step)
-            : internode::peer_rank_for_slot(G.node_idx, G.num_nodes, peer_slot);
-        const int virt_arrival_slot =
-            (G.collective_mode == 1) ? (peer_slot + n_peers * ring_step) : peer_slot;
+        const int origin_rank =
+            ag_gemm_ring_origin_for_step(G.node_idx, G.num_nodes, ring_step);
+        const int peer_slot =
+            internode::slot_at_peer(origin_rank, G.node_idx, G.num_nodes);
+        const int virt_arrival_slot = peer_slot + n_peers * ring_step;
 
         if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
             for (int task_id = comm_sm_id * globals::NUM_COMM_CHUNKS + warp_id;
@@ -160,11 +154,7 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 const int slot_row_store =
                     peer_slot * rows_per_peer_slot + global_row_idx;
                 const int slot_row_load = slot_row_store +
-                    (G.collective_mode == 1 ? ring_step * (n_peers * rows_per_peer_slot) : 0);
-                const int tiled_tile_idx =
-                    (global_row_idx * col_blocks + col_idx) * 2;
-                const int tiled_recv_row =
-                    (peer_slot * G.total_chunks + tiled_tile_idx) / 2;
+                    ring_step * (n_peers * rows_per_peer_slot);
 
                 // Wait for the 2 underlying 128-row inter WRs that together fill
                 // this 256-row intra_rb. post_merge_wrs_for_intra_row posts in
@@ -184,35 +174,15 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 // rb sets the first_chunk flag only, so poll just first_chunk.
                 // One intra tile is 256 rows, but RDMA arrivals are tracked in
                 // 128-row blocks, so wait for the lower and upper halves.
-                if (G.tiled_direct != 0) {
-                    ag_gemm_wait_arrival_slot(G, virt_arrival_slot,
-                                              tiled_tile_idx);
-                    ag_gemm_wait_arrival_slot(G, virt_arrival_slot,
-                                              tiled_tile_idx + 1);
-                } else {
-                    const int first_chunk_a = (2 * global_row_idx)     * chunks_per_inter_rb;
-                    const int first_chunk_b = (2 * global_row_idx + 1) * chunks_per_inter_rb;
-                    // Poll the same sub-flags that the sender publishes for this
-                    // row block.
-                    const int wait_split = 1;
-                    const int wait_chunks_per_sub = chunks_per_inter_rb;
-                    for (int sw = 0; sw < wait_split; ++sw) {
-                        const int ck_a = first_chunk_a + sw * wait_chunks_per_sub;
-                        const int ck_b = first_chunk_b + sw * wait_chunks_per_sub;
-                        ag_gemm_wait_arrival_slot(G, virt_arrival_slot, ck_a);
-                        ag_gemm_wait_arrival_slot(G, virt_arrival_slot, ck_b);
-                    }
-                }
+                const int first_chunk_a = (2 * global_row_idx)     * chunks_per_inter_rb;
+                const int first_chunk_b = (2 * global_row_idx + 1) * chunks_per_inter_rb;
+                ag_gemm_wait_arrival_slot(G, virt_arrival_slot, first_chunk_a);
+                ag_gemm_wait_arrival_slot(G, virt_arrival_slot, first_chunk_b);
                 __threadfence_system();
 
                 tma::expect_bytes(inputs_arrived[warp_id], sizeof(globals::A_comm_tile));
-                if (G.tiled_direct != 0) {
-                    tma::load_async(A_smem[warp_id], G.A_recv_local_tensor,
-                                    {tiled_recv_row, 0}, inputs_arrived[warp_id]);
-                } else {
-                    tma::load_async(A_smem[warp_id], G.A_recv_local_tensor,
-                                    {slot_row_load, col_idx}, inputs_arrived[warp_id]);
-                }
+                tma::load_async(A_smem[warp_id], G.A_recv_local_tensor,
+                                {slot_row_load, col_idx}, inputs_arrived[warp_id]);
                 wait(inputs_arrived[warp_id], get_phasebit<0>(phasebits, warp_id));
                 update_phasebit<0>(phasebits, warp_id);
                 tma::store_async(G.A_recv, A_smem[warp_id], {slot_row_store, col_idx});
@@ -245,8 +215,7 @@ __device__ inline void intra_comm_sm(const globals& G) {
         // unrelated CTA still publishing row Y does not block forwarding row X.
 
         if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
-            if (G.collective_mode == 1 && G.ring_proxy_forward == 0 &&
-                ring_step + 1 < n_peers) {
+            if (G.ring_proxy_forward == 0 && ring_step + 1 < n_peers) {
                 const int intra_col_blocks =
                     G.A_recv.cols() / (globals::RED_BLOCK * 2);
                 for (int lr = comm_sm_id; lr < local_row_blocks;
@@ -638,12 +607,8 @@ __device__ inline void phase0_post_wrs(const globals& G) {
     if (warp_id == 0 && lane_id == 0) {
         for (int lr = comm_sm_id; lr < local_row_blocks; lr += G.num_intra_comm) {
             const int global_row_idx = lr + G.dev_idx * local_row_blocks;
-            if (G.tiled_direct != 0) {
-                post_tiled_direct_wrs_for_intra_row(G, global_row_idx);
-            } else {
-                post_merge_wrs_for_intra_row(
-                    G, global_row_idx, chunks_per_rb_for_merge);
-            }
+            post_merge_wrs_for_intra_row(
+                G, global_row_idx, chunks_per_rb_for_merge);
         }
     }
 }
@@ -702,20 +667,16 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
                                     dynamic_shared_memory, stream>>>(G);
         return;
     }
-    // Ring internode (collective_mode==1): post phase-0 merge WRs on the same
-    // stream as the fused kernel so the prologue kernel fully completes before
-    // intra_comm_sm begins. Side-stream overlap lets the main kernel start while
-    // prologue CTAs may still be pushing FIFO entries — fine for direct fanout
-    // but it can starve or reorder the ring merge vs phase-2 arrival waits.
-    // Opt back to side-stream overlap with AG_GEMM_PROLOGUE_SIDE_STREAM=1.
+    // Ring: post phase-0 merge WRs on the same stream as the fused kernel so
+    // the prologue fully completes before intra_comm_sm begins. Side-stream
+    // overlap would let the main kernel start while prologue CTAs are still
+    // pushing FIFO entries, which can starve or reorder the ring merge vs
+    // phase-2 arrival waits. Opt back to side-stream with
+    // AG_GEMM_PROLOGUE_SIDE_STREAM=1.
     const bool force_side_stream =
         std::getenv("AG_GEMM_PROLOGUE_SIDE_STREAM") != nullptr &&
         std::getenv("AG_GEMM_PROLOGUE_SIDE_STREAM")[0] == '1';
-    const bool prologue_main_stream =
-        !force_side_stream &&
-        (G.collective_mode == 1 ||
-         (std::getenv("AG_GEMM_PROLOGUE_MAIN_STREAM") != nullptr &&
-          std::getenv("AG_GEMM_PROLOGUE_MAIN_STREAM")[0] == '1'));
+    const bool prologue_main_stream = !force_side_stream;
     if (prologue_main_stream) {
         ag_gemm_phase0_prologue_kernel<<<prologue_blocks, WARP_THREADS, 0,
                                          stream>>>(G);

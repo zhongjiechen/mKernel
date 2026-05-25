@@ -318,50 +318,62 @@ public:
     }
 
     /**
-     * Post a 4-byte SRD send of `token` into the peer's stage-barrier slot.
+     * Post a 4-byte SRD send of `token` into every peer's stage-barrier slot.
      * Call while the proxy is paused (host thread owns the QP). Always issued
      * on local QP 0 / remote QP 0 for deterministic ordering with the peer.
      */
     void post_stage_barrier(int slot, uint32_t token) {
-        if (cfg_.remote_barrier_addr == 0 || cfg_.flag_staging == nullptr ||
+        if (cfg_.flag_staging == nullptr ||
             cfg_.flag_staging->mr == nullptr) {
-            fprintf(stderr, "proxy_efa: post_stage_barrier called without remote "
-                            "barrier or flag staging configured\n");
+            fprintf(stderr, "proxy_efa: post_stage_barrier called without flag "
+                            "staging configured\n");
             return;
         }
-        // Claim our own unique slot in the staging ring — mirrors the WRITE cmd
-        // path. Previously we unconditionally wrote to host_ptr[0], which raced
-        // with the first WRITE of each epoch (staging_cursor_ resets to 0 in
-        // set_epoch, so WRITE #1 also wrote to slot 0). The NIC DMAs SGEs
-        // asynchronously, so either side could see the other's bytes: either
-        // the barrier delivered a packed arrival payload, or — far more
-        // visibly at M=2048 — the WRITE delivered epoch=2 (0x00000002) into the
-        // arrival queue, which the kernel drained and interpreted as
-        // first_tile=1/num_tiles=1, never publishing real arrivals and hanging
-        // in shared_reduce_my_slice_static spin.
-        const uint32_t barrier_slot =
-            (staging_cursor_++) % (uint32_t)cfg_.flag_staging->count;
-        cfg_.flag_staging->host_ptr[barrier_slot] = token;
-        ibv_qp_ex* qpx = qpx_[0];
-        ibv_wr_start(qpx);
-        qpx->wr_id = 1;
-        qpx->comp_mask = 0;
-        qpx->wr_flags = IBV_SEND_SIGNALED;
-        ibv_wr_rdma_write(qpx,
-            cfg_.remote_barrier_rkey,
-            cfg_.remote_barrier_addr + (uint64_t)slot * sizeof(uint32_t));
-        ibv_wr_set_ud_addr(qpx, cfg_.dst_ah, cfg_.dst_qpns[0], rdma::QKEY);
-        ibv_wr_set_sge(qpx,
-            cfg_.flag_staging->mr->lkey,
-            (uint64_t)(cfg_.flag_staging->host_ptr + barrier_slot),
-            sizeof(uint32_t));
-        int ret = ibv_wr_complete(qpx);
-        if (ret != 0) {
-            fprintf(stderr, "proxy_efa: post_stage_barrier ibv_wr_complete failed: %s\n",
-                    strerror(ret));
-            return;
+        const int num_peers = (cfg_.num_peers > 0 && cfg_.per_peer != nullptr)
+            ? cfg_.num_peers
+            : 1;
+        for (int p = 0; p < num_peers; ++p) {
+            const PerPeerProxyData* eff =
+                (cfg_.per_peer != nullptr) ? &cfg_.per_peer[p] : nullptr;
+            const uint64_t peer_barrier_addr =
+                eff ? eff->remote_barrier_addr : cfg_.remote_barrier_addr;
+            const uint32_t peer_barrier_rkey =
+                eff ? eff->remote_barrier_rkey : cfg_.remote_barrier_rkey;
+            ibv_ah*        peer_ah   = eff ? eff->dst_ah      : cfg_.dst_ah;
+            const uint32_t peer_qpn0 = eff ? eff->dst_qpns[0] : cfg_.dst_qpns[0];
+            if (peer_barrier_addr == 0) {
+                fprintf(stderr,
+                        "proxy_efa: post_stage_barrier peer %d has no barrier "
+                        "address; skipping\n", p);
+                continue;
+            }
+            // Claim a unique slot in the staging ring per peer to avoid races
+            // with concurrent WRITE batches (which also draw from this ring).
+            const uint32_t barrier_slot =
+                (staging_cursor_++) % (uint32_t)cfg_.flag_staging->count;
+            cfg_.flag_staging->host_ptr[barrier_slot] = token;
+            ibv_qp_ex* qpx = qpx_[0];
+            ibv_wr_start(qpx);
+            qpx->wr_id = 1;
+            qpx->comp_mask = 0;
+            qpx->wr_flags = IBV_SEND_SIGNALED;
+            ibv_wr_rdma_write(qpx,
+                peer_barrier_rkey,
+                peer_barrier_addr + (uint64_t)slot * sizeof(uint32_t));
+            ibv_wr_set_ud_addr(qpx, peer_ah, peer_qpn0, rdma::QKEY);
+            ibv_wr_set_sge(qpx,
+                cfg_.flag_staging->mr->lkey,
+                (uint64_t)(cfg_.flag_staging->host_ptr + barrier_slot),
+                sizeof(uint32_t));
+            int ret = ibv_wr_complete(qpx);
+            if (ret != 0) {
+                fprintf(stderr, "proxy_efa: post_stage_barrier ibv_wr_complete "
+                                "failed for peer %d: %s\n",
+                                p, strerror(ret));
+                continue;
+            }
+            inflight_ += 1;
         }
-        inflight_ += 1;
     }
 
     /**
@@ -835,11 +847,16 @@ private:
                     if (count == 0) {
                         batch_qp = cmd_qp;
                         batch[count++] = cmd;
-                    } else if (cmd_qp == batch_qp) {
+                    } else if (cmd_qp == batch_qp
+                               // Also break on dst_rank changes so the
+                               // per-peer endpoint resolved from batch[0]
+                               // applies to every cmd in the batch.
+                               && cmd.dst_rank == batch[0].dst_rank) {
                         batch[count++] = cmd;
                     } else {
-                        // Different QP — stash and close this batch so we keep
-                        // the ibv_wr_start/_complete block single-QP.
+                        // Different QP (or different peer) — stash and close
+                        // this batch so the ibv_wr_start/_complete block
+                        // stays single-QP and single-peer.
                         pending_cmd_ = cmd;
                         has_pending_cmd_ = true;
                         break;
@@ -882,7 +899,10 @@ private:
                         if (cmd.cmd_type != CmdType::WRITE) continue;
                         const int cmd_qp = map_to_local_qp(cmd);
                         if (cmd_qp < 0) continue;
-                        if (cmd_qp != batch_qp) {
+                        // Same single-QP + single-peer invariant as the
+                        // seeding loop above.
+                        if (cmd_qp != batch_qp
+                            || cmd.dst_rank != batch[0].dst_rank) {
                             pending_cmd_ = cmd;
                             has_pending_cmd_ = true;
                             break;
@@ -915,22 +935,16 @@ private:
 
                 ibv_qp_ex* qpx = qpx_[batch_qp];
 
-                // Resolve the per-peer endpoint for this batch. Today's
-                // batch-fill loop only breaks on QP changes — for N>2
-                // we'd need to also break on cmd.dst_rank changes to keep
-                // batches single-peer. At N=2 every cmd.dst_rank is the
-                // same value (1 - node_idx), so single-peer-per-batch
-                // already holds. For num_peers <= 1 we use per_peer[0]
-                // unconditionally; per_peer[0] aliases the legacy fields
-                // at slot 0, so the fast path is byte-identical.
+                // Resolve the per-peer endpoint for this batch.
+                // peer_slot_by_rank is populated for every session — at N=2
+                // it maps the single peer rank to slot 0, so the lookup
+                // degenerates correctly.
                 int peer_slot = 0;
-                if (cfg_.num_peers > 1 && cfg_.peer_slot_by_rank != nullptr) {
+                if (cfg_.peer_slot_by_rank != nullptr) {
                     const uint8_t r = batch[0].dst_rank;
                     const int s = cfg_.peer_slot_by_rank[r];
                     if (s >= 0) peer_slot = s;
                 }
-                // Session always populates per_peer (slot 0 mirrors the
-                // legacy single-peer fields in the 2-node config).
                 const PerPeerProxyData& eff = cfg_.per_peer[peer_slot];
                 const uint32_t dst_qpn = eff.dst_qpns[batch_qp];
 

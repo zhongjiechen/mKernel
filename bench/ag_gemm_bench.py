@@ -120,11 +120,7 @@ def main():
     correctness_ok = True
 
     # Per-shape intra override that bypasses the max(4) floor in the kernel.
-    # With H200 direct mode, 16 intra-comm CTAs gave the best release timings for small/medium shapes;
-    # M=49152 stays on the adaptive/default split, which was slightly faster.
     INTRA_OVERRIDE = {}
-    if NUM_NODES == 4 and os.environ.get("AG_GEMM_INTERNODE_COLLECTIVE", "").strip().lower() == "direct":
-        INTRA_OVERRIDE.update({8192: 16, 16384: 16, 32768: 16})
     # Per-shape override format: AG_GEMM_INTRA_OVERRIDE_<M>=<intra>.
     # Applied after the conditional defaults so the env value always wins.
     for base_n in shapes:
@@ -152,25 +148,9 @@ def main():
         M_node = M // NUM_NODES
         M_local = M_node // world_size
         assert M % ROW_BLOCK == 0 and K % RED_BLOCK == 0 and N % COL_BLOCK == 0
-        tiled_direct_enabled = os.environ.get("AG_GEMM_TILED_DIRECT") == "1"
-        if tiled_direct_enabled:
-            os.environ["AG_GEMM_ROW_STRIDE_BYTES"] = str(K * 2)
-        else:
-            os.environ.pop("AG_GEMM_ROW_STRIDE_BYTES", None)
-
-        ic = os.environ.get("AG_GEMM_INTERNODE_COLLECTIVE", "").strip().lower()
-        if ic == "direct":
-            ring_collective = False
-        elif ic == "ring":
-            ring_collective = True
-        elif ic in ("auto", ""):
-            ring_collective = NUM_NODES > 2
-        else:
-            ring_collective = NUM_NODES > 2
-        if os.environ.get("AG_GEMM_PERF_PRESET", "").strip().lower() == "legacy":
-            ring_collective = False
+        os.environ.pop("AG_GEMM_ROW_STRIDE_BYTES", None)
         n_peers = NUM_NODES - 1
-        ring_recv_banks = n_peers if ring_collective else 1
+        ring_recv_banks = n_peers
 
         if is_chief:
             print(f"\n[ag_gemm] M={M} K={K} N={N} M_node={M_node} M_local={M_local}", flush=True)
@@ -225,13 +205,9 @@ def main():
 
         a_half_bytes = M_node * K * 2
         total_chunks = (a_half_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
-        if os.environ.get("AG_GEMM_TILED_DIRECT") == "1":
-            total_chunks *= 2
 
-        # Per-peer recv_buf / arrival flag scaling. At N == 2 the multiplier
-        # is 1 — single-peer-sized, identical to the legacy allocation. At
-        # N > 2 the receiver gets one slot of size a_half_bytes + total_chunks
-        # arrival flag entries per sender.
+        # Per-peer recv_buf / arrival flag scaling. At N == 2 n_peers == 1,
+        # so this collapses to a single peer-sized slot.
         recv_buf_bytes = n_peers * a_half_bytes * ring_recv_banks
         recv_buf_chunks = n_peers * total_chunks * ring_recv_banks
 
@@ -239,10 +215,9 @@ def main():
         fifo_cap = 2048
         while fifo_cap < recv_buf_chunks * 2: fifo_cap *= 2
         a_tk_ptr = int(a_tk.data_.data_ptr())
-        send_buf_ptr = int(a_recv_tk.data_.data_ptr()) if ring_collective else a_tk_ptr
-        send_buf_size = recv_buf_bytes if ring_collective else a_half_bytes
-        # Direct mode sends local A through MR1 (src_view=1). Ring mode also
-        # registers A_recv as MR0 (src_view=0) so received shards can be
+        send_buf_ptr = int(a_recv_tk.data_.data_ptr())
+        send_buf_size = recv_buf_bytes
+        # A_recv is registered as MR0 (src_view=0) so received shards can be
         # forwarded to the next node after phase-2 republishes them.
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(

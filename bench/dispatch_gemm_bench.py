@@ -391,14 +391,6 @@ def main():
             sync_barrier.data_.zero_()
             copy_ready.data_.zero_()
 
-        # Prime: first epoch is a known stale-state warmup on the legacy
-        # two-node path. On N-node fanout it can mask the real check by
-        # deadlocking before the measured iteration, so start from a fresh
-        # epoch/reset there instead.
-        if NUM_NODES <= 2:
-            reset_state(); dist.barrier(); time.sleep(0.05)
-            run_once(); torch.cuda.synchronize(); dist.barrier()
-
         epoch += 1; mod.set_epoch(epoch); reset_state()
         dist.barrier(); time.sleep(0.05)
 
@@ -418,8 +410,6 @@ def main():
         # ~5 ms; smaller shapes use bigger N for stability.
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
-            legacy_sync = True
-        if NUM_NODES > 2:
             legacy_sync = True
         if not legacy_sync:
             # Tier N by shape so total measurement ~>= 100 ms.
