@@ -1,6 +1,6 @@
 #pragma once
 
-// Session management + pybind module for moe_dispatch_gemm_multinode.
+// Session management + pybind module for dispatch_gemm.
 // Included from src/dispatch_gemm.cu after the kernel namespace closes.
 
 // ============================================================================

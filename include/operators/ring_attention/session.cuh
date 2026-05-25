@@ -1,6 +1,6 @@
 #pragma once
 
-// Session management + pybind module for ring_attn_multinode.
+// Session management + pybind module for ring_attention.
 // Included from src/ring_attention.cu after the kernel namespace closes.
 // ============================================================================
 // Session management + pybind module

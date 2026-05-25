@@ -93,7 +93,7 @@ def cta_split_chunk_tiles_for_n(N):
 
 
 def compute_scratch_ints(M, N, world_size, num_remote_queues=1):
-    """Mirror gemm_ar_compute_scratch_layout in gemm_ar_multinode.cu."""
+    """Mirror gemm_ar_compute_scratch_layout in gemm_ar.cu."""
     row_blocks_per_slice = M // world_size // ROW_BLOCK
     col_blocks = N // COL_BLOCK
     chunk_tiles = kernel_chunk_tiles_for_n(N)

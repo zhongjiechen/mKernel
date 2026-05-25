@@ -1,5 +1,5 @@
 /**
- * @file gemm_rs_multinode.cu
+ * @file gemm_rs.cu
  * @brief Multi-node GEMM + Reduce-Scatter - single fused kernel.
  *
  * Single kernel launch. CTA groups run with role recycling:

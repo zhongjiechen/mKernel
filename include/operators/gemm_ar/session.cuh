@@ -1,6 +1,6 @@
 #pragma once
 
-// Session management + pybind module for gemm_ar_multinode.
+// Session management + pybind module for gemm_ar.
 // Included from src/gemm_ar.cu after the kernel namespace closes.
 //
 // The kernel namespace lives in src/gemm_ar.cu; this header defines the pybind
@@ -215,4 +215,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("use_acquire_poll") = false,
           pybind11::arg("remote_accum_ptr") = (int64_t)0);
 }
-// -- END inlined from gemm_ar_multinode_module.cuh

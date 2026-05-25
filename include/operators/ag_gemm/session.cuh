@@ -1,6 +1,6 @@
 #pragma once
 
-// Session management + pybind module for ag_gemm_multinode.
+// Session management + pybind module for ag_gemm.
 // Included from src/ag_gemm.cu after the kernel namespace closes.
 // ============================================================================
 // Session management

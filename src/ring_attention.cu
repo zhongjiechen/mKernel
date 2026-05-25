@@ -1,5 +1,5 @@
 /**
- * @file ring_attention_multinode.cu
+ * @file ring_attention.cu
  * @brief Multi-node Ring Attention - staged kernels.
  *
  * The host entrypoint launches a short sequence of kernels rather than one

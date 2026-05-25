@@ -1,5 +1,5 @@
 /**
- * @file moe_dispatch_gemm_multinode.cu
+ * @file dispatch_gemm.cu
  * @brief Multi-node MoE Dispatch + Group GEMM - single fused kernel.
  *
  * Single kernel launch. CTA roles are split by blockIdx.x:

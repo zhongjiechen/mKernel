@@ -1,5 +1,5 @@
 /**
- * @file gemm_ar_multinode.cu
+ * @file gemm_ar.cu
  * @brief Multi-node GEMM + All-Reduce — single fused kernel.
  *
  * Single kernel launch. Four CTA groups run concurrently:

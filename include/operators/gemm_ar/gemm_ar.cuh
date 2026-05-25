@@ -54,10 +54,6 @@ struct fused_globals;
 void launch_fused_gemm_ar(const fused_globals& G);
 void launch_fused_gemm_ar_epilogue(const fused_globals& G);
 
-// -- BEGIN inlined from gemm_ar_multinode_common.cuh
-// Shared lightweight definitions for multinode GEMM+AR.
-// Included from `gemm_ar_multinode.cu` inside the `gemm_ar_multinode` namespace.
-
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int NUM_BLOCKS = 132;
@@ -196,10 +192,8 @@ __host__ __device__ inline int gemm_ar_units_for_queue(int total_units, int queu
     }
     return 1 + (total_units - 1 - queue_id) / num_queues;
 }
-// -- END inlined from gemm_ar_multinode_common.cuh
-// -- BEGIN inlined from gemm_ar_multinode_fused_prelude.cuh
 // Shared fused-kernel prelude for multinode GEMM+AR.
-// Included from `gemm_ar_multinode.cu` inside the `gemm_ar_multinode` namespace.
+// Defined inside the gemm_ar_multinode namespace; instantiated in src/gemm_ar.cu.
 
 static constexpr int TILE_BYTES = 128 * 256 * 2;
 
@@ -948,7 +942,6 @@ __device__ inline void gemm_ar_finish_multicast_publication(const fused_globals&
     }
     __syncthreads();
 }
-// -- END inlined from gemm_ar_multinode_fused_prelude.cuh
 
 __device__ inline void gemm_ar_decode_comp_task(
     int task_id, int row_blocks_per_slice, int col_blocks, int dev_idx, int& row_idx, int& col_idx
@@ -974,9 +967,8 @@ __device__ inline int gemm_ar_inter_reduce_store_base(const fused_globals& G) {
 // Claim remote-arrived chunks, publish them, then announce slice completion.
 // ============================================================================
 
-// -- BEGIN inlined from gemm_ar_multinode_host_layout.cuh
 // Shared host-side layout/debug helpers for multinode GEMM+AR.
-// Included from `gemm_ar_multinode.cu` inside the `gemm_ar_multinode` namespace.
+// Defined inside the gemm_ar_multinode namespace; instantiated in src/gemm_ar.cu.
 
 __host__ inline bool gemm_ar_host_debug_enabled() {
     return false;
@@ -1233,10 +1225,8 @@ __host__ inline void gemm_ar_init_debug_scratch(
         host_tail.size() * sizeof(uint32_t),
         cudaMemcpyHostToDevice);
 }
-// -- END inlined from gemm_ar_multinode_host_layout.cuh
-// -- BEGIN inlined from gemm_ar_multinode_host_entrypoint.cuh
 // Host-side globals construction and fused entrypoint.
-// Included from `gemm_ar_multinode.cu` inside the `gemm_ar_multinode` namespace.
+// Defined inside the gemm_ar_multinode namespace; instantiated in src/gemm_ar.cu.
 
 __host__ inline fused_globals gemm_ar_make_globals(
     const at::Tensor& A, const at::Tensor& B,
@@ -1491,6 +1481,5 @@ void entrypoint(
         gemm_ar_host_debug_log(node_idx, dev_idx, "entrypoint after launch_epilogue_kernel");
     }
 }
-// -- END inlined from gemm_ar_multinode_host_entrypoint.cuh
 
 }  // namespace gemm_ar_multinode

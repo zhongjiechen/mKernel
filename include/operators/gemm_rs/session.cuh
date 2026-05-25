@@ -1,6 +1,6 @@
 #pragma once
 
-// Session management + pybind module for gemm_rs_multinode.
+// Session management + pybind module for gemm_rs.
 // Included from src/gemm_rs.cu after the kernel namespace closes.
 
 // ============================================================================

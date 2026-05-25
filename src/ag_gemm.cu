@@ -1,5 +1,5 @@
 /**
- * @file ag_gemm_multinode.cu
+ * @file ag_gemm.cu
  * @brief Multi-node All-Gather + GEMM - single fused kernel.
  *
  * Single kernel launch. Two CTA groups run concurrently:
