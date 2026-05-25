@@ -274,12 +274,11 @@ __device__ __forceinline__ void gemm_ar_pipelined_ar_tile(
 // Expected benefit: removes ~half of NVSwitch traffic (no multimem.st),
 // reducing intra-AR time for small M where NVSwitch ops dominate.
 
-// Reference's dual-store pattern (gemm_ar_ref_kernel.cu:215-247): the
-// multimem.ld_reduce produces results in registers — write them to BOTH
-// C_local and a staging slot in the same loop. Eliminates the separate
-// pack-to-staging pass. tx_tile_base (when non-null) is the contiguous start
-// of this tile's TILE_ROWS×TILE_COLS staging region (G.staging_buf +
-// tile_id*TILE_ELEMS in our layout). Null = legacy single-store behavior.
+// Dual-store pattern: multimem.ld_reduce produces results in registers — write
+// them to BOTH C_local and a staging slot in the same loop, eliminating the
+// separate pack-to-staging pass. tx_tile_base (when non-null) is the contiguous
+// start of this tile's TILE_ROWS×TILE_COLS staging region (G.staging_buf +
+// tile_id*TILE_ELEMS in our layout). Null = single-store behavior.
 __device__ __forceinline__ void gemm_ar_pipelined_rs_tile(
     const fused_globals::C_distributed_tensor& dbuf, int tile_row, int tile_col,
     bf16* C_local, int N, bf16* tx_tile_base = nullptr
@@ -990,8 +989,6 @@ __device__ inline void shared_reduce_my_slice_worksteal(
         if (s_chunk_id == -2) break;  // all done — uniform exit
         if (s_chunk_id < 0) continue; // nothing found, retry
 
-
-
         const int chunk_id = s_chunk_id;
         if (tid == 0) {
         }
@@ -1183,9 +1180,6 @@ __device__ inline void shared_reduce_my_slice_static(
         }
         __syncthreads();
     }
-
-
-
     // After all statically owned chunks are published, spin until every chunk
     // across all reduce CTAs is published (needed before multicast finalization).
     // CTAs with red_id >= total_chunks (no owned chunks) also land here and
@@ -1336,20 +1330,11 @@ __device__ inline void shared_reduce_my_slice(
 }
 
 __device__ inline void fused_inter_reduce_and_publish_sm(const fused_globals& G) {
-    const int red_id = blockIdx.x - gemm_ar_inter_reduce_store_base(G);
-
-
-    // --- Sub-phase A: chunk-owned recv-side reduction ---
-    shared_reduce_my_slice(G
-    );
-
-
-    // --- Sub-phase B: finalize multicast publication once all chunks are done ---
+    shared_reduce_my_slice(G);
     if (!G.defer_final_multicast_finish) {
+        const int red_id = blockIdx.x - gemm_ar_inter_reduce_store_base(G);
         gemm_ar_finish_multicast_publication(G, red_id);
     }
-
-    // --- Sub-phase C: no peer-read gather ---
 }
 
 // ============================================================================
@@ -1399,9 +1384,9 @@ __device__ inline void fused_epilogue_kernel(const fused_globals& G) {
     if (is_reduce_cta) {
         gemm_ar_finish_multicast_publication(G, blockIdx.x - reduce_base);
     }
-    // 16-way iter-end barrier: the 8-way intra-node finish_multicast above
-    // combined with a cross-node RDMA barrier here gives a true 16-rank sync
-    // at iter boundary — enables honest steady-state benchmarking without
+    // Iter-end barrier: the intra-node M-way finish_multicast above combined
+    // with the cross-node N-way RDMA barrier below gives a true (N*M)-rank
+    // sync at iter boundary — enables steady-state benchmarking without a
     // host-side dist.barrier/synchronize between iters.
     if (is_reduce_cta) {
         // Reset arrival flags on-stream BEFORE the barrier; gating peer's

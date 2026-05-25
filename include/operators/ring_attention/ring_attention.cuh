@@ -85,7 +85,7 @@ struct config {
 };
 
 // ============================================================================
-// Globals — same shape as intranode ring_attention globals
+// Globals
 // ============================================================================
 
 struct globals {
@@ -254,7 +254,7 @@ inline void entrypoint(
     c10::cuda::CUDAGuard device_guard(dev_idx);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev_idx).stream();
 
-    // Construct intranode globals (used for all attn_partial / attn_comm calls)
+    // Construct globals used for all attn_partial / attn_comm calls
     auto make_G = [&](int ring_stage) {
         return globals{
             .Q = ::dist::local_tensor_from_tensor<typename globals::Q_local_tensor>(Q),
@@ -308,12 +308,11 @@ inline void entrypoint(
         int n_partial = G.num_partial_blocks();
         int n_reduction = G.num_reduction_blocks();
 
-        // Per-stage launch path: matches intranode design. Each launch isolates
-        // its register frame so attn_partial / attn_comm / attn_reduction get
-        // STACK:0. A fused persistent variant was tried and removed — the role
-        // union forced ~150 bytes of silent spills in a single kernel that no
-        // amount of __noinline__ refactoring or FA3 layout could eliminate
-        // without halving wgmma throughput.
+        // Per-stage launch path. Each launch isolates its register frame so
+        // attn_partial / attn_comm / attn_reduction get STACK:0. A fused
+        // persistent variant forces ~150 bytes of silent spills in a single
+        // kernel that no amount of __noinline__ refactoring or FA3 layout
+        // can eliminate without halving wgmma throughput.
         cudaFuncSetAttribute(attn_comm_partial_stage_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, config::DYNAMIC_SHARED_MEMORY);
         cudaFuncSetAttribute(attn_reduction_stage_kernel,

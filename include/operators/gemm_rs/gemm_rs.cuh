@@ -27,7 +27,7 @@
  * partitioned 1/M per node.
  *
  * Hot path is a single CTA-specialized kernel:
- *   compute CTAs -> intranode RS CTAs -> inter send CTAs -> inter reduce CTAs
+ *   compute CTAs -> intra-node RS CTAs -> inter-node send CTAs -> inter-node reduce CTAs
  * with fine-grained per-tile handoff between each phase.
  */
 
@@ -60,7 +60,7 @@ using namespace kittens;
 namespace gemm_rs_multinode {
 
 // ============================================================================
-// Config (matches intranode gemm_rs.cu)
+// Config
 // ============================================================================
 
 struct config {
@@ -125,7 +125,7 @@ struct intra_globals {
     using A_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, B_tile>;
     // Workspace is a multicast dbuf under GEMM_RS_MULTIMEM_RS: each GPU has its own
-    // replica, and multimem.ld_reduce via workspace.mc_ptr_at pulls the 8-way
+    // replica, and multimem.ld_reduce via workspace.mc_ptr_at pulls the M-way
     // sum in one HW op (matching gemm_ar's gemm_ar_pipelined_rs_tile). The
     // compute/intra-RS TMA paths index workspace[dev_idx] for the local gl,
     // which doesn't need a multicast binding — so when GEMM_RS_MULTIMEM_RS is off
@@ -137,9 +137,9 @@ struct intra_globals {
     using barrier_distributed_tensor = dist::barrier_distributed_tensor<NUM_DEVICES>;
     // GEMM_RS_READY_VIA_MULTIMEM: per-chunk "this GPU's compute done" flag. Each
     // peer writes `epoch` to its own replica on the last tile of a chunk.
-    // Owner polls multimem.ld_reduce.min across all 8 replicas — returns
-    // `epoch` iff every peer has stamped this chunk. Replaces the 8-way dbuf
-    // barrier (8 sys atomics per chunk) with 8 local stores + 1 HW op.
+    // Owner polls multimem.ld_reduce.min across all M replicas — returns
+    // `epoch` iff every peer has stamped this chunk. Replaces the M-way dbuf
+    // barrier (M sys atomics per chunk) with M local stores + 1 HW op.
     using ready_chunk_distributed_tensor = dist::distributed_tensor<dist::local_tensor<int, 1, 1, -1, -1>, NUM_DEVICES, true>;
 
     A_local_tensor A;
@@ -214,7 +214,7 @@ struct fused_globals {
         // GEMM_RS_MULTIMEM_RS: per-chunk "ready to send" flag set by the owner's
         // intra-RS after multimem.ld_reduce + local store for all tiles of
         // the chunk. SFR sender polls this (instead of the dbuf barrier) to
-        // avoid aliasing the compute-side 8-way barrier signal.
+        // avoid aliasing the compute-side M-way barrier signal.
         uint32_t *chunk_sendable;
         // Per-chunk claim bitmap. A CTA must win atomicCAS(0->1) before
         // posting a chunk, so each chunk is sent once.
@@ -506,7 +506,7 @@ __host__ inline int gemm_rs_logical_queues_per_qp_host() {
     return std::min(16, logical);
 }
 
-// Single-launch gemm_rs entrypoint: compute + intranode RS + inter send + inter reduce.
+// Single-launch gemm_rs entrypoint: compute + intra-node RS + inter-node send + inter-node reduce.
 void entrypoint_fused(
     const at::Tensor &A,
     const at::Tensor &B,

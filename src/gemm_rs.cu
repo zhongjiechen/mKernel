@@ -341,7 +341,6 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
     }
 }
 
-// Any CTA that finishes its primary role can claim reduce chunks from this pool.
 __device__ __forceinline__ bool gemm_rs_receiver_owns_chunk(
     const fused_globals::runtime_state &Rt, int chunk_id
 ) {
@@ -904,9 +903,9 @@ __device__ inline void fused_kernel(const fused_globals &G) {
                                               outputs_arrived, outputs_finished, stage, phasebits,
                                               row_blocks, col_blocks, num_iters);
             // Compute-side chunk-ready signal. When this GPU finishes all
-            // tiles in a chunk, emit a "I'm done contributing" edge so the
+            // tiles in a chunk, emit a "I'm done contributing" signal so the
             // owner's send CTA knows this GPU's partials have landed in
-            // staging. Counter is local atomic; the edge itself is either a
+            // staging. Counter is local atomic; the signal itself is either a
             // cross-device barrier signal (default) or a local release-store
             // into a multicast flag (GEMM_RS_READY_VIA_MULTIMEM).
             // With GEMM_RS_FUSE_COMPUTE_INTRA, the compute CTA has also just
@@ -971,10 +970,8 @@ __device__ inline void fused_kernel(const fused_globals &G) {
         }
     }
 
-
-
-    // Match the split intra kernel when we intentionally launch only the
-    // compute + intranode CTAs for debugging/reuse checks.
+    // Path taken when we intentionally launch only the compute + intra-node
+    // CTAs (no inter-node send/reduce), e.g. for debugging or reuse checks.
     if ((int)gridDim.x == I.num_comp_sms + I.num_comm_sms && threadIdx.x == 0) {
         __threadfence();
         unsigned int prev = atomicAdd(I.kernel_done, 1u);

@@ -86,8 +86,7 @@ __device__ inline void fused_inter_copy_sm(const fused_globals &G) {
                 uint32_t v;
                 do {
                     // Proxy path: acquire load from the per-peer arrival
-                    // slot. Pairs with the proxy's release-sys store (the
-                    // DeepEP-style synchronization edge).
+                    // slot. Pairs with the proxy's release-sys store.
                     v = comm::atomic_u32::acquire_load_sys(&G.arrival_flags[flag_idx]);
                     if (v == G.epoch) break;
                     __nanosleep(100);

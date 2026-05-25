@@ -32,8 +32,7 @@
  *     peer_tokens_distributed_tensor[peer_slot] based on
  *     pull_dispatch_indices (columns: src_node, src_dev, src_token).
  *   Phase 3 (group GEMM):
- *     Same as the intranode kernel — each GPU computes GEMMs for its
- *     assigned experts.
+ *     Each GPU computes GEMMs for its assigned experts.
  *
  * Hot path is a single fused kernel launch (`fused()`) that overlaps the
  * inter-node RDMA exchange, intra-node D2D copy, dispatch, and per-expert
@@ -385,9 +384,6 @@ void fused(
     // through them while Inter-Recv is still ferrying chunks. Per-chunk
     // copy_ready polling inside dispatch_fused gates each peer token.
     launch_fused_dispatch_gemm(GF, stream);
-
-    // Per-row-block barrier zeroing happens inside fused_kernel's last-CTA path.
-
 }
 
 }  // namespace moe_dispatch_gemm_multinode

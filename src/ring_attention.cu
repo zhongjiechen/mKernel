@@ -40,11 +40,10 @@
 namespace ring_attn_multinode {
 
 // ============================================================================
-// Intra-node device functions: attn_partial, attn_comm, attn_reduction
+// Stage device functions: attn_partial, attn_comm, attn_reduction
 // ============================================================================
 //
-// NOTE: The device functions below are large and identical to those in the
-// intranode kernel. They live in this TU rather than the cuh because they
+// These device functions live in this TU rather than the header because they
 // are passed by name to __global__ stubs in the same TU; ptxas needs the
 // definition visible at the point each stub is instantiated.
 
@@ -617,19 +616,18 @@ __device__ inline void kv_copy_sm(const kv_exchange_globals &G, int peer_slot) {
 // __global__ kernel stubs (entrypoint launches these via plain <<<...>>>)
 // ============================================================================
 
-// Per-stage kernels, modeled after the intranode dynamic_sm ring_attention design.
-// Splitting comm+partial / reduction / RDMA into independent __global__ launches
-// with one CTA per work-block keeps each kernel's register live-range short,
-// yielding STACK:0 (vs the persistent kernel's STACK:600 spills) and avoiding
-// ptxas C7510/C7512 wgmma serialization that costs ~5× per-block compute time.
+// Per-stage kernels. Splitting comm+partial / reduction / RDMA into independent
+// __global__ launches with one CTA per work-block keeps each kernel's register
+// live-range short, yielding STACK:0 (vs the persistent kernel's STACK:600
+// spills) and avoiding ptxas C7510/C7512 wgmma serialization that costs ~5×
+// per-block compute time.
 //
 // Launch grid: num_comm_sms + num_partial_blks. CTA roles split by blockIdx.x.
 // Comm CTAs do attn_comm (one per comm slot); compute CTAs do exactly one
 // attn_partial block (oversubscribed → multiple waves on H100's 132 SMs).
-// Mirrors intranode attn_comm_partial_kernel exactly: no outer reg setup;
-// the called functions do their own warpgroup register reallocation. Passing
-// SKIP_REG_ALLOC=false lets ptxas split the register frame at the function
-// boundary the same way it does for the intranode kernel (STACK:0 / STACK:48).
+// No outer reg setup here; the called functions do their own warpgroup
+// register reallocation. Passing SKIP_REG_ALLOC=false lets ptxas split the
+// register frame at the function boundary (STACK:0 / STACK:48).
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
 void attn_comm_partial_stage_kernel(
     const __grid_constant__ globals G,

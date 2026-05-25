@@ -909,7 +909,7 @@ inline void commit_epoch(Session* s, uint32_t epoch) {
 /**
  * Host-side stage barrier backed by a 4-byte proxy-issued RDMA write.
  *
- * This mirrors the intranode ring-stage barrier at launch boundaries:
+ * Sequence at launch boundaries:
  * 1. wait for local kernels and RDMA traffic to quiesce
  * 2. pause the proxy so we can safely use the same QP from the host thread
  * 3. send our stage token to the peer's barrier slot

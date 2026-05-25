@@ -49,14 +49,6 @@ __device__ inline void intra_comm_sm(const globals& G) {
     if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
         init_semaphore(inputs_arrived[warp_id], 0, 1);
 
-        // ========== Phase 0: lifted to prologue kernel ==========
-        // The early RDMA WR posting has been hoisted to a separate prologue
-        // kernel (ag_gemm_phase0_prologue_kernel). The prologue posts WRs to
-        // the host proxy's FIFO so the proxy can begin the post→wire→peer
-        // round-trip overlapped with this kernel's launch + intra-AG phase,
-        // removing intra-comm CTA startup latency from the critical path.
-
-        // ========== Phase 1: sender-side intra-AG ==========
         // Gather own M_local shard from A[dev_idx] into A (multicast).
         if (G.debug_skip_phase1 == 0) {
             for (int task_id = comm_sm_id * globals::NUM_COMM_CHUNKS + warp_id;
@@ -78,7 +70,7 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 // Multicast store_async_wait only fences local-GPU completion;
                 // cross-GPU visibility of the multicast write needs a system
                 // fence before signaling compute (which lives on the same GPU
-                // but reads via the multicast aperture). 
+                // but reads via multicast). 
                 __threadfence_system();
 
                 // Plane 0 [row,col]: per-K-strip, count=1. Compute waits per red_idx
@@ -107,19 +99,11 @@ __device__ inline void intra_comm_sm(const globals& G) {
         return;
     }
 
-    // ========== Phase 2: receiver-side fan-out ==========
     // intra_comm_sm ranks r on the peer node have each RDMA-written their
     // M_local-row slice of peer A_half into THIS rank's recv_buf at the
     // corresponding A_half row offset [r*M_local, (r+1)*M_local). Exactly
-    // one rank r's slice landed at each offset; OUR rank r's phase-2
-    // workers fan out OUR slice via multicast into A_recv on all 8 ranks.
-    //
-    // Phase-2 task range mirrors phase-1: same (row_idx, col_idx) grid,
-    // just indexing a different (source, dest) pair:
-    //   source: G.A_recv_local_tensor (recv_buf unicast view, with A_comm_tile desc)
-    //   dest:   G.A_recv    (multicast dbuf; writes fan out to all 8 ranks)
-    // Signal plane 2[global_row_idx, col_idx] with count=1 to unblock
-    // fused_comp_sm's remote-tile wait.
+    // one rank r's slice landed at each offset; OUR rank r 
+    // workers fan out OUR slice via multicast into A_recv on all M ranks.
 
     const int K_val = G.A_recv_local_tensor.cols();
     const int chunks_per_inter_rb = max(1,
@@ -199,7 +183,7 @@ __device__ inline void intra_comm_sm(const globals& G) {
         __syncthreads();
 
         // Each CTA forwards only the rows it owns after finishing its own
-        // phase-2 task loop. Rows are disjoint in the ring receive bank, so an
+        // task loop. Rows are disjoint in the ring receive buffer, so an
         // unrelated CTA still publishing row Y does not block forwarding row X.
 
         if (warp_id < globals::NUM_COMM_CHUNKS && lane_id == 0) {
@@ -483,7 +467,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
 // reserved barrier slot {0, 1023, 1022} (per-device — barrier[dev_idx] is the
 // local view, no multicast traffic). Each CTA derives its own per-iter target
 // from its arrival number, so no host-side counter init is needed and the
-// counter just grows monotonically (overflow at ~16 M iters at 132 CTAs/iter).
+// counter just grows monotonically. 
 //
 // Atomic polling forces L2 coherence on each check before the flag-plane reset.
 __device__ inline void grid_sync_at_epoch(const globals& G) {
@@ -557,7 +541,7 @@ void ag_gemm_fused_kernel_stub(const __grid_constant__ globals G) {
 }
 
 // ============================================================================
-// Phase-0 prologue kernel
+// Prologue kernel
 // ============================================================================
 // Posts the inter-node RDMA WRs (zero-copy from A.data_ DMA-BUF MR) to the
 // host proxy's D2H FIFO. The proxy can begin issuing post_send / waiting on
@@ -656,14 +640,14 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
                                     dynamic_shared_memory, stream>>>(G);
         return;
     }
-    // 1. Capture prior main-stream state.
+    // Capture prior main-stream state.
     MKERNEL_CUDACHECK(cudaEventRecord(main_pre_event, stream));
-    // 2. Prologue stream waits on it.
+    // Prologue stream waits on it.
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(prologue_stream, main_pre_event, 0));
-    // 3. Launch prologue on the side stream.
+    // Launch prologue on the side stream.
     ag_gemm_phase0_prologue_kernel<<<prologue_blocks, WARP_THREADS, 0,
                                      prologue_stream>>>(G);
-    // 4. Launch main kernel — does NOT wait on prologue.
+    // Launch main kernel — does NOT wait on prologue.
     ag_gemm_fused_kernel_stub<<<active_sms, config::NUM_THREADS,
                                 dynamic_shared_memory, stream>>>(G);
 }

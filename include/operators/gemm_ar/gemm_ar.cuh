@@ -88,7 +88,7 @@ __device__ inline void slice_row_major_decode(
 // rb_in_slice.
 //
 // Compared to slice_row_major_decode (all tiles of slice 0, then slice 1,
-// ...), this aligns barrier / intra-AR progress across all 8 GPUs so no rank
+// ...), this aligns barrier / intra-AR progress across all M GPUs so no rank
 // sits in the final multicast poll for ~one GEMM duration waiting for the
 // last slice to start reducing.
 //
@@ -265,7 +265,8 @@ struct fused_globals {
     uint32_t* queue_observed_arrivals; // arrivals actually decoded per queue
     uint32_t* row_send_count;          // AQ coalescing: completed chunks per row-block
 
-    // --- Producer-published gemm_ready_queue (Phase A, iter 16) ---
+    // Producer-published gemm_ready_queue: compute CTAs hand off chunks to
+    // intra-AR CTAs as soon as all tiles in the chunk are ready.
     uint32_t* gemm_tiles_ready_count;  // per-chunk tile barrier counter
     uint32_t* gemm_tile_scanned;       // per-tile barrier-detected flag
     int* gemm_rq_entries;              // ring buffer of chunk IDs (+1 encoded)
@@ -274,13 +275,15 @@ struct fused_globals {
     uint32_t* gemm_scan_cursor;        // idle intra-AR CTAs claim chunks to test
     int gemm_rq_capacity;              // power-of-2
 
-    // --- Producer-published local_ar_done_queue (Phase A, iter 20) ---
+    // Producer-published local_ar_done_queue: intra-AR CTAs hand off chunks
+    // to inter-send CTAs once the local all-reduce step is done.
     int* local_ar_rq_entries;          // ring buffer of chunk IDs (+1 encoded)
     uint32_t* local_ar_rq_head;        // consumer CAS to dequeue
     uint32_t* local_ar_rq_tail;        // producer reserve/publish cursor
     int local_ar_rq_capacity;          // power-of-2
 
-    // --- Producer-published remote_arrived_queue (Phase A, iter 20b) ---
+    // Producer-published remote_arrived_queue: recv-progress CTAs hand off
+    // chunks to inter-reduce CTAs once the remote partial has landed.
     int* remote_rq_entries;            // ring buffer of chunk IDs (+1 encoded)
     uint32_t* remote_rq_head;          // consumer CAS to dequeue
     uint32_t* remote_rq_tail;          // producer reserve/publish cursor
@@ -305,7 +308,7 @@ struct fused_globals {
                                        // primary CTA[i] sets 1 after passing its first tile barrier;
                                        // secondary CTA[i+half] polls this (L2-cached) before its own
 
-    // --- GEMM_AR_INTER_REDUCE_WORKSTEAL: cursor-based work-stealing reduce ---
+    // Cursor-based work-stealing reduce.
     // All CTAs (including recycled compute/intra/send) join the reduce phase.
     // reduce_cursor: single global counter, atomicAdd'd to get candidate chunk.
     // chunk_claimed_flag: per-chunk claim bit (0=unclaimed, 1=claimed via CAS).
@@ -508,7 +511,7 @@ __device__ inline void gemm_ar_cross_node_barrier(const fused_globals& G) {
 // Pairwise iter-end cross-node barrier (monotonic-epoch compare, no clear).
 //
 // On each rank, one driver thread does:
-//   1. intra-node 8-way barrier (plane-1 slot {0,0}) — syncs all 8 local GPUs.
+//   1. intra-node M-way barrier (plane-1 slot {0,0}) — syncs all M local GPUs.
 //   2. push BARRIER_NOTIFY → proxy RDMA-writes its current cfg_.epoch into
 //      pair-peer's stage_barrier slot 0; spin on our own local slot until
 //      slot >= G.epoch. Never cleared by the kernel.
@@ -522,7 +525,7 @@ __device__ inline void gemm_ar_cross_node_barrier(const fused_globals& G) {
 // is correct.
 //
 // Why pairwise (not leader-only): each rank has its own Session + pinned
-// stage_barrier slot + pair-peer (rank X ↔ rank X across nodes). All 8
+// stage_barrier slot + pair-peer (rank X ↔ rank X across nodes). All M
 // RDMAs per direction fly concurrently → better NIC utilization, symmetric
 // code, no single-leader serialization.
 __device__ inline void gemm_ar_hierarchical_xnode_barrier(
@@ -532,12 +535,12 @@ __device__ inline void gemm_ar_hierarchical_xnode_barrier(
     if (blockIdx.x != driver_block_id || threadIdx.x != 0) return;
 
 
-    // Step 1: 8-way intra-node arrival via per-epoch slot to rule out any
+    // Step 1: M-way intra-node arrival via per-epoch slot to rule out any
     // cross-iter residue on slot {1,0,0}. epoch & 1023 gives 1024 distinct
     // slots cycling, far longer than any plausible in-flight op horizon.
     //
     // GEMM_AR_SKIP_XBAR_INTRA_BARRIER: when the caller just returned from
-    // gemm_ar_finish_multicast_publication on every reduce CTA, the 8-way intra-node
+    // gemm_ar_finish_multicast_publication on every reduce CTA, the M-way intra-node
     // sync has already been achieved per-chunk (signal_all + wait_mc(==1) on
     // each reduce CTA's slot). Re-doing barrier_all here is redundant and
     // costs an extra NVSwitch round-trip. Gated so we can ablate.
