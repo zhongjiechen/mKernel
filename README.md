@@ -1,8 +1,17 @@
-# mKernel
-
 <div align="center" >
+  <p align="center"> 
     <img src="figs/mKernel.png" height=350 alt="mKernel" style="margin-bottom:12px"/><br/>
     <em>mKernel: multi-GPU, multi-node fused kernels</em><br/><br/>
+  </p>
+
+  <p align="center">
+        <a href="https://uccl-project.github.io/"><b>Blog</b></a> | 
+        <a href="https://join.slack.com/t/uccl-dev/shared_invite/zt-3xbjdb0d0-tvDeUhGxtYxvGqsGKQ31Uw"><b>Join Slack</b></a> | 
+        <a href="https://x.com/uccl_proj"><b>Twitter/X</b></a> | 
+        <a href="#roadmap"><b>Roadmap</b></a> | 
+        <a href="#quick-start"><b>Quick Start</b></a> |
+        <a href="https://github.com/uccl-project/uccl/issues/944"><b>Open Letter</b></a>
+  </p>
 </div>
 
 ## Highlights
