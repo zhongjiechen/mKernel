@@ -1,0 +1,50 @@
+{
+    "kernel": "lite_tp_ag_gemm_push_wmma_basic",
+    "dtype": "float32_tf32",
+    "baseline": "NCCL+cuBLAS",
+    "sizes": [
+        "M=512",
+        "M=1024",
+        "M=4096",
+        "M=8192"
+    ],
+    "fused_ms": [
+        0.23449599742889404,
+        0.5601279735565186,
+        7.788544178009033,
+        41.009857177734375
+    ],
+    "nccl_cublas_ms": [
+        0.6813120245933533,
+        0.4553920030593872,
+        4.852479934692383,
+        20.242431640625
+    ],
+    "fused_tflops_per_gpu": [
+        0.14309170462568205,
+        0.47923951074176097,
+        2.205786959841274,
+        3.3513638654323383
+    ],
+    "nccl_cublas_tflops_per_gpu": [
+        0.04924972815506558,
+        0.5894601885773423,
+        3.5404307519489198,
+        6.789646417586048
+    ],
+    "speedup_vs_nccl_cublas": [
+        2.9054313594412062,
+        0.8130142120342376,
+        0.6230278501075166,
+        0.49359917428864625
+    ],
+    "chunk_rows": [
+        64,
+        64,
+        64,
+        64
+    ],
+    "world_size": 8,
+    "local_world_size": 4,
+    "note": "TP-correct basic AG+GEMM: rank-local B_i, no NCCL/cuBLAS fused path, RDMA pair exchange + IPC A_full staging + WMMA GEMM."
+}

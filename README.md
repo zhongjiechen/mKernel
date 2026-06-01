@@ -65,6 +65,28 @@ make plots
 - EFA backend: AWS EFA installation with libfabric, libibverbs, efadv, and EFA headers/libraries under `EFA_HOME=/opt/amazon/efa` by default.
 - Benchmarks assume homogeneous multi-GPU nodes, `torchrun`, passwordless SSH from node 0 to peer nodes, and routable data-plane IPs in `NODE*_IP`.
 
+## Lite L4 AG+GEMM baseline
+
+For consumer/Ada GPUs such as L40/L4 that cannot run the Hopper-only release
+kernels, the lite AG+GEMM path lives under `src/lite`. It implements the
+measured fused path without NCCL or cuBLAS. The current L4 target is
+tensor-parallel inference AG+GEMM: each rank owns a different local column shard
+`B_i`, gathers all `A` rows, and computes its local output shard
+`C_i = A_full @ B_i`.
+
+```sh
+# Launch this target on both L4 nodes with matching LITE_MASTER_* settings and
+# LITE_NODE_RANK=0/1.
+CUDA_VISIBLE_DEVICES=0,1,2,3 make lite-ag-gemm \
+  LITE_PYTHON=python3 \
+  LITE_NODE_RANK=0 LITE_MASTER_ADDR=10.10.55.1 \
+  LITE_AG_GEMM_MODE=check
+```
+
+The benchmark also runs a separate NCCL+cuBLAS full-AllGather baseline for
+comparison and reports latency plus TFLOPS/GPU. Only the basic FP32/TF32 TP
+baseline is kept in `src/lite`.
+
 ## Backends
 
 | Backend | Macro | Transport | Where it runs |
@@ -101,4 +123,3 @@ The MMA / compute code is adapted from [ThunderKittens](https://github.com/HazyR
 ## License
 
 MIT — see [LICENSE](LICENSE).
-

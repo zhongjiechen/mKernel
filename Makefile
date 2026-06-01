@@ -31,6 +31,7 @@ EFA_HOME        ?= /opt/amazon/efa
 NVCC            := $(CUDA_HOME)/bin/nvcc
 # Python with torch installed. Override with `PYTHON=/path/to/python`.
 PYTHON          ?= python3
+LITE_PYTHON     ?= python3
 
 # === Include paths (must precede LDFLAGS — TORCH_LIB feeds both) ===
 HERE            := $(abspath .)
@@ -40,9 +41,9 @@ ifeq ($(BACKEND),efa)
 else
     INC_EFA     :=
 endif
-PY_INC          := $(shell $(PYTHON) -c "import sysconfig; print('-I'+sysconfig.get_path('include'))")
-TORCH_INC       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(' '.join('-I'+p for p in e.include_paths()))")
-TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(e.library_paths()[0])")
+PY_INC          = $(shell $(PYTHON) -c "import sysconfig; print('-I'+sysconfig.get_path('include'))")
+TORCH_INC       = $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(' '.join('-I'+p for p in e.include_paths()))")
+TORCH_LIB       = $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(e.library_paths()[0])")
 
 # === Common compile flags ===
 ARCH            := -gencode arch=compute_90a,code=sm_90a
@@ -52,11 +53,11 @@ ARCH            := -gencode arch=compute_90a,code=sm_90a
 INTRA_NUM_DEVICES ?= 8
 COMMON_DEFINES  := -DKITTENS_HOPPER -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES)
 COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH)
-LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
+LDFLAGS         = -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
                    -Xlinker -rpath -Xlinker $(TORCH_LIB)
 
-COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
+COMMON_INC      = $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 
 # === Per-kernel constants (passed via -D, no env-var lookups) ===
 #
@@ -110,4 +111,26 @@ test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all clean bench check test-slot-math plots
+LITE_NPROC ?= 4
+LITE_NNODES ?= 2
+LITE_NODE_RANK ?= 0
+LITE_MASTER_ADDR ?= 10.10.55.1
+LITE_MASTER_PORT ?= 29500
+LITE_RDMA_TCP_PORT ?= 32000
+LITE_AG_GEMM_SHAPES ?= 512,1024,4096,8192
+LITE_AG_GEMM_WARMUP ?= 3
+LITE_AG_GEMM_ITERS ?= 7
+LITE_AG_GEMM_CHUNK_ROWS ?= 64
+LITE_AG_GEMM_MODE ?= bench
+
+lite-ag-gemm:
+	$(LITE_PYTHON) -m torch.distributed.run --nproc_per_node=$(LITE_NPROC) \
+	    --nnodes=$(LITE_NNODES) --node_rank=$(LITE_NODE_RANK) \
+	    --master_addr=$(LITE_MASTER_ADDR) --master_port=$(LITE_MASTER_PORT) \
+	    bench/lite_ag_gemm_rdma_full_bench.py --mode $(LITE_AG_GEMM_MODE) \
+	    --shapes $(LITE_AG_GEMM_SHAPES) \
+	    --warmup $(LITE_AG_GEMM_WARMUP) --iters $(LITE_AG_GEMM_ITERS) \
+	    --chunk-rows $(LITE_AG_GEMM_CHUNK_ROWS) --fast-epoch \
+	    --tcp-port $(LITE_RDMA_TCP_PORT)
+
+.PHONY: all clean bench check test-slot-math plots lite-ag-gemm
